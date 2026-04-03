@@ -16,7 +16,7 @@ To create a Telegram bot:
 4. Provide a **username** (5-32 characters, must end in `bot`, e.g. `my_bridge_bot`).
 5. BotFather returns an **authentication token** in the format:
    ```
-   110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw
+   <bot_id>:<secret_token>
    ```
 
 **Token security:** The token authorizes all requests to the Bot API. Keep it secret. If compromised, use `/token` in BotFather to regenerate.
