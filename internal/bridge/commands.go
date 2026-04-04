@@ -30,6 +30,7 @@ const helpText = `Available commands:
 /sessions — list all sessions across all groups
 /close <thread_id> — close a session by topic thread_id
 /update [do] — check for updates or apply update now
+/cost — show cost information for this group or topic
 /ping — check proxy latency
 /help — show this message`
 
@@ -119,6 +120,8 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply = helpText
 	case "/ping":
 		reply, err = h.cmdPing(ctx)
+	case "/cost":
+		reply, err = h.cmdCost(ctx, update, group)
 	default:
 		reply = fmt.Sprintf("Unknown command: %s\n\nUse /help for available commands.", cmd)
 	}
@@ -868,4 +871,83 @@ func (h *CommandHandler) updatePinnedMetadata(ctx context.Context, chatID, threa
 		Text:      metadata,
 	}
 	return h.postJSON(ctx, "/edit", editReq, nil)
+}
+
+// cmdCost handles /cost — shows cost information for this group or topic.
+// In General topic: shows group total, per-topic breakdown, and daily trend.
+// In a topic: shows this topic's total cost.
+func (h *CommandHandler) cmdCost(ctx context.Context, update contract.Update, group *Group) (string, error) {
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+
+	var sb strings.Builder
+
+	if update.ThreadID == nil {
+		// General topic: show group-level cost breakdown
+		groupTotal, err := h.db.GetGroupTotalCost(ctx, update.ChatID)
+		if err != nil {
+			return "", fmt.Errorf("get group total cost: %w", err)
+		}
+
+		fmt.Fprintf(&sb, "💰 Group Cost Report\n\n")
+		fmt.Fprintf(&sb, "Total Cost: $%.4f", groupTotal)
+
+		if group.MaxBudget > 0 {
+			budgetPercent := (groupTotal / group.MaxBudget) * 100
+			fmt.Fprintf(&sb, " / $%.2f budget (%.1f%% used)\n", group.MaxBudget, budgetPercent)
+			if budgetPercent >= 100 {
+				sb.WriteString("⚠️ BUDGET EXCEEDED — Further requests blocked\n")
+			} else if budgetPercent >= 80 {
+				sb.WriteString("⚠️ Warning: Approaching budget limit (80%)\n")
+			}
+		} else {
+			sb.WriteString("\n")
+		}
+
+		// Per-topic breakdown
+		byTopic, err := h.db.GetCostsByTopic(ctx, update.ChatID)
+		if err != nil {
+			return "", fmt.Errorf("get costs by topic: %w", err)
+		}
+
+		if len(byTopic) > 0 {
+			sb.WriteString("\nCost by topic:\n")
+			for _, tc := range byTopic {
+				fmt.Fprintf(&sb, "  • Thread %d: $%.4f (%d events)\n", tc.ThreadID, tc.TotalCost, tc.EventCount)
+			}
+		}
+
+		// Daily trend (last 7 days)
+		daily, err := h.db.GetDailyCosts(ctx, update.ChatID, 7)
+		if err != nil {
+			return "", fmt.Errorf("get daily costs: %w", err)
+		}
+
+		if len(daily) > 0 {
+			sb.WriteString("\nDaily trend (last 7 days):\n")
+			for _, dc := range daily {
+				fmt.Fprintf(&sb, "  • %s: $%.4f\n", dc.Date, dc.TotalCost)
+			}
+		}
+	} else {
+		// In a topic: show this topic's cost only
+		topicCost, err := h.db.GetTopicTotalCost(ctx, update.ChatID, *update.ThreadID)
+		if err != nil {
+			return "", fmt.Errorf("get topic cost: %w", err)
+		}
+
+		fmt.Fprintf(&sb, "💰 Topic Cost: $%.4f\n\n", topicCost)
+
+		// Get session details for more context
+		session, err := h.db.GetSession(ctx, update.ChatID, *update.ThreadID)
+		if err != nil {
+			return "", fmt.Errorf("get session: %w", err)
+		}
+		if session != nil {
+			fmt.Fprintf(&sb, "Session: %s\nMessages: %d\n", session.SessionID, session.MessageCount)
+		}
+	}
+
+	return strings.TrimRight(sb.String(), "\n"), nil
 }
