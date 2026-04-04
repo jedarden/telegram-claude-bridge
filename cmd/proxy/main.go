@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os/signal"
+	"path"
 	"strconv"
 	"syscall"
 	"time"
@@ -41,6 +44,7 @@ func main() {
 	mux.HandleFunc("/reopen_topic", handleReopenTopic(sender))
 	mux.HandleFunc("/pin_message", handlePinMessage(sender))
 	mux.HandleFunc("/answer_callback", handleAnswerCallback(sender))
+	mux.HandleFunc("GET /file/{file_id}", handleFile(sender))
 
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
@@ -302,6 +306,73 @@ func handleAnswerCallback(s *telegram.Sender) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(contract.OKResponse{OK: true}); err != nil {
 			log.Printf("answer_callback encode: %v", err)
+		}
+	}
+}
+
+// handleFile handles GET /file/{file_id}.
+// It calls Telegram's getFile to resolve the file_path, then streams the bytes from
+// the Telegram file CDN. Returns 404 for invalid/expired file_id, 413 if > 20MB.
+func handleFile(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		fileID := r.PathValue("file_id")
+		if fileID == "" {
+			writeProxyError(w, http.StatusBadRequest, 400, "missing file_id")
+			return
+		}
+
+		tgFile, apiErr := s.GetFile(r.Context(), fileID)
+		if apiErr != nil {
+			// Telegram 400-range errors mean invalid or expired file_id.
+			if apiErr.ErrorCode >= 400 && apiErr.ErrorCode < 500 {
+				writeProxyError(w, http.StatusNotFound, 404, "file not found or expired")
+				return
+			}
+			writeTelegramError(w, apiErr)
+			return
+		}
+
+		if tgFile.FilePath == nil {
+			writeProxyError(w, http.StatusNotFound, 404, "file not available")
+			return
+		}
+
+		if tgFile.FileSize != nil && *tgFile.FileSize > telegram.MaxFileSize {
+			writeProxyError(w, http.StatusRequestEntityTooLarge, 413, "file exceeds 20MB limit")
+			return
+		}
+
+		resp, err := s.DownloadFile(r.Context(), *tgFile.FilePath)
+		if err != nil {
+			writeProxyError(w, http.StatusBadGateway, 502, fmt.Sprintf("download failed: %v", err))
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusNotFound {
+			writeProxyError(w, http.StatusNotFound, 404, "file not found or expired")
+			return
+		}
+		if resp.StatusCode != http.StatusOK {
+			writeProxyError(w, http.StatusBadGateway, 502, fmt.Sprintf("Telegram returned %d", resp.StatusCode))
+			return
+		}
+
+		ct := resp.Header.Get("Content-Type")
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		w.Header().Set("Content-Type", ct)
+
+		if cl := resp.Header.Get("Content-Length"); cl != "" {
+			w.Header().Set("Content-Length", cl)
+		}
+
+		filename := path.Base(*tgFile.FilePath)
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, filename))
+
+		if _, err := io.Copy(w, resp.Body); err != nil {
+			log.Printf("file stream %s: %v", fileID, err)
 		}
 	}
 }

@@ -11,11 +11,15 @@ import (
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
 )
 
+// MaxFileSize is the maximum file size the proxy will download (20MB, Telegram bot API limit).
+const MaxFileSize = 20 * 1024 * 1024
+
 // Sender makes outbound calls to the Telegram Bot API.
 type Sender struct {
-	token   string
-	apiBase string
-	client  *http.Client
+	token          string
+	apiBase        string
+	client         *http.Client
+	downloadClient *http.Client
 }
 
 // NewSender creates a Sender. If apiBase is empty, the production Telegram API is used.
@@ -24,10 +28,43 @@ func NewSender(token, apiBase string) *Sender {
 		apiBase = telegramAPIBase
 	}
 	return &Sender{
-		token:   token,
-		apiBase: apiBase,
-		client:  &http.Client{Timeout: 10 * time.Second},
+		token:          token,
+		apiBase:        apiBase,
+		client:         &http.Client{Timeout: 10 * time.Second},
+		downloadClient: &http.Client{}, // no timeout; context controls deadline
 	}
+}
+
+// TGFile holds the result of a getFile API call.
+type TGFile struct {
+	FileID       string  `json:"file_id"`
+	FileUniqueID string  `json:"file_unique_id"`
+	FileSize     *int64  `json:"file_size,omitempty"`
+	FilePath     *string `json:"file_path,omitempty"`
+}
+
+// GetFile calls Telegram's getFile method and returns the file metadata.
+func (s *Sender) GetFile(ctx context.Context, fileID string) (*TGFile, *contract.ErrorResponse) {
+	tgResp, apiErr := s.call(ctx, "getFile", map[string]any{"file_id": fileID})
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	var f TGFile
+	if err := json.Unmarshal(tgResp.Result, &f); err != nil {
+		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: "bad response from Telegram"}
+	}
+	return &f, nil
+}
+
+// DownloadFile fetches raw file bytes from Telegram's file CDN.
+// The caller must close the response body.
+func (s *Sender) DownloadFile(ctx context.Context, filePath string) (*http.Response, error) {
+	fileURL := fmt.Sprintf("%s/file/bot%s/%s", s.apiBase, s.token, filePath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	return s.downloadClient.Do(req)
 }
 
 // tgAPIResponse is the generic Telegram Bot API response envelope.
