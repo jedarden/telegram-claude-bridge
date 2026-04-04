@@ -2,6 +2,8 @@
 // Version: 1.0
 package contract
 
+import "strings"
+
 // FromUser is the sender of a Telegram message.
 type FromUser struct {
 	ID        int64   `json:"id"`
@@ -229,3 +231,85 @@ const (
 
 // ContractVersion is the version of this data contract.
 const ContractVersion = "1.0"
+
+// IsGeneralTopic returns true when the update is in the General (main) topic.
+// The General topic has no thread_id (nil means General).
+func (u *Update) IsGeneralTopic() bool {
+	return u.ThreadID == nil
+}
+
+// IsCommand returns true when the content is a text message beginning with a bot command.
+func (c *Content) IsCommand() bool {
+	if c.Type != ContentTypeText || c.Text == nil || len(c.Entities) == 0 {
+		return false
+	}
+	e := c.Entities[0]
+	return e.Type == "bot_command" && e.Offset == 0
+}
+
+// ExtractCommandAndArgs parses a bot command from the content text.
+// It returns the command (e.g. "/start") and the remaining text as args.
+// Returns ("", "") if the content is not a command.
+func (c *Content) ExtractCommandAndArgs() (command, args string) {
+	if !c.IsCommand() {
+		return "", ""
+	}
+	e := c.Entities[0]
+	runes := []rune(*c.Text)
+	if e.Length > len(runes) {
+		return "", ""
+	}
+	command = string(runes[:e.Length])
+	// Strip @BotName suffix if present (e.g. "/start@mybot" → "/start")
+	if idx := strings.IndexByte(command, '@'); idx != -1 {
+		command = command[:idx]
+	}
+	args = strings.TrimSpace(string(runes[e.Length:]))
+	return command, args
+}
+
+// SendPhotoRequest holds metadata for POST /send_photo (multipart/form-data).
+// The actual file bytes are sent as a separate multipart part named "photo".
+type SendPhotoRequest struct {
+	ChatID           int64   `json:"chat_id"`
+	ThreadID         *int64  `json:"thread_id,omitempty"`
+	Caption          *string `json:"caption,omitempty"`
+	ParseMode        *string `json:"parse_mode,omitempty"`
+	ReplyToMessageID *int64  `json:"reply_to_message_id,omitempty"`
+}
+
+// SendDocumentRequest holds metadata for POST /send_document (multipart/form-data).
+// The actual file bytes are sent as a separate multipart part named "document".
+type SendDocumentRequest struct {
+	ChatID           int64   `json:"chat_id"`
+	ThreadID         *int64  `json:"thread_id,omitempty"`
+	Caption          *string `json:"caption,omitempty"`
+	ParseMode        *string `json:"parse_mode,omitempty"`
+	ReplyToMessageID *int64  `json:"reply_to_message_id,omitempty"`
+	FileName         *string `json:"file_name,omitempty"`
+}
+
+// SendAudioRequest holds metadata for POST /send_audio (multipart/form-data).
+// The actual file bytes are sent as a separate multipart part named "audio".
+type SendAudioRequest struct {
+	ChatID           int64   `json:"chat_id"`
+	ThreadID         *int64  `json:"thread_id,omitempty"`
+	Caption          *string `json:"caption,omitempty"`
+	ParseMode        *string `json:"parse_mode,omitempty"`
+	Duration         *int    `json:"duration,omitempty"`
+	Title            *string `json:"title,omitempty"`
+	ReplyToMessageID *int64  `json:"reply_to_message_id,omitempty"`
+}
+
+// SendVideoRequest holds metadata for POST /send_video (multipart/form-data).
+// The actual file bytes are sent as a separate multipart part named "video".
+type SendVideoRequest struct {
+	ChatID           int64   `json:"chat_id"`
+	ThreadID         *int64  `json:"thread_id,omitempty"`
+	Caption          *string `json:"caption,omitempty"`
+	ParseMode        *string `json:"parse_mode,omitempty"`
+	Duration         *int    `json:"duration,omitempty"`
+	Width            *int    `json:"width,omitempty"`
+	Height           *int    `json:"height,omitempty"`
+	ReplyToMessageID *int64  `json:"reply_to_message_id,omitempty"`
+}
