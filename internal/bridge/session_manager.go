@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -34,8 +35,9 @@ const (
 // subprocess invocations. Messages that arrive during processing are
 // queued (up to 32) and batched into the next prompt.
 type SessionManager struct {
-	db     *DB
-	sender *Sender
+	db       *DB
+	sender   *Sender
+	proxyURL string
 
 	mu     sync.Mutex
 	topics map[topicKey]*topicWorker
@@ -94,12 +96,14 @@ type contentBlockDelta struct {
 	} `json:"delta"`
 }
 
-// NewSessionManager creates a SessionManager backed by db and sender.
-func NewSessionManager(db *DB, sender *Sender) *SessionManager {
+// NewSessionManager creates a SessionManager backed by db, sender, and proxyURL.
+// proxyURL is the base URL of the proxy, used to download photo attachments.
+func NewSessionManager(db *DB, sender *Sender, proxyURL string) *SessionManager {
 	return &SessionManager{
-		db:     db,
-		sender: sender,
-		topics: make(map[topicKey]*topicWorker),
+		db:       db,
+		sender:   sender,
+		proxyURL: proxyURL,
+		topics:   make(map[topicKey]*topicWorker),
 	}
 }
 
@@ -202,9 +206,33 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		return
 	}
 
-	prompt := buildSessionPrompt(batch)
+	// Download any photo attachments before building the prompt.
+	tempFiles := make([]string, len(batch))
+	for i, msg := range batch {
+		if msg.update.Content != nil && msg.update.Content.Type == contract.ContentTypePhoto &&
+			msg.update.Content.FileID != nil {
+			path, err := m.processPhoto(ctx, key.chatID, msg.update.MessageID, *msg.update.Content.FileID)
+			if err != nil {
+				log.Printf("[session_mgr] photo download (%d,%d) msg %d: %v",
+					key.chatID, key.threadID, msg.update.MessageID, err)
+			} else {
+				tempFiles[i] = path
+			}
+		}
+	}
+	defer func() {
+		for _, path := range tempFiles {
+			if path != "" {
+				if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+					log.Printf("[session_mgr] cleanup %s: %v", path, err)
+				}
+			}
+		}
+	}()
+
+	prompt := buildSessionPrompt(batch, tempFiles)
 	if prompt == "" {
-		return // no text content to process
+		return // no content to process
 	}
 
 	m.sender.SendTyping(ctx, key.chatID, tidPtr)
@@ -428,12 +456,17 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 }
 
 // buildSessionPrompt constructs the prompt from a batch of messages.
+// tempFiles maps each batch index to a downloaded image path (empty string if none).
 // Single message: used as-is.
 // Multiple messages: previous ones listed under a header, last one highlighted.
-func buildSessionPrompt(batch []sessionMsg) string {
+func buildSessionPrompt(batch []sessionMsg, tempFiles []string) string {
 	texts := make([]string, 0, len(batch))
-	for _, msg := range batch {
-		if t := sessionMsgText(msg.update); t != "" {
+	for i, msg := range batch {
+		var imagePath string
+		if i < len(tempFiles) {
+			imagePath = tempFiles[i]
+		}
+		if t := sessionMsgText(msg.update, imagePath); t != "" {
 			texts = append(texts, t)
 		}
 	}
@@ -451,12 +484,30 @@ func buildSessionPrompt(batch []sessionMsg) string {
 	}
 }
 
-// sessionMsgText extracts the text from an update, or "" for non-text content.
-func sessionMsgText(update contract.Update) string {
-	if update.Content == nil || update.Content.Text == nil {
+// sessionMsgText extracts the prompt text from an update.
+// For photo messages, imagePath is the local path to the downloaded (and resized) file.
+// Returns "" for unsupported content types or when a photo could not be downloaded.
+func sessionMsgText(update contract.Update, imagePath string) string {
+	if update.Content == nil {
 		return ""
 	}
-	return *update.Content.Text
+	switch update.Content.Type {
+	case contract.ContentTypeText:
+		if update.Content.Text == nil {
+			return ""
+		}
+		return *update.Content.Text
+	case contract.ContentTypePhoto:
+		if imagePath == "" {
+			return "" // download failed; skip silently
+		}
+		if update.Content.Caption != nil && *update.Content.Caption != "" {
+			return fmt.Sprintf("[Image: %s]\nCaption: %s\nPlease analyze this image.",
+				imagePath, *update.Content.Caption)
+		}
+		return fmt.Sprintf("[User sent an image: %s]\nPlease analyze this image.", imagePath)
+	}
+	return ""
 }
 
 // resolveSessionModel returns the model to use for a Claude invocation.

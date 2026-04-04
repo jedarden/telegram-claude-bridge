@@ -34,9 +34,12 @@ func main() {
 	defer sender.Close()
 
 	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL)
+	sessionMgr := bridge.NewSessionManager(db, sender, cfg.ProxyURL)
+	defer sessionMgr.Shutdown()
 
 	router := bridge.NewRouter(db)
 	router.OnCommand = cmdHandler.Handle
+	router.OnSession = sessionMgr.Handle
 
 	updates := make(chan contract.Update, 64)
 	poller := bridge.NewPoller(cfg.ProxyURL, cfg.PollTimeout, updates)
