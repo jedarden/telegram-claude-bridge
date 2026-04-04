@@ -132,6 +132,8 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply, err = h.cmdCost(ctx, update, group)
 	case "/budget":
 		reply, err = h.cmdBudget(ctx, update, group, args)
+	case "/version":
+		reply, err = h.cmdVersion(ctx)
 	default:
 		reply = fmt.Sprintf("Unknown command: %s\n\nUse /help for available commands.", cmd)
 	}
