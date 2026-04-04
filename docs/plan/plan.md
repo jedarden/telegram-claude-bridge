@@ -18,7 +18,7 @@ Hold the Telegram bot token and act as a dumb authenticated pipe. No routing, no
 
 ### Technology
 
-- **Language:** Go (small binary, low memory, easy to containerize) or Python (consistency with bridge)
+- **Language:** Go (same as bridge — shared module, single build system)
 - **Runtime:** Single-container Deployment in its own namespace on ardenone-cluster
 - **Networking:** Tailscale sidecar or host networking for Tailscale access; no public ingress
 
@@ -161,12 +161,12 @@ All intelligence lives here: routing, session management, media processing, Clau
 
 ### Technology
 
-- **Language:** Python 3.11+ (async, best ecosystem for media processing libraries)
-- **Framework:** `asyncio` with `aiohttp` for HTTP client to proxy
-- **Claude integration:** Headless Claude Code CLI via `asyncio.create_subprocess_exec`. Invoked with `-p` (print mode), `--output-format stream-json` for streaming, `--resume` for session continuity.
-- **Media processing:** `openai-whisper` for audio transcription, `ffmpeg` for video frame/audio extraction
-- **State:** SQLite via `aiosqlite`
-- **Runtime:** systemd unit on EX44
+- **Language:** Go
+- **HTTP:** stdlib `net/http` for client to proxy
+- **Claude integration:** Headless Claude Code CLI via `os/exec`. Invoked with `-p` (print mode), `--output-format stream-json` for streaming, `--resume` for session continuity. Stdout piped through `bufio.Scanner` for NDJSON line parsing.
+- **Media processing:** `whisper` CLI for audio transcription, `ffmpeg` CLI for video frame/audio extraction (both invoked as subprocesses)
+- **State:** SQLite via `modernc.org/sqlite` (pure Go, no CGo)
+- **Runtime:** single static binary, systemd unit on EX44
 
 ### Architecture
 
@@ -210,18 +210,22 @@ All intelligence lives here: routing, session management, media processing, Clau
 
 Polls the proxy's `/updates` endpoint in a loop. Maintains its own long-poll timeout matching the proxy's Telegram poll. On connection failure, retries with exponential backoff (1s, 2s, 4s, 8s, max 30s). Deserializes update envelopes and dispatches to the Router.
 
-```python
-async def poll_loop(proxy_url: str, router: Router):
-    backoff = 1
-    while True:
-        try:
-            updates = await fetch_updates(proxy_url, timeout=35)
-            backoff = 1
-            for update in updates:
-                await router.route(update)
-        except ConnectionError:
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
+```go
+func pollLoop(ctx context.Context, proxyURL string, router *Router) {
+    backoff := time.Second
+    for {
+        updates, err := fetchUpdates(ctx, proxyURL, 35*time.Second)
+        if err != nil {
+            time.Sleep(backoff)
+            backoff = min(backoff*2, 30*time.Second)
+            continue
+        }
+        backoff = time.Second
+        for _, update := range updates {
+            router.Route(ctx, update)
+        }
+    }
+}
 ```
 
 #### 2. Router
@@ -279,29 +283,25 @@ The bridge stores this in SQLite and passes `--resume <session_id>` on all subse
 
 **Prompt input via stdin** (preferred — avoids shell injection from user text):
 
-```
-echo "<user message>" | claude -p --output-format stream-json --resume <session_id> --cwd <dir>
-```
-
-Or with `asyncio.create_subprocess_exec`:
-
-```python
-proc = await asyncio.create_subprocess_exec(
-    "claude", "-p",
+```go
+cmd := exec.CommandContext(ctx, "claude", "-p",
     "--output-format", "stream-json",
-    "--resume", session_id,
-    "--cwd", project_dir,
+    "--resume", sessionID,
+    "--cwd", projectDir,
     "--permission-mode", "plan",
-    stdin=asyncio.subprocess.PIPE,
-    stdout=asyncio.subprocess.PIPE,
-    stderr=asyncio.subprocess.PIPE,
 )
-proc.stdin.write(prompt.encode())
-proc.stdin.close()
+cmd.Stdin = strings.NewReader(prompt)
 
-async for line in proc.stdout:
-    event = json.loads(line)
-    # stream to Telegram via edit-in-place
+stdout, _ := cmd.StdoutPipe()
+cmd.Start()
+
+scanner := bufio.NewScanner(stdout)
+for scanner.Scan() {
+    var event StreamEvent
+    json.Unmarshal(scanner.Bytes(), &event)
+    // stream to Telegram via edit-in-place
+}
+cmd.Wait()
 ```
 
 **Session lifecycle:**
@@ -313,15 +313,16 @@ async for line in proc.stdout:
 
 **Timeouts:** 5-minute default per prompt. The subprocess is killed after the timeout. Configurable via `/timeout` command. On timeout, send error message to the topic and leave the session intact for retry.
 
-```python
-try:
-    stdout, stderr = await asyncio.wait_for(
-        proc.communicate(), timeout=timeout_sec
-    )
-except asyncio.TimeoutError:
-    proc.kill()
-    await proc.wait()
-    # notify user in Telegram
+```go
+ctx, cancel := context.WithTimeout(context.Background(), timeout)
+defer cancel()
+
+cmd := exec.CommandContext(ctx, "claude", "-p", ...)
+// CommandContext kills the process when ctx expires
+err := cmd.Wait()
+if ctx.Err() == context.DeadlineExceeded {
+    // notify user in Telegram
+}
 ```
 
 **File/image attachments:** Files downloaded from the proxy are saved to a temp directory and referenced in the prompt text. Claude Code's `Read` tool can process images, PDFs, code files, and notebooks from the filesystem. The prompt includes the file path:
@@ -536,20 +537,22 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 - Grant bot admin with `can_manage_topics`
 
 ### 1.2 — Proxy MVP
-- Single Python file (FastAPI or aiohttp)
+- Go binary (`cmd/proxy/main.go`), stdlib `net/http`
 - Long-poll Telegram, expose `/updates`, `/send`, `/edit`, `/health`
 - Token from env var (OpenBao injection at pod start)
-- Containerize, deploy to ardenone-cluster via ArgoCD
+- `FROM scratch` container, deploy to ardenone-cluster via ArgoCD
 - Verify: curl from EX44 over Tailscale returns updates
 
 ### 1.3 — Bridge MVP
+- Go binary (`cmd/bridge/main.go`)
 - Poller → Router → Session Manager → Sender pipeline
-- SQLite state with `groups` and `sessions` tables
+- SQLite state with `groups` and `sessions` tables (`modernc.org/sqlite`)
 - General topic: `/cwd` command to register a group
 - Non-General topics: create session on first message, `--resume` on subsequent
+- Claude CLI invoked via `os/exec`, stdout parsed line-by-line with `bufio.Scanner`
 - Text-only (no media processing)
-- No streaming — wait for full response, send as single message (chunked if >4096)
-- Systemd unit on EX44
+- No streaming — use `--output-format json`, wait for full response, send as single message (chunked if >4096)
+- Single static binary, systemd unit on EX44
 - Verify: send message in topic, receive Claude response
 
 ### 1.4 — Basic Commands
@@ -670,11 +673,11 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 
 | Component | Where | How | Config Source |
 |---|---|---|---|
-| Proxy | ardenone-cluster, `telegram-bridge` namespace | Deployment via ArgoCD | `declarative-config` repo |
-| Bridge | Hetzner EX44 | systemd unit | Local config file + SQLite |
+| Proxy | ardenone-cluster, `telegram-bridge` namespace | Deployment via ArgoCD, `FROM scratch` ~10MB image | `declarative-config` repo |
+| Bridge | Hetzner EX44 | Single Go binary, systemd unit | Local config file + SQLite |
 | Bot token | OpenBao on ardenone-cluster | Fetched at proxy startup | `secret/data/telegram-claude-bridge/bot-token` |
 | Manifests | `declarative-config` repo | GitOps via ArgoCD | `k8s/ardenone-cluster/telegram-bridge/` |
-| Bridge code | `telegram-claude-bridge` repo | git pull + systemd restart | This repo |
+| Source | `telegram-claude-bridge` repo | Go monorepo: `cmd/proxy/`, `cmd/bridge/` | This repo |
 
 ---
 
@@ -682,15 +685,108 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 
 | Decision | Options | Leaning | Notes |
 |---|---|---|---|
-| Proxy language | Go vs Python | Python | Consistency with bridge, simpler for a thin proxy |
+| Proxy language | Go | **Decided: Go** | Same language as bridge, single binary, minimal container |
+| Bridge language | Go | **Decided: Go** | See language evaluation below |
 | Claude integration | Headless CLI | **Decided: CLI** | `claude -p` with `--output-format stream-json`, `--resume` for sessions. Subprocess per prompt. |
-| Bridge language | Python vs TypeScript vs Go vs Rust | TBD | See language evaluation below |
 | Message format proxy→bridge | Normalized envelope vs raw Telegram JSON | Normalized | Keeps bridge decoupled from Telegram API specifics, proxy handles schema changes |
 | Media transfer proxy→bridge | Inline in update vs separate `/file` endpoint | Separate `/file` | Keeps update payloads small, avoids large base64 blobs |
 | Whisper model | turbo vs base vs small | turbo | Best accuracy-to-speed ratio |
 | Private chat topics | Support vs groups only | Groups only (initially) | Bot API 9.4 supports private chat topics, but groups are the primary use case |
 | Response format | HTML vs MarkdownV2 | HTML | MarkdownV2 escaping is unreliable — universal consensus from existing implementations |
 | Permission mode | plan vs acceptEdits vs dontAsk | plan (default) | Configurable per group. `plan` gives interactive approval via Telegram inline keyboards. |
+
+---
+
+## Language Evaluation
+
+The bridge and proxy are fundamentally I/O-bound glue: HTTP client, subprocess management, NDJSON line parsing, and SQLite. The language needs strong async I/O, reliable subprocess streaming, and minimal operational overhead.
+
+### Candidates
+
+#### Go
+
+**Strengths:**
+- Goroutines map 1:1 to the concurrency model: one goroutine per topic polling Claude subprocess stdout, one for the proxy HTTP poll loop, one per pending send. No callback chains or async/await coloring.
+- `os/exec` provides first-class subprocess management with `cmd.StdoutPipe()` returning an `io.Reader` — NDJSON line scanning is `bufio.NewScanner(pipe)` in a loop.
+- `net/http` client and server in stdlib — no third-party HTTP library needed for either component.
+- `database/sql` with `modernc.org/sqlite` (pure Go SQLite, no CGo) — single binary with no system dependencies.
+- Compiles to a single static binary. Deploy to EX44 is `scp` + `systemctl restart`. Container for the proxy is a `FROM scratch` image at ~10MB.
+- Memory footprint is minimal (~10-20MB for the bridge). Relevant on the proxy side where resource limits are 64Mi.
+- `encoding/json` handles all serialization. `json.Decoder` with `Token()` for streaming JSON parsing.
+- Error handling is explicit — no hidden exceptions from subprocess or HTTP failures.
+- Whisper and ffmpeg are invoked as CLI subprocesses regardless of language, so no Python library advantage.
+
+**Weaknesses:**
+- No REPL for quick iteration during development.
+- Verbose error handling boilerplate.
+- JSON struct tags are slightly more ceremony than dynamic languages.
+
+#### Python
+
+**Strengths:**
+- Fastest to prototype. `asyncio.create_subprocess_exec` for Claude CLI, `aiohttp` for HTTP, `aiosqlite` for SQLite.
+- Whisper can be imported as a library (`import whisper`) rather than shelled out — lower latency for transcription.
+- Largest ecosystem of Telegram bot libraries (`python-telegram-bot`, `aiogram`, `telethon`).
+- Most existing implementations in the research survey are Python.
+
+**Weaknesses:**
+- Runtime dependency: Python 3.11+, pip, virtualenv. Must be maintained on EX44 alongside system Python.
+- Async subprocess streaming in Python requires careful handling of `asyncio.StreamReader` — easy to deadlock on large stdout/stderr buffers.
+- `asyncio` function coloring: every function in the call chain must be async. Mixing sync and async (e.g., SQLite without aiosqlite) blocks the event loop.
+- Higher memory footprint (~50-100MB with dependencies loaded).
+- Dependency management (pip, requirements.txt or pyproject.toml) is more fragile than a compiled binary.
+- Containerizing Python is heavier (~200MB+ image with dependencies).
+
+#### TypeScript (Node.js / Bun)
+
+**Strengths:**
+- Good async primitives (`child_process.spawn` with stream events, `fetch` for HTTP).
+- Several surveyed implementations use TypeScript (the official Anthropic Telegram plugin runs on Bun).
+- Strong typing with TypeScript catches contract mismatches at compile time.
+- npm ecosystem has Telegram bot libraries (`telegraf`, `grammy`).
+
+**Weaknesses:**
+- Runtime dependency: Node.js or Bun must be installed and maintained on EX44.
+- `child_process` subprocess streaming is callback-based, slightly less ergonomic than Go's `io.Reader`.
+- `better-sqlite3` (native addon) requires build tools; `sql.js` (WASM) is slower.
+- Heavier container images than Go.
+- npm dependency tree adds supply chain surface area.
+
+#### Rust
+
+**Strengths:**
+- Performance and memory safety. `tokio::process::Command` for async subprocess. Single binary like Go.
+- Excellent error handling with `Result<T, E>`.
+
+**Weaknesses:**
+- Significantly more development time for what is I/O-bound glue code.
+- Async Rust has a steeper learning curve (lifetimes + async = complexity).
+- Compile times are slow for iteration speed.
+- Overkill — the bridge is not compute-bound, and the safety guarantees don't add much over Go for this workload.
+
+### Decision Matrix
+
+| Criterion | Go | Python | TypeScript | Rust |
+|---|---|---|---|---|
+| Subprocess streaming | `os/exec` + `bufio.Scanner` — excellent | `asyncio.create_subprocess_exec` — good, deadlock risk | `child_process.spawn` — good, callback-based | `tokio::process` — excellent |
+| HTTP client/server | stdlib `net/http` — no deps | `aiohttp` — third-party | `fetch` / `express` — third-party | `reqwest` / `axum` — third-party |
+| SQLite | `modernc.org/sqlite` pure Go — no CGo | `aiosqlite` — third-party | `better-sqlite3` — native addon | `rusqlite` — C binding |
+| JSON/NDJSON parsing | `encoding/json` stdlib | `json` stdlib | `JSON.parse` built-in | `serde_json` — third-party |
+| Binary/deployment | Single static binary, `FROM scratch` | Virtualenv + pip + runtime | Node/Bun runtime + node_modules | Single static binary |
+| Memory footprint | ~10-20MB | ~50-100MB | ~40-80MB | ~5-15MB |
+| Container size | ~10MB | ~200MB+ | ~150MB+ | ~10MB |
+| Development speed | Moderate | Fast | Moderate | Slow |
+| Operational overhead | Minimal — just the binary | Runtime + deps to maintain | Runtime + deps to maintain | Minimal — just the binary |
+| Concurrency model | Goroutines — natural fit | asyncio — function coloring | Event loop — natural fit | Tokio — steeper learning curve |
+| Whisper/ffmpeg | Shell out (same as all others) | Can import as library | Shell out | Shell out |
+
+### Recommendation: Go
+
+The bridge is subprocess management + HTTP + SQLite + NDJSON parsing. Go's stdlib covers all of these without third-party dependencies. Single binary deployment eliminates runtime management on EX44. The proxy is the same workload at smaller scale, so both components share a language, build system, and deployment model.
+
+Whisper is the one area where Python has an advantage (library import vs CLI). But Whisper-as-CLI (`whisper` command or `faster-whisper` CLI) is well-supported and avoids coupling the bridge to Python's runtime. The latency difference (subprocess spawn vs library call) is negligible compared to transcription time itself.
+
+The bridge and proxy share a Go module (monorepo with `cmd/proxy/` and `cmd/bridge/`), build to two binaries, and deploy independently.
 
 ---
 
