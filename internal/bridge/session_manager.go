@@ -1,6 +1,8 @@
 package bridge
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,10 +16,17 @@ import (
 )
 
 const (
-	topicQueueCapacity      = 32
-	defaultSessionModel     = "claude-sonnet-4-6"
-	defaultSessionTimeout   = 300
-	defaultPermissionMode   = "acceptEdits"
+	topicQueueCapacity    = 32
+	defaultSessionModel   = "claude-sonnet-4-6"
+	defaultSessionTimeout = 300
+	defaultPermissionMode = "acceptEdits"
+
+	// scannerMaxBuf is the max line size for the bufio.Scanner reading stream-json
+	// output. Claude responses can exceed the 64KB default.
+	scannerMaxBuf = 1 << 20 // 1MB
+
+	// streamDebounce is the minimum interval between progressive Telegram edits.
+	streamDebounce = 500 * time.Millisecond
 )
 
 // SessionManager manages per-topic Claude Code subprocess sessions.
@@ -51,13 +60,38 @@ type sessionMsg struct {
 	group   *Group   // non-nil when session is nil; nil when session is non-nil
 }
 
-// claudeOutput is the JSON emitted by `claude -p --output-format json`.
+// claudeOutput holds the results of a Claude CLI invocation.
+// StreamMsgID is non-zero when a live-edit streaming message was posted during
+// the subprocess run; processBatch edits it with the final canonical text.
 type claudeOutput struct {
 	Type         string  `json:"type"`
 	SessionID    string  `json:"session_id"`
 	Result       string  `json:"result"`
 	IsError      bool    `json:"is_error"`
 	TotalCostUSD float64 `json:"total_cost_usd"`
+	StreamMsgID  int64   // non-zero when streaming edits were posted
+}
+
+// streamLine is the envelope for each NDJSON line emitted by
+// `claude -p --output-format stream-json`.
+type streamLine struct {
+	Type         string          `json:"type"`
+	SessionID    string          `json:"session_id,omitempty"`
+	Result       string          `json:"result,omitempty"`
+	IsError      bool            `json:"is_error,omitempty"`
+	TotalCostUSD float64         `json:"total_cost_usd,omitempty"`
+	Event        json.RawMessage `json:"event,omitempty"`
+}
+
+// contentBlockDelta is a content_block_delta event nested inside a stream_event
+// line's "event" field.
+type contentBlockDelta struct {
+	Type  string `json:"type"`
+	Index int    `json:"index"`
+	Delta struct {
+		Type string `json:"type"` // "text_delta"
+		Text string `json:"text"`
+	} `json:"delta"`
 }
 
 // NewSessionManager creates a SessionManager backed by db and sender.
@@ -182,7 +216,7 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	out, err := m.invokeClaudeAPI(callCtx, session, group, prompt)
+	out, err := m.invokeClaudeAPI(callCtx, session, group, prompt, key.chatID, tidPtr, origMsgID)
 	if err != nil {
 		if callCtx.Err() == context.DeadlineExceeded {
 			log.Printf("[session_mgr] timeout for (%d,%d) after %ds", key.chatID, key.threadID, timeoutSec)
@@ -202,10 +236,14 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	}
 
 	text := out.Result
+	if text == "" && out.StreamMsgID != 0 {
+		// Streaming happened but result is empty — leave the last streamed update as-is.
+		return
+	}
 	if text == "" {
 		text = "(no response)"
 	}
-	if err := m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, text); err != nil {
+	if err := m.sender.SendStreamFinal(ctx, key.chatID, tidPtr, origMsgID, out.StreamMsgID, text); err != nil {
 		log.Printf("[session_mgr] send response (%d,%d): %v", key.chatID, key.threadID, err)
 	}
 }
@@ -233,12 +271,25 @@ func (m *SessionManager) resolveSessionGroup(ctx context.Context, key topicKey, 
 	return session, group, nil
 }
 
-// invokeClaudeAPI builds and runs the claude subprocess, returning parsed output.
-// The prompt is delivered via stdin to prevent shell injection.
-func (m *SessionManager) invokeClaudeAPI(ctx context.Context, session *Session, group *Group, prompt string) (*claudeOutput, error) {
+// invokeClaudeAPI runs the claude subprocess with --output-format stream-json,
+// reads NDJSON lines via bufio.Scanner, accumulates text_delta events into
+// progressive Telegram edits, and returns the final parsed output.
+//
+// chatID, threadID, and origMsgID are the Telegram coordinates used to post
+// the initial streaming message and subsequent edits.
+func (m *SessionManager) invokeClaudeAPI(
+	ctx context.Context,
+	session *Session,
+	group *Group,
+	prompt string,
+	chatID int64,
+	threadID *int64,
+	origMsgID int64,
+) (*claudeOutput, error) {
 	args := []string{
 		"-p",
-		"--output-format", "json",
+		"--output-format", "stream-json",
+		"--include-partial-messages",
 		"--permission-mode", resolvePermissionMode(group),
 		"--cwd", group.CWD,
 		"--model", resolveSessionModel(session, group),
@@ -250,29 +301,111 @@ func (m *SessionManager) invokeClaudeAPI(ctx context.Context, session *Session, 
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Stdin = strings.NewReader(prompt)
 
-	stdout, err := cmd.Output()
+	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start claude: %w", err)
+	}
+
+	scanner := bufio.NewScanner(stdoutPipe)
+	scanner.Buffer(make([]byte, scannerMaxBuf), scannerMaxBuf)
+
+	var (
+		textBuf     strings.Builder
+		lastEdit    time.Time
+		streamMsgID int64
+		out         claudeOutput
+	)
+
+	// flushEdit sends the current accumulated text as an initial message or an
+	// edit of the streaming placeholder. Skipped if the debounce interval hasn't
+	// elapsed yet (unless force=true).
+	flushEdit := func(force bool) {
+		text := textBuf.String()
+		if text == "" {
+			return
+		}
+		if !force && time.Since(lastEdit) < streamDebounce {
+			return
+		}
+		if streamMsgID == 0 {
+			id, err := m.sender.sendInitialStream(ctx, chatID, threadID, origMsgID, text)
+			if err != nil {
+				log.Printf("[session_mgr] send initial stream (%d,%d): %v", chatID, *threadID, err)
+				return
+			}
+			streamMsgID = id
+		} else {
+			if err := m.sender.EditMessage(ctx, chatID, streamMsgID, text); err != nil {
+				log.Printf("[session_mgr] edit stream (%d,%d): %v", chatID, *threadID, err)
+			}
+		}
+		lastEdit = time.Now()
+	}
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var env streamLine
+		if err := json.Unmarshal(line, &env); err != nil {
+			log.Printf("[session_mgr] parse stream line: %v (%.100s)", err, line)
+			continue
+		}
+		switch env.Type {
+		case "system":
+			// Init event — capture session_id early (result event overwrites later).
+			if env.SessionID != "" {
+				out.SessionID = env.SessionID
+			}
+		case "assistant":
+			// Complete assistant message block; text is accumulated via stream_events.
+		case "stream_event":
+			var delta contentBlockDelta
+			if err := json.Unmarshal(env.Event, &delta); err != nil {
+				continue
+			}
+			if delta.Type == "content_block_delta" && delta.Delta.Type == "text_delta" {
+				textBuf.WriteString(delta.Delta.Text)
+				flushEdit(false)
+			}
+		case "result":
+			// Canonical final event — overwrite session_id with the authoritative value.
+			out.Type = env.Type
+			out.SessionID = env.SessionID
+			out.Result = env.Result
+			out.IsError = env.IsError
+			out.TotalCostUSD = env.TotalCostUSD
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		_ = cmd.Process.Kill()
+		return nil, fmt.Errorf("read stdout: %w", err)
+	}
+
+	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderr := strings.TrimSpace(string(exitErr.Stderr))
-			if stderr != "" {
-				return nil, fmt.Errorf("claude exited %d: %s", exitErr.ExitCode(), stderr)
+			stderrStr := strings.TrimSpace(stderrBuf.String())
+			if stderrStr != "" {
+				return nil, fmt.Errorf("claude exited %d: %s", exitErr.ExitCode(), stderrStr)
 			}
 			return nil, fmt.Errorf("claude exited %d", exitErr.ExitCode())
 		}
-		return nil, fmt.Errorf("run claude: %w", err)
+		return nil, fmt.Errorf("wait claude: %w", err)
 	}
 
-	var out claudeOutput
-	if err := json.Unmarshal(stdout, &out); err != nil {
-		preview := string(stdout)
-		if len(preview) > 200 {
-			preview = preview[:200]
-		}
-		return nil, fmt.Errorf("parse claude output: %w (output: %s)", err, preview)
-	}
 	if out.IsError {
 		return nil, fmt.Errorf("claude error: %s", out.Result)
 	}
+
+	out.StreamMsgID = streamMsgID
 	return &out, nil
 }
 

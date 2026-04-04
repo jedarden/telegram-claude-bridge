@@ -111,6 +111,79 @@ func (s *Sender) SendResponse(ctx context.Context, chatID int64, threadID *int64
 	return nil
 }
 
+// sendInitialStream sends the first streaming message as a reply to origMsgID
+// and returns the sent message ID. Used by invokeClaudeAPI to post the initial
+// live-edit placeholder.
+func (s *Sender) sendInitialStream(ctx context.Context, chatID int64, threadID *int64, origMsgID int64, text string) (int64, error) {
+	req := contract.SendRequest{
+		ChatID:           chatID,
+		ThreadID:         threadID,
+		Text:             text,
+		ReplyToMessageID: &origMsgID,
+	}
+	var resp contract.SendResponse
+	if err := s.postWithRetry(ctx, "/send", req, &resp); err != nil {
+		return 0, err
+	}
+	if _, dbErr := s.db.ExecContext(ctx,
+		`INSERT INTO sent_messages (chat_id, thread_id, orig_msg_id, sent_msg_id, chunk_index, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		chatID, nullableInt64(threadID), origMsgID, resp.MessageID, 0, time.Now().Unix(),
+	); dbErr != nil {
+		log.Printf("[bridge/sender] db insert failed: %v", dbErr)
+	}
+	return resp.MessageID, nil
+}
+
+// EditMessage replaces the text of an already-sent message.
+func (s *Sender) EditMessage(ctx context.Context, chatID, messageID int64, text string) error {
+	return s.postWithRetry(ctx, "/edit", contract.EditRequest{
+		ChatID:    chatID,
+		MessageID: messageID,
+		Text:      text,
+	}, nil)
+}
+
+// SendStreamFinal concludes a streaming response. If streamMsgID is non-zero it
+// edits that message with the first chunk of the final text and sends any
+// overflow chunks as new (non-reply) messages in the same topic. If streamMsgID
+// is zero (no streaming occurred) it behaves exactly like SendResponse.
+func (s *Sender) SendStreamFinal(ctx context.Context, chatID int64, threadID *int64, origMsgID, streamMsgID int64, text string) error {
+	if streamMsgID == 0 {
+		return s.SendResponse(ctx, chatID, threadID, origMsgID, text)
+	}
+	chunks := chunkText(text)
+	// Edit the streaming placeholder with the first (or only) chunk.
+	if err := s.postWithRetry(ctx, "/edit", contract.EditRequest{
+		ChatID:    chatID,
+		MessageID: streamMsgID,
+		Text:      chunks[0],
+	}, nil); err != nil {
+		log.Printf("[bridge/sender] stream final edit failed: %v, falling back to new message", err)
+		return s.SendResponse(ctx, chatID, threadID, origMsgID, text)
+	}
+	// Send any overflow chunks as new messages in the topic (no reply attribution).
+	for i, chunk := range chunks[1:] {
+		req := contract.SendRequest{
+			ChatID:   chatID,
+			ThreadID: threadID,
+			Text:     chunk,
+		}
+		var resp contract.SendResponse
+		if err := s.postWithRetry(ctx, "/send", req, &resp); err != nil {
+			return fmt.Errorf("overflow chunk %d: %w", i+1, err)
+		}
+		if _, dbErr := s.db.ExecContext(ctx,
+			`INSERT INTO sent_messages (chat_id, thread_id, orig_msg_id, sent_msg_id, chunk_index, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			chatID, nullableInt64(threadID), origMsgID, resp.MessageID, i+1, time.Now().Unix(),
+		); dbErr != nil {
+			log.Printf("[bridge/sender] db insert failed: %v", dbErr)
+		}
+	}
+	return nil
+}
+
 // chunkText splits text into ≤4096-rune chunks at natural boundaries.
 //
 // Algorithm:
