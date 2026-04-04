@@ -73,8 +73,9 @@ type SessionManager struct {
 	sender   *Sender
 	proxyURL string
 
-	mu     sync.Mutex
-	topics map[topicKey]*topicWorker
+	mu                  sync.Mutex
+	topics              map[topicKey]*topicWorker
+	pinnedUpdateLastSeen map[topicKey]time.Time // debounce: track last pinned msg update time
 }
 
 type topicKey struct {
@@ -147,10 +148,11 @@ type contentBlockDelta struct {
 // proxyURL is the base URL of the proxy, used to download photo attachments.
 func NewSessionManager(db *DB, sender *Sender, proxyURL string) *SessionManager {
 	return &SessionManager{
-		db:       db,
-		sender:   sender,
-		proxyURL: proxyURL,
-		topics:   make(map[topicKey]*topicWorker),
+		db:                  db,
+		sender:              sender,
+		proxyURL:            proxyURL,
+		topics:              make(map[topicKey]*topicWorker),
+		pinnedUpdateLastSeen: make(map[topicKey]time.Time),
 	}
 }
 
@@ -765,6 +767,19 @@ func (m *SessionManager) updatePinnedMetadata(ctx context.Context, session *Sess
 		// No pinned message to update
 		return nil
 	}
+
+	key := topicKey{chatID: session.ChatID, threadID: session.ThreadID}
+
+	// Check debounce: skip if updated less than a minute ago
+	m.mu.Lock()
+	lastSeen, exists := m.pinnedUpdateLastSeen[key]
+	if exists && time.Since(lastSeen) < time.Minute {
+		m.mu.Unlock()
+		return nil // Skip this update
+	}
+	// Mark this update time
+	m.pinnedUpdateLastSeen[key] = time.Now()
+	m.mu.Unlock()
 
 	model := session.Model
 	if model == "" && group != nil {
