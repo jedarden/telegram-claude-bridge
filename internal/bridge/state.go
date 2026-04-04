@@ -353,6 +353,36 @@ func (d *DB) ListSessions(ctx context.Context, chatID int64) ([]*Session, error)
 	return sessions, rows.Err()
 }
 
+// ListAllSessions returns all sessions across all groups, ordered by last_active descending.
+func (d *DB) ListAllSessions(ctx context.Context) ([]*Session, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
+		        created_at, last_active, message_count
+		 FROM sessions ORDER BY last_active DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []*Session
+	for rows.Next() {
+		s, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, s)
+	}
+	return sessions, rows.Err()
+}
+
+// CloseSession marks a session as closed.
+func (d *DB) CloseSession(ctx context.Context, chatID, threadID int64) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE sessions SET status = 'closed' WHERE chat_id = ? AND thread_id = ?`,
+		chatID, threadID)
+	return err
+}
+
 // DeleteSession removes a session record.
 func (d *DB) DeleteSession(ctx context.Context, chatID, threadID int64) error {
 	_, err := d.db.ExecContext(ctx,

@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/jedarden/telegram-claude-bridge/internal/bridge"
 	"github.com/jedarden/telegram-claude-bridge/internal/config"
+	"github.com/jedarden/telegram-claude-bridge/internal/contract"
 )
 
 func main() {
@@ -13,6 +19,41 @@ func main() {
 	}
 
 	log.Printf("bridge starting, proxy=%s (poll_timeout=%ds)", cfg.ProxyURL, cfg.PollTimeout)
-	// TODO: connect to proxy, start update polling loop, manage Claude sessions
-	_ = cfg
+
+	db, err := bridge.OpenDB(cfg.DBPath)
+	if err != nil {
+		log.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	// The sender uses its own database for tracking sent message IDs.
+	sender, err := bridge.NewSender(cfg.ProxyURL, cfg.DBPath+".sender")
+	if err != nil {
+		log.Fatalf("create sender: %v", err)
+	}
+	defer sender.Close()
+
+	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL)
+
+	router := bridge.NewRouter(db)
+	router.OnCommand = cmdHandler.Handle
+
+	updates := make(chan contract.Update, 64)
+	poller := bridge.NewPoller(cfg.ProxyURL, cfg.PollTimeout, updates)
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	poller.Start(ctx)
+	log.Println("bridge ready, waiting for updates")
+
+	for {
+		select {
+		case update := <-updates:
+			router.Route(ctx, update)
+		case <-ctx.Done():
+			log.Println("bridge shutting down")
+			return
+		}
+	}
 }
