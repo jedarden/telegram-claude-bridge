@@ -40,11 +40,14 @@ type BridgeConfig struct {
 }
 
 // LoadProxyConfig reads ProxyConfig from environment variables.
-// Required: TELEGRAM_TOKEN
+// Required: BOT_TOKEN (or TELEGRAM_TOKEN for backward compatibility).
 func LoadProxyConfig() (*ProxyConfig, error) {
-	token := os.Getenv("TELEGRAM_TOKEN")
+	token := os.Getenv("BOT_TOKEN")
 	if token == "" {
-		return nil, fmt.Errorf("TELEGRAM_TOKEN environment variable is required")
+		token = os.Getenv("TELEGRAM_TOKEN")
+	}
+	if token == "" {
+		return nil, fmt.Errorf("BOT_TOKEN environment variable is required")
 	}
 
 	cfg := &ProxyConfig{
