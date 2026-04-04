@@ -64,7 +64,7 @@ func main() {
 		defer upd.Stop()
 	}
 
-	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL, upd)
+	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL, upd, Version, CommitSHA, BuildDate)
 	sessionMgr := bridge.NewSessionManager(db, sender, cfg.ProxyURL)
 	defer sessionMgr.Shutdown()
 

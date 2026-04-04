@@ -226,7 +226,7 @@ func (u *Updater) buildNewBinary(ctx context.Context) error {
 	// Get version info for ldflags
 	version, commit, buildDate := u.getBuildInfo(ctx)
 
-	ldflags := fmt.Sprintf("-X main.version=%s -X main.commit=%s -X main.buildDate=%s",
+	ldflags := fmt.Sprintf("-X main.Version=%s -X main.CommitSHA=%s -X main.BuildDate=%s",
 		version, commit, buildDate)
 
 	// Build to temp file (binary path with .new suffix)
