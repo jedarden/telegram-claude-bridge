@@ -66,8 +66,12 @@ type sessionMsg struct {
 // Only the field relevant to the content type is populated.
 type msgExtra struct {
 	imagePath     string   // local path for photo attachments (ContentTypePhoto)
-	transcription string   // whisper transcription text (ContentTypeVoice / ContentTypeAudio)
+	transcription string   // whisper transcription text (ContentTypeVoice / ContentTypeAudio / ContentTypeVideo)
 	audioTitle    string   // audio track title, if set (ContentTypeAudio only)
+	keyframePaths []string // paths to extracted keyframe images (ContentTypeVideo / ContentTypeVideoNote)
+	videoCaption  string   // video caption, if set (ContentTypeVideo only)
+	docPath       string   // local path for document attachments (ContentTypeDocument)
+	docMsg        string   // unsupported file type warning message
 	cleanupPaths  []string // all temp files to remove after prompt is sent
 }
 
@@ -216,18 +220,20 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	}
 
 	// Start a continuous typing indicator early if any message requires audio
-	// transcription (Whisper can take 10-30 s for long recordings).
+	// transcription or video processing (Whisper can take 10-30 s for long recordings).
 	var stopTyping func()
 	for _, msg := range batch {
 		if msg.update.Content != nil &&
 			(msg.update.Content.Type == contract.ContentTypeVoice ||
-				msg.update.Content.Type == contract.ContentTypeAudio) {
+				msg.update.Content.Type == contract.ContentTypeAudio ||
+				msg.update.Content.Type == contract.ContentTypeVideo ||
+				msg.update.Content.Type == contract.ContentTypeVideoNote) {
 			stopTyping = m.startTyping(ctx, key.chatID, tidPtr)
 			break
 		}
 	}
 
-	// Resolve attachments: download photos and transcribe voice/audio.
+	// Resolve attachments: download photos, transcribe voice/audio, and process video.
 	extras := make([]msgExtra, len(batch))
 	for i, msg := range batch {
 		if msg.update.Content == nil || msg.update.Content.FileID == nil {
@@ -251,6 +257,21 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 			ex := msgExtra{transcription: text, cleanupPaths: paths}
 			if msg.update.Content.Title != nil {
 				ex.audioTitle = *msg.update.Content.Title
+			}
+			extras[i] = ex
+		case contract.ContentTypeVideo, contract.ContentTypeVideoNote:
+			result, paths, err := m.processVideo(ctx, key.chatID, msg.update.MessageID, *msg.update.Content.FileID)
+			if err != nil {
+				log.Printf("[session_mgr] video processing (%d,%d) msg %d: %v",
+					key.chatID, key.threadID, msg.update.MessageID, err)
+			}
+			ex := msgExtra{
+				transcription: result.transcription,
+				keyframePaths: result.keyframePaths,
+				cleanupPaths:  paths,
+			}
+			if msg.update.Content.Caption != nil {
+				ex.videoCaption = *msg.update.Content.Caption
 			}
 			extras[i] = ex
 		}
@@ -563,6 +584,38 @@ func sessionMsgText(update contract.Update, ex msgExtra) string {
 				ex.audioTitle, ex.transcription)
 		}
 		return fmt.Sprintf("[Audio transcription]: %s\n\nPlease respond to the above.", ex.transcription)
+	case contract.ContentTypeVideo, contract.ContentTypeVideoNote:
+		var parts []string
+		videoType := "video"
+		if update.Content.Type == contract.ContentTypeVideoNote {
+			videoType = "video note"
+		}
+
+		// Add keyframes if any were extracted.
+		if len(ex.keyframePaths) > 0 {
+			parts = append(parts, fmt.Sprintf("[User sent a %s with %d keyframe(s)]", videoType, len(ex.keyframePaths)))
+			for i, path := range ex.keyframePaths {
+				parts = append(parts, fmt.Sprintf("  Keyframe %d: %s", i+1, path))
+			}
+		} else {
+			parts = append(parts, fmt.Sprintf("[User sent a %s]", videoType))
+		}
+
+		// Add caption if present.
+		if ex.videoCaption != "" {
+			parts = append(parts, fmt.Sprintf("Caption: %s", ex.videoCaption))
+		}
+
+		// Add transcription if available.
+		if ex.transcription != "" {
+			parts = append(parts, fmt.Sprintf("Audio transcription: %s", ex.transcription))
+		}
+
+		if len(parts) > 0 {
+			parts = append(parts, "Please analyze this video content.")
+			return strings.Join(parts, "\n")
+		}
+		return "" // processing failed; skip silently
 	}
 	return ""
 }
