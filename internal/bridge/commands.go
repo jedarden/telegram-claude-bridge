@@ -17,11 +17,20 @@ import (
 
 const helpText = `Available commands:
 /cwd [path] — show or set this group's working directory
+/permission [mode] — show or set Claude's permission mode (acceptEdits, bypassPermissions, plan, dontAsk)
 /status — list active sessions in this group
 /sessions — list all sessions across all groups
 /close <thread_id> — close a session by topic thread_id
 /ping — check proxy latency
 /help — show this message`
+
+// validPermissionModes lists the --permission-mode values accepted by Claude CLI.
+var validPermissionModes = map[string]bool{
+	"acceptEdits":        true,
+	"bypassPermissions":  true,
+	"plan":               true,
+	"dontAsk":            true,
+}
 
 // CommandHandler dispatches bot commands sent in the General topic.
 type CommandHandler struct {
@@ -56,6 +65,8 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 	switch cmd {
 	case "/cwd":
 		reply, err = h.cmdCWD(ctx, update, group, args)
+	case "/permission":
+		reply, err = h.cmdPermission(ctx, update, group, args)
 	case "/status":
 		reply, err = h.cmdStatus(ctx, update, group)
 	case "/sessions":
@@ -114,15 +125,44 @@ func (h *CommandHandler) cmdCWD(ctx context.Context, update contract.Update, gro
 		newGroup.MaxBudget    = group.MaxBudget
 		newGroup.TimeoutSec   = group.TimeoutSec
 	} else {
-		newGroup.DefaultModel = "claude-sonnet-4-6"
-		newGroup.MaxBudget    = 5.0
-		newGroup.TimeoutSec   = 300
+		newGroup.DefaultModel   = "claude-sonnet-4-6"
+		newGroup.MaxBudget      = 5.0
+		newGroup.TimeoutSec     = 300
+		newGroup.PermissionMode = defaultPermissionMode
 	}
 
 	if err := h.db.UpsertGroup(ctx, newGroup); err != nil {
 		return "", fmt.Errorf("save group: %w", err)
 	}
 	return fmt.Sprintf("Working directory set to: %s", args), nil
+}
+
+// cmdPermission handles /permission [mode].
+// Without an argument it shows the current permission mode. With an argument it
+// validates and updates the mode for this group.
+func (h *CommandHandler) cmdPermission(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+
+	if args == "" {
+		mode := group.PermissionMode
+		if mode == "" {
+			mode = defaultPermissionMode
+		}
+		return fmt.Sprintf("Permission mode: %s\n\nValid modes: acceptEdits, bypassPermissions, plan, dontAsk", mode), nil
+	}
+
+	mode := strings.TrimSpace(args)
+	if !validPermissionModes[mode] {
+		return fmt.Sprintf("Invalid permission mode %q.\n\nValid modes: acceptEdits, bypassPermissions, plan, dontAsk", mode), nil
+	}
+
+	group.PermissionMode = mode
+	if err := h.db.UpsertGroup(ctx, group); err != nil {
+		return "", fmt.Errorf("save group: %w", err)
+	}
+	return fmt.Sprintf("Permission mode set to: %s", mode), nil
 }
 
 // cmdStatus handles /status — lists active sessions for this group.

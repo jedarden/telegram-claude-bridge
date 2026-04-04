@@ -17,13 +17,14 @@ type DB struct {
 
 // Group represents a configured Telegram group/supergroup.
 type Group struct {
-	ChatID       int64
-	Name         string
-	CWD          string
-	DefaultModel string
-	MaxBudget    float64
-	TimeoutSec   int
-	CreatedAt    time.Time
+	ChatID         int64
+	Name           string
+	CWD            string
+	DefaultModel   string
+	MaxBudget      float64
+	TimeoutSec     int
+	PermissionMode string
+	CreatedAt      time.Time
 }
 
 // Session represents an active Claude Code session mapped to a (chat_id, thread_id) pair.
@@ -55,7 +56,7 @@ type SentMessage struct {
 	CreatedAt time.Time
 }
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -100,6 +101,9 @@ var migrations = []string{
 		created_at TEXT NOT NULL DEFAULT (datetime('now')),
 		PRIMARY KEY (chat_id, thread_id, message_id)
 	);`,
+
+	// Version 2 — add permission_mode to groups
+	`ALTER TABLE groups ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'acceptEdits';`,
 }
 
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
@@ -184,7 +188,8 @@ func (d *DB) migrate() error {
 // GetGroup returns the group with the given chat_id, or (nil, nil) if not found.
 func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 	row := d.db.QueryRowContext(ctx,
-		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec, created_at
+		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec,
+		        COALESCE(permission_mode,'acceptEdits'), created_at
 		 FROM groups WHERE chat_id = ?`, chatID)
 	return scanGroup(row)
 }
@@ -192,15 +197,16 @@ func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 // UpsertGroup inserts or replaces a group record.
 func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(chat_id) DO UPDATE SET
-		   name          = excluded.name,
-		   cwd           = excluded.cwd,
-		   default_model = excluded.default_model,
-		   max_budget    = excluded.max_budget,
-		   timeout_sec   = excluded.timeout_sec`,
-		g.ChatID, g.Name, g.CWD, g.DefaultModel, g.MaxBudget, g.TimeoutSec,
+		   name            = excluded.name,
+		   cwd             = excluded.cwd,
+		   default_model   = excluded.default_model,
+		   max_budget      = excluded.max_budget,
+		   timeout_sec     = excluded.timeout_sec,
+		   permission_mode = excluded.permission_mode`,
+		g.ChatID, g.Name, g.CWD, g.DefaultModel, g.MaxBudget, g.TimeoutSec, g.PermissionMode,
 		g.CreatedAt.UTC().Format(time.RFC3339),
 	)
 	return err
@@ -209,7 +215,8 @@ func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 // ListGroups returns all configured groups.
 func (d *DB) ListGroups(ctx context.Context) ([]*Group, error) {
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec, created_at
+		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec,
+		        COALESCE(permission_mode,'acceptEdits'), created_at
 		 FROM groups ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -254,7 +261,7 @@ type groupScanner interface {
 func scanGroup(s groupScanner) (*Group, error) {
 	var g Group
 	var createdAt string
-	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &createdAt)
+	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &g.PermissionMode, &createdAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

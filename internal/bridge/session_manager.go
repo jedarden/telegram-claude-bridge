@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	topicQueueCapacity   = 32
-	defaultSessionModel  = "claude-sonnet-4-6"
-	defaultSessionTimeout = 300
+	topicQueueCapacity      = 32
+	defaultSessionModel     = "claude-sonnet-4-6"
+	defaultSessionTimeout   = 300
+	defaultPermissionMode   = "acceptEdits"
 )
 
 // SessionManager manages per-topic Claude Code subprocess sessions.
@@ -238,7 +239,7 @@ func (m *SessionManager) invokeClaudeAPI(ctx context.Context, session *Session, 
 	args := []string{
 		"-p",
 		"--output-format", "json",
-		"--permission-mode", "bypassPermissions",
+		"--permission-mode", resolvePermissionMode(group),
 		"--cwd", group.CWD,
 		"--model", resolveSessionModel(session, group),
 	}
@@ -335,4 +336,13 @@ func resolveSessionModel(session *Session, group *Group) string {
 		return group.DefaultModel
 	}
 	return defaultSessionModel
+}
+
+// resolvePermissionMode returns the --permission-mode value for a Claude invocation.
+// Falls back to defaultPermissionMode if not configured on the group.
+func resolvePermissionMode(group *Group) string {
+	if group != nil && group.PermissionMode != "" {
+		return group.PermissionMode
+	}
+	return defaultPermissionMode
 }
