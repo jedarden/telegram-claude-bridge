@@ -22,6 +22,7 @@ func main() {
 	}
 
 	poller := telegram.NewPoller(cfg.TelegramToken, "")
+	sender := telegram.NewSender(cfg.TelegramToken, "")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -31,6 +32,9 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handleHealth(poller))
 	mux.HandleFunc("/updates", handleUpdates(poller))
+	mux.HandleFunc("/send", handleSend(sender))
+	mux.HandleFunc("/edit", handleEdit(sender))
+	mux.HandleFunc("/send_chat_action", handleSendChatAction(sender))
 
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
@@ -92,5 +96,96 @@ func handleUpdates(p *telegram.Poller) http.HandlerFunc {
 		}); err != nil {
 			log.Printf("updates encode: %v", err)
 		}
+	}
+}
+
+func handleSend(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req contract.SendRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "invalid JSON: "+err.Error())
+			return
+		}
+		resp, apiErr := s.SendMessage(r.Context(), req)
+		if apiErr != nil {
+			writeTelegramError(w, apiErr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("send encode: %v", err)
+		}
+	}
+}
+
+func handleEdit(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req contract.EditRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "invalid JSON: "+err.Error())
+			return
+		}
+		resp, apiErr := s.EditMessageText(r.Context(), req)
+		if apiErr != nil {
+			writeTelegramError(w, apiErr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("edit encode: %v", err)
+		}
+	}
+}
+
+func handleSendChatAction(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req contract.ChatActionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "invalid JSON: "+err.Error())
+			return
+		}
+		if apiErr := s.SendChatAction(r.Context(), req); apiErr != nil {
+			writeTelegramError(w, apiErr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(contract.OKResponse{OK: true}); err != nil {
+			log.Printf("send_chat_action encode: %v", err)
+		}
+	}
+}
+
+// writeProxyError writes a proxy-originated error (bad request, etc.).
+func writeProxyError(w http.ResponseWriter, httpStatus, code int, desc string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(httpStatus)
+	if err := json.NewEncoder(w).Encode(contract.ErrorResponse{ErrorCode: code, Description: desc}); err != nil {
+		log.Printf("error encode: %v", err)
+	}
+}
+
+// writeTelegramError maps a Telegram API error to an HTTP response.
+// 429 → 429, all others → 502 Bad Gateway.
+func writeTelegramError(w http.ResponseWriter, e *contract.ErrorResponse) {
+	httpStatus := http.StatusBadGateway
+	if e.ErrorCode == contract.ErrCodeRateLimit {
+		httpStatus = http.StatusTooManyRequests
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(httpStatus)
+	if err := json.NewEncoder(w).Encode(e); err != nil {
+		log.Printf("telegram error encode: %v", err)
 	}
 }
