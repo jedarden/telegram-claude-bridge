@@ -20,6 +20,12 @@ const helpText = `Available commands:
 /new <name> — create a new topic and start a Claude session
 /cwd [path] — show or set this group's working directory
 /permission [mode] — show or set Claude's permission mode (acceptEdits, bypassPermissions, plan, dontAsk)
+/model [name] — view or set model for this topic
+/haiku — quick switch to claude-haiku-4-5
+/sonnet — quick switch to claude-sonnet-4-6
+/opus — quick switch to claude-opus-4-6
+/color [name] — set topic icon color (active, complete, blocked, error, review, research)
+/info — show session info (model, cwd, session_id, messages)
 /status — list active sessions in this group
 /sessions — list all sessions across all groups
 /close <thread_id> — close a session by topic thread_id
@@ -71,6 +77,18 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply, err = h.cmdCWD(ctx, update, group, args)
 	case "/permission":
 		reply, err = h.cmdPermission(ctx, update, group, args)
+	case "/model":
+		reply, err = h.cmdModel(ctx, update, group, args)
+	case "/haiku":
+		reply, err = h.cmdModel(ctx, update, group, "claude-haiku-4-5")
+	case "/sonnet":
+		reply, err = h.cmdModel(ctx, update, group, "claude-sonnet-4-6")
+	case "/opus":
+		reply, err = h.cmdModel(ctx, update, group, "claude-opus-4-6")
+	case "/color":
+		reply, err = h.cmdColor(ctx, update, group, args)
+	case "/info":
+		reply, err = h.cmdInfo(ctx, update, group)
 	case "/status":
 		reply, err = h.cmdStatus(ctx, update, group)
 	case "/sessions":
@@ -252,12 +270,20 @@ func (h *CommandHandler) cmdClose(ctx context.Context, update contract.Update, g
 		return "", fmt.Errorf("close session: %w", err)
 	}
 
+	// Set the color to green (complete) when closing
+	if colorErr := h.db.SetSessionIconColor(ctx, update.ChatID, threadID, ColorComplete); colorErr != nil {
+		log.Printf("[bridge/commands] set icon color failed for (%d, %d): %v", update.ChatID, threadID, colorErr)
+	}
+	if colorErr := h.editTopicColor(ctx, update.ChatID, threadID, ColorComplete); colorErr != nil {
+		log.Printf("[bridge/commands] edit topic color failed for (%d, %d): %v", update.ChatID, threadID, colorErr)
+	}
+
 	// Best-effort: also close the Telegram topic via proxy.
 	if topicErr := h.closeTopic(ctx, update.ChatID, threadID); topicErr != nil {
 		log.Printf("[bridge/commands] close_topic failed for (%d, %d): %v", update.ChatID, threadID, topicErr)
-		return fmt.Sprintf("Session closed (thread %d). Note: could not close Telegram topic: %v", threadID, topicErr), nil
+		return fmt.Sprintf("Session closed and marked complete (thread %d). Note: could not close Telegram topic: %v", threadID, topicErr), nil
 	}
-	return fmt.Sprintf("Session closed and topic closed (thread %d).", threadID), nil
+	return fmt.Sprintf("Session closed and marked complete (thread %d).", threadID), nil
 }
 
 // cmdPing handles /ping — measures round-trip latency to the proxy /health endpoint.
@@ -274,6 +300,121 @@ func (h *CommandHandler) cmdPing(ctx context.Context) (string, error) {
 	resp.Body.Close()
 	latency := time.Since(start).Round(time.Millisecond)
 	return fmt.Sprintf("pong (%s round-trip to proxy)", latency), nil
+}
+
+// cmdColor handles /color [name] — sets the topic icon color manually.
+// Valid colors: active (light blue), complete (green), blocked (yellow),
+// error (red/orange), review (pink), research (purple).
+func (h *CommandHandler) cmdColor(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	if update.ThreadID == nil {
+		return "Color commands only work within a topic session. Use /new to create a topic first.", nil
+	}
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+
+	// If no args, show current color
+	if args == "" {
+		session, err := h.db.GetSession(ctx, update.ChatID, *update.ThreadID)
+		if err != nil {
+			return "", fmt.Errorf("get session: %w", err)
+		}
+		if session == nil {
+			return "No session found for this topic.", nil
+		}
+		colorName := colorToName(session.IconColor)
+		return fmt.Sprintf("Current color: %s\n\nAvailable colors: active, complete, blocked, error, review, research", colorName), nil
+	}
+
+	// Parse and validate the color name
+	colorName := strings.ToLower(strings.TrimSpace(args))
+	var newColor int
+	var valid bool
+
+	switch colorName {
+	case "active", "blue", "lightblue":
+		newColor = ColorActive
+		valid = true
+	case "complete", "closed", "green":
+		newColor = ColorComplete
+		valid = true
+	case "blocked", "yellow":
+		newColor = ColorBlocked
+		valid = true
+	case "error", "red", "redorange":
+		newColor = ColorError
+		valid = true
+	case "review", "pink":
+		newColor = ColorReview
+		valid = true
+	case "research", "purple":
+		newColor = ColorResearch
+		valid = true
+	}
+
+	if !valid {
+		return fmt.Sprintf("Invalid color %q.\n\nAvailable colors: active, complete, blocked, error, review, research", args), nil
+	}
+
+	// Update the color in the database
+	if err := h.db.SetSessionIconColor(ctx, update.ChatID, *update.ThreadID, newColor); err != nil {
+		return "", fmt.Errorf("set icon color: %w", err)
+	}
+
+	// Update the Telegram topic
+	if err := h.editTopicColor(ctx, update.ChatID, *update.ThreadID, newColor); err != nil {
+		log.Printf("[bridge/commands] edit topic color failed: %v", err)
+		return fmt.Sprintf("Color set to %s (database updated). Note: could not update Telegram topic: %v", colorName, err), nil
+	}
+
+	return fmt.Sprintf("Topic color set to: %s", colorName), nil
+}
+
+// colorToName converts an icon color integer to a human-readable name.
+func colorToName(color int) string {
+	switch color {
+	case ColorActive:
+		return "active"
+	case ColorComplete:
+		return "complete"
+	case ColorBlocked:
+		return "blocked"
+	case ColorError:
+		return "error"
+	case ColorReview:
+		return "review"
+	case ColorResearch:
+		return "research"
+	default:
+		return fmt.Sprintf("unknown (%d)", color)
+	}
+}
+
+// editTopicColor calls POST /edit_topic on the proxy to change the icon color.
+func (h *CommandHandler) editTopicColor(ctx context.Context, chatID, threadID int64, iconColor int) error {
+	body := contract.EditTopicRequest{
+		ChatID:    chatID,
+		ThreadID:  threadID,
+		IconColor: &iconColor,
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.proxyURL+"/edit_topic", bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("proxy returned HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // closeTopic calls POST /close_topic on the proxy.
@@ -370,6 +511,17 @@ func (h *CommandHandler) cmdNew(ctx context.Context, update contract.Update, gro
 	if err := h.pinMessage(ctx, update.ChatID, sendResp.MessageID); err != nil {
 		log.Printf("[bridge/commands] pin message failed: %v", err)
 		// Non-fatal: continue anyway
+
+		// Step 6: Record the pinned message so we can find it for updates later
+		if err := h.db.RecordSentMessage(ctx, &SentMessage{
+			ChatID:    update.ChatID,
+			ThreadID:  threadID,
+			MessageID: sendResp.MessageID,
+			Purpose:   "metadata",
+		}); err != nil {
+			log.Printf("[bridge/commands] record pinned message failed: %v", err)
+			// Non-fatal: continue anyway
+		}
 	}
 
 	return fmt.Sprintf("Created topic: %s (thread_id: %d)", topicName, threadID), nil
@@ -449,4 +601,137 @@ func (h *CommandHandler) postJSON(ctx context.Context, path string, body, out an
 		}
 	}
 	return nil
+}
+
+// cmdModel handles /model [name] — views or sets the model for this topic.
+// Also called by /haiku, /sonnet, /opus shortcuts.
+func (h *CommandHandler) cmdModel(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	if update.ThreadID == nil {
+		return "Model commands only work within a topic session. Use /new to create a topic first.", nil
+	}
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+
+	// Get the current session
+	session, err := h.db.GetSession(ctx, update.ChatID, *update.ThreadID)
+	if err != nil {
+		return "", fmt.Errorf("get session: %w", err)
+	}
+	if session == nil {
+		return "No session found for this topic.", nil
+	}
+
+	// If no args, show current model
+	if args == "" {
+		currentModel := session.Model
+		if currentModel == "" {
+			currentModel = group.DefaultModel
+		}
+		if currentModel == "" {
+			currentModel = defaultSessionModel
+		}
+		return fmt.Sprintf("Current model: %s\n\nAvailable models: claude-haiku-4-5, claude-sonnet-4-6, claude-opus-4-6", currentModel), nil
+	}
+
+	// Validate and set the new model
+	newModel := strings.TrimSpace(args)
+	validModels := map[string]bool{
+		"claude-haiku-4-5":  true,
+		"claude-sonnet-4-6": true,
+		"claude-opus-4-6":   true,
+	}
+	if !validModels[newModel] {
+		return fmt.Sprintf("Invalid model %q.\n\nAvailable models: claude-haiku-4-5, claude-sonnet-4-6, claude-opus-4-6", newModel), nil
+	}
+
+	session.Model = newModel
+	if err := h.db.UpdateSession(ctx, session); err != nil {
+		return "", fmt.Errorf("update session model: %w", err)
+	}
+
+	// Update the pinned metadata message
+	if err := h.updatePinnedMetadata(ctx, update.ChatID, *update.ThreadID, session); err != nil {
+		log.Printf("[bridge/commands] update pinned metadata failed: %v", err)
+		// Non-fatal: continue anyway
+	}
+
+	return fmt.Sprintf("Model set to: %s", newModel), nil
+}
+
+// cmdInfo handles /info — shows session information.
+func (h *CommandHandler) cmdInfo(ctx context.Context, update contract.Update, group *Group) (string, error) {
+	if update.ThreadID == nil {
+		return "Session info is only available within a topic session.", nil
+	}
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+
+	session, err := h.db.GetSession(ctx, update.ChatID, *update.ThreadID)
+	if err != nil {
+		return "", fmt.Errorf("get session: %w", err)
+	}
+	if session == nil {
+		return "No session found for this topic.", nil
+	}
+
+	model := session.Model
+	if model == "" {
+		model = group.DefaultModel
+	}
+	if model == "" {
+		model = defaultSessionModel
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Session ID: %s\n", session.SessionID)
+	fmt.Fprintf(&sb, "Model: %s\n", model)
+	fmt.Fprintf(&sb, "CWD: %s\n", session.CWD)
+	fmt.Fprintf(&sb, "Messages: %d\n", session.MessageCount)
+	fmt.Fprintf(&sb, "Cost: $%.4f\n", session.TotalCostUSD)
+	fmt.Fprintf(&sb, "Status: %s\n", session.Status)
+	fmt.Fprintf(&sb, "Thread ID: %d\n", session.ThreadID)
+	fmt.Fprintf(&sb, "Started: %s", session.CreatedAt.Format("2006-01-02 15:04:05"))
+
+	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// updatePinnedMetadata updates the pinned metadata message for a session.
+func (h *CommandHandler) updatePinnedMetadata(ctx context.Context, chatID, threadID int64, session *Session) error {
+	// Find the pinned metadata message in sent_messages
+	pinnedMsg, err := h.db.FindSentMessageByPurpose(ctx, chatID, threadID, "metadata")
+	if err != nil {
+		return fmt.Errorf("find pinned message: %w", err)
+	}
+	if pinnedMsg == nil {
+		// No pinned message found - this is okay, it may have been deleted
+		return nil
+	}
+
+	// Get the group for default model fallback
+	group, err := h.db.GetGroup(ctx, chatID)
+	if err != nil {
+		return fmt.Errorf("get group: %w", err)
+	}
+
+	model := session.Model
+	if model == "" && group != nil {
+		model = group.DefaultModel
+	}
+	if model == "" {
+		model = defaultSessionModel
+	}
+
+	// Build the new metadata text
+	metadata := fmt.Sprintf("Session: %s\nCWD: %s\nModel: %s\nStarted: %s",
+		session.SessionID, session.CWD, model, session.CreatedAt.Format("2006-01-02 15:04:05"))
+
+	// Edit the pinned message
+	editReq := contract.EditRequest{
+		ChatID:    chatID,
+		MessageID: pinnedMsg.MessageID,
+		Text:      metadata,
+	}
+	return h.postJSON(ctx, "/edit", editReq, nil)
 }

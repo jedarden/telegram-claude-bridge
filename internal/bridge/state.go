@@ -8,6 +8,18 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite" // register sqlite driver
+
+	"github.com/jedarden/telegram-claude-bridge/internal/contract"
+)
+
+// Icon color constants for topic status states.
+const (
+	ColorActive    = contract.IconColorLightBlue // 0x6FB9F0
+	ColorComplete  = contract.IconColorGreen     // 0x8EEE98
+	ColorBlocked   = contract.IconColorYellow    // 0xFFD67E
+	ColorError     = contract.IconColorRedOrange // 0xFB6F5F
+	ColorReview    = contract.IconColorPink      // 0xFF93B2
+	ColorResearch  = contract.IconColorPurple    // 0xCB86DB
 )
 
 // DB wraps a SQLite database providing all state persistence for the bridge.
@@ -29,15 +41,18 @@ type Group struct {
 
 // Session represents an active Claude Code session mapped to a (chat_id, thread_id) pair.
 type Session struct {
-	ChatID       int64
-	ThreadID     int64
-	SessionID    string
-	CWD          string
-	Model        string
-	Status       string
-	CreatedAt    time.Time
-	LastActive   time.Time
-	MessageCount int
+	ChatID          int64
+	ThreadID        int64
+	SessionID       string
+	CWD             string
+	Model           string
+	Status          string
+	IconColor       int
+	CreatedAt       time.Time
+	LastActive      time.Time
+	MessageCount    int
+	PinnedMessageID int64  // ID of the pinned metadata message in this topic
+	TotalCostUSD    float64 // Total cost of all messages in this session (USD)
 }
 
 // AllowedUser represents a user permitted to interact with the bot.
@@ -56,7 +71,7 @@ type SentMessage struct {
 	CreatedAt time.Time
 }
 
-const schemaVersion = 2
+const schemaVersion = 5
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -104,6 +119,15 @@ var migrations = []string{
 
 	// Version 2 — add permission_mode to groups
 	`ALTER TABLE groups ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'acceptEdits';`,
+
+	// Version 3 — add icon_color to sessions
+	`ALTER TABLE sessions ADD COLUMN icon_color INTEGER NOT NULL DEFAULT 7322096;`, // 0x6FB9F0 (light blue)
+
+		// Version 4 — add pinned_message_id to sessions
+		`ALTER TABLE sessions ADD COLUMN pinned_message_id INTEGER NOT NULL DEFAULT 0;`,
+
+		// Version 5 — add total_cost_usd to sessions
+		`ALTER TABLE sessions ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0;`,
 }
 
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
@@ -137,6 +161,11 @@ func OpenDB(path string) (*DB, error) {
 // Close closes the underlying database connection.
 func (d *DB) Close() error {
 	return d.db.Close()
+}
+
+// SqlDB returns the underlying *sql.DB for use with other packages.
+func (d *DB) SqlDB() *sql.DB {
+	return d.db
 }
 
 // migrate creates the schema_version table if needed, then applies any
@@ -278,7 +307,7 @@ func scanGroup(s groupScanner) (*Group, error) {
 func (d *DB) GetSession(ctx context.Context, chatID, threadID int64) (*Session, error) {
 	row := d.db.QueryRowContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
-		        created_at, last_active, message_count
+		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd
 		 FROM sessions WHERE chat_id = ? AND thread_id = ?`, chatID, threadID)
 	return scanSession(row)
 }
@@ -295,14 +324,20 @@ func (d *DB) CreateSession(ctx context.Context, s *Session) error {
 	if s.Status == "" {
 		s.Status = "active"
 	}
+	if s.IconColor == 0 {
+		s.IconColor = 7322096 // Default to light blue (0x6FB9F0)
+	}
 	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO sessions
-		   (chat_id, thread_id, session_id, cwd, model, status, created_at, last_active, message_count)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		   (chat_id, thread_id, session_id, cwd, model, status, icon_color, created_at, last_active, message_count, pinned_message_id, total_cost_usd)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.ChatID, s.ThreadID, s.SessionID, s.CWD, nullableString(s.Model), s.Status,
+		s.IconColor,
 		s.CreatedAt.UTC().Format(time.RFC3339),
 		s.LastActive.UTC().Format(time.RFC3339),
 		s.MessageCount,
+		s.PinnedMessageID,
+		s.TotalCostUSD,
 	)
 	return err
 }
@@ -315,15 +350,40 @@ func (d *DB) UpdateSession(ctx context.Context, s *Session) error {
 		     cwd           = ?,
 		     model         = ?,
 		     status        = ?,
+		     icon_color    = ?,
 		     last_active   = ?,
 		     message_count = ?
+			     pinned_message_id = ?,
+			     total_cost_usd    = ?,
 		 WHERE chat_id = ? AND thread_id = ?`,
 		s.SessionID, s.CWD, nullableString(s.Model), s.Status,
+		s.IconColor,
 		s.LastActive.UTC().Format(time.RFC3339),
 		s.MessageCount,
+		s.PinnedMessageID,
+		s.TotalCostUSD,
 		s.ChatID, s.ThreadID,
 	)
 	return err
+}
+
+// SetSessionIconColor updates only the icon_color field for a session.
+func (d *DB) SetSessionIconColor(ctx context.Context, chatID, threadID int64, color int) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE sessions SET icon_color = ? WHERE chat_id = ? AND thread_id = ?`,
+		color, chatID, threadID,
+	)
+	return err
+}
+
+// GetSessionIconColor returns the current icon_color for a session.
+// Returns the default active color if session not found.
+func (d *DB) GetSessionIconColor(ctx context.Context, chatID, threadID int64) int {
+	session, err := d.GetSession(ctx, chatID, threadID)
+	if err != nil || session == nil {
+		return ColorActive
+	}
+	return session.IconColor
 }
 
 // TouchSession bumps last_active and increments message_count atomically.
@@ -342,7 +402,7 @@ func (d *DB) TouchSession(ctx context.Context, chatID, threadID int64) error {
 func (d *DB) ListSessions(ctx context.Context, chatID int64) ([]*Session, error) {
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
-		        created_at, last_active, message_count
+		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd
 		 FROM sessions WHERE chat_id = ? ORDER BY last_active DESC`, chatID)
 	if err != nil {
 		return nil, err
@@ -364,7 +424,7 @@ func (d *DB) ListSessions(ctx context.Context, chatID int64) ([]*Session, error)
 func (d *DB) ListAllSessions(ctx context.Context) ([]*Session, error) {
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
-		        created_at, last_active, message_count
+		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd
 		 FROM sessions ORDER BY last_active DESC`)
 	if err != nil {
 		return nil, err
@@ -397,6 +457,24 @@ func (d *DB) DeleteSession(ctx context.Context, chatID, threadID int64) error {
 	return err
 }
 
+// SetSessionPinnedMessageID updates the pinned_message_id for a session.
+func (d *DB) SetSessionPinnedMessageID(ctx context.Context, chatID, threadID int64, messageID int64) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE sessions SET pinned_message_id = ? WHERE chat_id = ? AND thread_id = ?`,
+		messageID, chatID, threadID,
+	)
+	return err
+}
+
+// UpdateSessionCost adds to the total_cost_usd for a session.
+func (d *DB) UpdateSessionCost(ctx context.Context, chatID, threadID int64, costUSD float64) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE sessions SET total_cost_usd = total_cost_usd + ? WHERE chat_id = ? AND thread_id = ?`,
+		costUSD, chatID, threadID,
+	)
+	return err
+}
+
 type sessionScanner interface {
 	Scan(dest ...any) error
 }
@@ -406,7 +484,8 @@ func scanSession(s sessionScanner) (*Session, error) {
 	var createdAt, lastActive string
 	err := s.Scan(
 		&sess.ChatID, &sess.ThreadID, &sess.SessionID, &sess.CWD,
-		&sess.Model, &sess.Status, &createdAt, &lastActive, &sess.MessageCount,
+		&sess.Model, &sess.Status, &createdAt, &lastActive, &sess.MessageCount, &sess.IconColor,
+		&sess.PinnedMessageID, &sess.TotalCostUSD,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil

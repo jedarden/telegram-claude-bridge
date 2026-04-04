@@ -30,6 +30,40 @@ const (
 	streamDebounce = 1 * time.Second
 )
 
+// Model tier constants for escalation/de-escalation.
+const (
+	modelTierHaiku  = 0
+	modelTierSonnet = 1
+	modelTierOpus   = 2
+)
+
+// modelChangePhrase maps natural language phrases to their target models.
+type modelChangePhrase struct {
+	phrase      string
+	targetModel string
+	tierDelta   int // positive for escalation, negative for de-escalation
+}
+
+// modelChangePhrases is a table of known model-change phrases.
+// Phrases are checked in order, first match wins.
+var modelChangePhrases = []modelChangePhrase{
+	// Direct model switches
+	{"use opus", "claude-opus-4-6", 0},
+	{"switch to opus", "claude-opus-4-6", 0},
+	{"use sonnet", "claude-sonnet-4-6", 0},
+	{"switch to sonnet", "claude-sonnet-4-6", 0},
+	{"use haiku", "claude-haiku-4-5", 0},
+	{"switch to haiku", "claude-haiku-4-5", 0},
+
+	// Tier escalation
+	{"think harder", "", 1},
+	{"this needs more power", "", 1},
+
+	// Tier de-escalation
+	{"quick answer", "", -1},
+	{"keep it simple", "", -1},
+}
+
 // SessionManager manages per-topic Claude Code subprocess sessions.
 // Each forum topic gets exactly one worker goroutine that serialises
 // subprocess invocations. Messages that arrive during processing are
@@ -301,6 +335,68 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		}
 	}()
 
+	// Check for natural language model change requests in the latest message.
+	currentModel := resolveSessionModel(session, group)
+	if last.update.Content != nil && last.update.Content.Text != nil {
+		newModel, cleanedText, tierDelta := detectModelChange(*last.update.Content.Text)
+		if newModel != "" || tierDelta != 0 {
+			var targetModel string
+			var changeMsg string
+
+			if newModel != "" {
+				// Direct model switch
+				targetModel = newModel
+				changeMsg = fmt.Sprintf("Model switched to: %s", targetModel)
+			} else {
+				// Tier escalation/de-escalation
+				var changed bool
+				var limitMsg string
+				targetModel, changed, limitMsg = applyTierChange(currentModel, tierDelta)
+				if !changed {
+					// Already at limit, inform user but continue processing
+					_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, limitMsg)
+					// Continue with original text
+				} else {
+					changeMsg = fmt.Sprintf("Model switched to: %s", targetModel)
+				}
+			}
+
+			if targetModel != currentModel {
+				// Update the session model
+				if session == nil {
+					// Create a placeholder session for the model update
+					session = &Session{
+						ChatID:    key.chatID,
+						ThreadID:  key.threadID,
+						Model:     targetModel,
+						CreatedAt: time.Now().UTC(),
+					}
+				} else {
+					session.Model = targetModel
+				}
+				if err := m.db.UpdateSession(ctx, session); err != nil {
+					log.Printf("[session_mgr] update session model: %v", err)
+				} else {
+					// Update the pinned metadata message
+					if err := m.updatePinnedMetadata(ctx, session, group); err != nil {
+						log.Printf("[session_mgr] update pinned metadata: %v", err)
+					}
+				}
+
+				// Send confirmation
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, changeMsg)
+			}
+
+			// Update the text in the update for prompt building
+			if cleanedText != "" {
+				*last.update.Content.Text = cleanedText
+			} else {
+				// Message was only a model change request - no Claude invocation needed
+				return
+			}
+		}
+	}
+
 	prompt := buildSessionPrompt(batch, extras)
 	if prompt == "" {
 		return // no content to process
@@ -325,6 +421,18 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 
 	out, err := m.invokeClaudeAPI(callCtx, session, group, prompt, key.chatID, tidPtr, origMsgID, placeholderID)
 	if err != nil {
+		// Determine if this is a "blocked" state (waiting for permission) vs actual error
+		errMsg := err.Error()
+		isBlocked := isBlockedError(errMsg)
+
+		if isBlocked {
+			// Update topic color to yellow for blocked state (waiting for user input)
+			_ = m.updateTopicColor(ctx, key.chatID, key.threadID, ColorBlocked)
+		} else {
+			// Update topic color to red for error state
+			_ = m.updateTopicColor(ctx, key.chatID, key.threadID, ColorError)
+		}
+
 		if callCtx.Err() == context.DeadlineExceeded {
 			log.Printf("[session_mgr] timeout for (%d,%d) after %ds", key.chatID, key.threadID, timeoutSec)
 			_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID,
@@ -342,6 +450,9 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		// Non-fatal: still deliver the response.
 	}
 
+	// Update topic color to blue (active) on successful invocation
+	_ = m.updateTopicColor(ctx, key.chatID, key.threadID, ColorActive)
+
 	text := out.Result
 	if text == "" && out.StreamMsgID != 0 {
 		// Streaming happened but result is empty — leave the last streamed update as-is.
@@ -352,6 +463,14 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	}
 	if err := m.sender.SendStreamFinal(ctx, key.chatID, tidPtr, origMsgID, out.StreamMsgID, text); err != nil {
 		log.Printf("[session_mgr] send response (%d,%d): %v", key.chatID, key.threadID, err)
+	}
+
+	// Update the pinned metadata message with the new message count and cost
+	if session != nil {
+		if err := m.updatePinnedMetadata(ctx, session, group); err != nil {
+			log.Printf("[session_mgr] update pinned metadata (%d,%d): %v", key.chatID, key.threadID, err)
+			// Non-fatal: continue anyway
+		}
 	}
 }
 
@@ -590,21 +709,80 @@ func (m *SessionManager) invokeClaudeAPI(
 // persistSession writes a new session record or updates the existing one.
 func (m *SessionManager) persistSession(ctx context.Context, key topicKey, existing *Session, group *Group, out *claudeOutput) error {
 	if existing == nil {
-		return m.db.CreateSession(ctx, &Session{
-			ChatID:    key.chatID,
-			ThreadID:  key.threadID,
-			SessionID: out.SessionID,
-			CWD:       group.CWD,
-			Model:     resolveSessionModel(nil, group),
-			Status:    "active",
-		})
+		// New session: create the record
+		sess := &Session{
+			ChatID:       key.chatID,
+			ThreadID:     key.threadID,
+			SessionID:    out.SessionID,
+			CWD:          group.CWD,
+			Model:        resolveSessionModel(nil, group),
+			Status:       "active",
+			MessageCount: 1,
+			TotalCostUSD: out.TotalCostUSD,
+		}
+		if err := m.db.CreateSession(ctx, sess); err != nil {
+			return err
+		}
+
+		// Send and pin the initial metadata message
+		metadata := fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: %d\nCost: $%.2f",
+			sess.SessionID,
+			sess.CWD,
+			sess.Model,
+			sess.CreatedAt.Format("2006-01-02 15:04"),
+			sess.MessageCount,
+			sess.TotalCostUSD)
+
+		pinnedMsgID, err := m.sender.SendAndPinMetadata(ctx, key.chatID, key.threadID, metadata)
+		if err != nil {
+			log.Printf("[session_mgr] send and pin metadata: %v", err)
+			// Non-fatal: continue without pinned message
+			return nil
+		}
+
+		// Store the pinned message ID in the session
+		sess.PinnedMessageID = pinnedMsgID
+		return m.db.UpdateSession(ctx, sess)
 	}
+
+	// Existing session: update the record
 	existing.SessionID = out.SessionID
 	existing.LastActive = time.Now().UTC()
 	existing.MessageCount++
+	existing.TotalCostUSD += out.TotalCostUSD
 	return m.db.UpdateSession(ctx, existing)
 }
 
+
+
+// updatePinnedMetadata updates the pinned metadata message for a session.
+// Debounced to at most once per minute per session.
+func (m *SessionManager) updatePinnedMetadata(ctx context.Context, session *Session, group *Group) error {
+	if session.PinnedMessageID == 0 {
+		// No pinned message to update
+		return nil
+	}
+
+	model := session.Model
+	if model == "" && group != nil {
+		model = group.DefaultModel
+	}
+	if model == "" {
+		model = defaultSessionModel
+	}
+
+	// Build the metadata text
+	metadata := fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: %d\nCost: $%.2f",
+		session.SessionID,
+		session.CWD,
+		model,
+		session.CreatedAt.Format("2006-01-02 15:04"),
+		session.MessageCount,
+		session.TotalCostUSD)
+
+	// Edit the pinned message
+	return m.sender.EditMessage(ctx, session.ChatID, session.PinnedMessageID, metadata)
+}
 // buildSessionPrompt constructs the prompt from a batch of messages.
 // extras maps each batch index to resolved attachment data (image path or transcription).
 // Single message: used as-is.
@@ -741,4 +919,132 @@ func resolvePermissionMode(group *Group) string {
 		return group.PermissionMode
 	}
 	return defaultPermissionMode
+}
+
+// modelTier returns the tier index for a given model name.
+func modelTier(model string) int {
+	switch model {
+	case "claude-haiku-4-5":
+		return modelTierHaiku
+	case "claude-sonnet-4-6":
+		return modelTierSonnet
+	case "claude-opus-4-6":
+		return modelTierOpus
+	default:
+		return modelTierSonnet // default to sonnet tier
+	}
+}
+
+// tierModel returns the model name for a given tier.
+func tierModel(tier int) string {
+	switch tier {
+	case modelTierHaiku:
+		return "claude-haiku-4-5"
+	case modelTierSonnet:
+		return "claude-sonnet-4-6"
+	case modelTierOpus:
+		return "claude-opus-4-6"
+	default:
+		return defaultSessionModel
+	}
+}
+
+// detectModelChange checks text for model-change phrases and returns the new model
+// and the text with the phrase removed. If no phrase is detected, returns ("", text).
+func detectModelChange(text string) (newModel string, cleanedText string, tierDelta int) {
+	lower := strings.ToLower(text)
+	for _, mcp := range modelChangePhrases {
+		if strings.Contains(lower, mcp.phrase) {
+			if mcp.targetModel != "" {
+				return mcp.targetModel, removePhrase(text, mcp.phrase), 0
+			}
+			return "", removePhrase(text, mcp.phrase), mcp.tierDelta
+		}
+	}
+	return "", text, 0
+}
+
+// removePhrase removes a phrase from text, handling case-insensitivity and cleaning up whitespace.
+func removePhrase(text, phrase string) string {
+	lower := strings.ToLower(text)
+	lowerPhrase := strings.ToLower(phrase)
+	idx := strings.Index(lower, lowerPhrase)
+	if idx == -1 {
+		return text
+	}
+
+	// Get the actual substring from the original text (preserving case)
+	actualPhrase := text[idx : idx+len(phrase)]
+
+	// Remove the phrase and clean up whitespace
+	result := strings.Replace(text, actualPhrase, "", 1)
+	result = strings.TrimSpace(result)
+
+	// If result is empty, return empty string
+	if result == "" {
+		return ""
+	}
+
+	return result
+}
+
+// applyTierChange returns the model name after applying a tier delta.
+// If at the limit, returns the same model and a flag indicating no change was possible.
+func applyTierChange(currentModel string, delta int) (newModel string, changed bool, msg string) {
+	tier := modelTier(currentModel)
+	newTier := tier + delta
+
+	switch {
+	case newTier > modelTierOpus:
+		return currentModel, false, "Already using the most powerful model (Opus)."
+	case newTier < modelTierHaiku:
+		return currentModel, false, "Already using the fastest model (Haiku)."
+	default:
+		return tierModel(newTier), true, ""
+	}
+}
+
+// updateTopicColor updates both the database and the Telegram topic icon color.
+// Only sends the update if the color is different from the current color.
+func (m *SessionManager) updateTopicColor(ctx context.Context, chatID, threadID int64, newColor int) error {
+	// Check if color actually changed to avoid unnecessary API calls
+	currentColor := m.db.GetSessionIconColor(ctx, chatID, threadID)
+	if currentColor == newColor {
+		return nil // No change needed
+	}
+
+	// Update database
+	if err := m.db.SetSessionIconColor(ctx, chatID, threadID, newColor); err != nil {
+		return fmt.Errorf("update db: %w", err)
+	}
+
+	// Update Telegram topic
+	if err := m.sender.EditTopicIconColor(ctx, chatID, threadID, newColor); err != nil {
+		log.Printf("[session_mgr] edit topic color (%d,%d): %v", chatID, threadID, err)
+		return err
+	}
+
+	return nil
+}
+
+// isBlockedError returns true if the error message indicates Claude is waiting
+// for user permission or approval, as opposed to a fatal error.
+func isBlockedError(errMsg string) bool {
+	lower := strings.ToLower(errMsg)
+	blockedPatterns := []string{
+		"waiting for permission",
+		"waiting for approval",
+		"please approve",
+		"tool use confirmation",
+		"press enter to continue",
+		"waiting for user input",
+		"permission denied",
+		"bypass permissions",
+	}
+	for _, pattern := range blockedPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
 }
