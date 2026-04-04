@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram-Claude Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=coding
+ExecStart=/home/coding/telegram-claude-bridge/bin/bridge
+WorkingDirectory=/home/coding/telegram-claude-bridge
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=60
+Environment=PATH=/home/coding/.local/bin:/usr/local/go/bin:/usr/bin:/bin
+Environment=HOME=/home/coding
+
+[Install]
+WantedBy=multi-user.target
