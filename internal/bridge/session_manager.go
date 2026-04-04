@@ -416,6 +416,13 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 
 	m.sender.SendTyping(ctx, key.chatID, tidPtr)
 
+	// Check budget enforcement before invoking Claude API
+	if err := m.checkBudgetEnforcement(ctx, key.chatID, group); err != nil {
+		// Budget exceeded - send error and don't proceed
+		_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, err.Error())
+		return
+	}
+
 	// Send a "Thinking…" placeholder immediately so the user has visual feedback
 	// while the Claude subprocess starts up.
 	placeholderID, err := m.sender.SendPlaceholder(ctx, key.chatID, tidPtr, origMsgID)
@@ -740,6 +747,25 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 			return err
 		}
 
+		// Record detailed cost event for the first invocation
+		costEvent := &CostEvent{
+			ChatID:      key.chatID,
+			ThreadID:    key.threadID,
+			CostUSD:     out.TotalCostUSD,
+			Model:       resolveSessionModel(nil, group),
+			CreatedAt:   time.Now().UTC(),
+		}
+		if out.Usage != nil {
+			costEvent.InputTokens = out.Usage.InputTokens
+			costEvent.OutputTokens = out.Usage.OutputTokens
+			costEvent.CacheReadTokens = out.Usage.CacheReadTokens
+			costEvent.CacheCreationTokens = out.Usage.CacheCreationTokens
+		}
+		if err := m.db.RecordCostEvent(ctx, costEvent); err != nil {
+			log.Printf("[session_mgr] record cost event (%d,%d): %v", key.chatID, key.threadID, err)
+			// Non-fatal: continue anyway
+		}
+
 		// Send and pin the initial metadata message
 		pinnedMsgID, err := m.createAndPinMetadata(ctx, sess, group)
 		if err != nil {
@@ -758,7 +784,30 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 	existing.LastActive = time.Now().UTC()
 	existing.MessageCount++
 	existing.TotalCostUSD += out.TotalCostUSD
-	return m.db.UpdateSession(ctx, existing)
+	if err := m.db.UpdateSession(ctx, existing); err != nil {
+		return err
+	}
+
+	// Record detailed cost event
+	costEvent := &CostEvent{
+		ChatID:      key.chatID,
+		ThreadID:    key.threadID,
+		CostUSD:     out.TotalCostUSD,
+		Model:       resolveSessionModel(existing, group),
+		CreatedAt:   time.Now().UTC(),
+	}
+	if out.Usage != nil {
+		costEvent.InputTokens = out.Usage.InputTokens
+		costEvent.OutputTokens = out.Usage.OutputTokens
+		costEvent.CacheReadTokens = out.Usage.CacheReadTokens
+		costEvent.CacheCreationTokens = out.Usage.CacheCreationTokens
+	}
+	if err := m.db.RecordCostEvent(ctx, costEvent); err != nil {
+		log.Printf("[session_mgr] record cost event (%d,%d): %v", key.chatID, key.threadID, err)
+		// Non-fatal: continue anyway
+	}
+
+	return nil
 }
 
 // createAndPinMetadata sends and pins a metadata message for a session.
@@ -1054,6 +1103,37 @@ func (m *SessionManager) updateTopicColor(ctx context.Context, chatID, threadID 
 	if err := m.sender.EditTopicIconColor(ctx, chatID, threadID, newColor); err != nil {
 		log.Printf("[session_mgr] edit topic color (%d,%d): %v", chatID, threadID, err)
 		return err
+	}
+
+	return nil
+}
+
+// checkBudgetEnforcement checks if the group has exceeded its budget.
+// Returns an error if the budget is exceeded (100%+) or a warning if approaching (80%+).
+func (m *SessionManager) checkBudgetEnforcement(ctx context.Context, chatID int64, group *Group) error {
+	if group.MaxBudget <= 0 {
+		return nil // No budget configured
+	}
+
+	currentCost, err := m.db.GetGroupTotalCost(ctx, chatID)
+	if err != nil {
+		log.Printf("[session_mgr] get group cost for budget check: %v", err)
+		return nil // Proceed on error - don't block on cost check failure
+	}
+
+	budgetPercent := (currentCost / group.MaxBudget) * 100
+
+	if budgetPercent >= 100 {
+		return fmt.Errorf("💰 Budget exceeded for this group ($%.2f / $%.2f). Admin can increase via /budget.",
+			currentCost, group.MaxBudget)
+	}
+
+	if budgetPercent >= 80 {
+		// Send a warning but allow the request to proceed
+		tidPtr := (*int64)(nil) // General topic (no thread)
+		_ = m.sender.SendResponse(ctx, chatID, tidPtr, 0,
+			fmt.Sprintf("⚠️ Warning: Approaching budget limit ($%.2f / $%.2f = %.1f%% used). Consider increasing via /budget.",
+				currentCost, group.MaxBudget, budgetPercent))
 	}
 
 	return nil

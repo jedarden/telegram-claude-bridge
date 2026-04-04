@@ -126,6 +126,8 @@ type HealthResponse struct {
 	LastUpdateID    *int64 `json:"last_update_id,omitempty"`
 	UptimeSeconds   int64  `json:"uptime_seconds"`
 	ContractVersion string `json:"contract_version,omitempty"`
+	Version         string `json:"version,omitempty"`
+	CommitSHA       string `json:"commit,omitempty"`
 }
 
 // SendRequest is the body of POST /send.

@@ -31,6 +31,7 @@ const helpText = `Available commands:
 /close <thread_id> — close a session by topic thread_id
 /update [do] — check for updates or apply update now
 /cost — show cost information for this group or topic
+/budget [amount] — show or set group budget (admin only)
 /ping — check proxy latency
 /help — show this message`
 
@@ -44,11 +45,14 @@ var validPermissionModes = map[string]bool{
 
 // CommandHandler dispatches bot commands sent in the General topic.
 type CommandHandler struct {
-	db       *DB
-	sender   *Sender
-	proxyURL string
-	client   *http.Client
-	updater  UpdaterInterface
+	db        *DB
+	sender    *Sender
+	proxyURL  string
+	client    *http.Client
+	updater   UpdaterInterface
+	bridgeVer string
+	bridgeSHA string
+	buildDate string
 }
 
 // UpdaterInterface defines the interface for update commands.
@@ -67,13 +71,17 @@ type UpdateResult struct {
 
 // NewCommandHandler returns a CommandHandler backed by db and sender.
 // updater is optional; pass nil to disable update commands.
-func NewCommandHandler(db *DB, sender *Sender, proxyURL string, updater UpdaterInterface) *CommandHandler {
+// version, commitSHA, and buildDate are build-time version info.
+func NewCommandHandler(db *DB, sender *Sender, proxyURL string, updater UpdaterInterface, version, commitSHA, buildDate string) *CommandHandler {
 	return &CommandHandler{
-		db:       db,
-		sender:   sender,
-		proxyURL: proxyURL,
-		client:   &http.Client{Timeout: 10 * time.Second},
-		updater:  updater,
+		db:        db,
+		sender:    sender,
+		proxyURL:  proxyURL,
+		client:    &http.Client{Timeout: 10 * time.Second},
+		updater:   updater,
+		bridgeVer: version,
+		bridgeSHA: commitSHA,
+		buildDate: buildDate,
 	}
 }
 
@@ -122,6 +130,8 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply, err = h.cmdPing(ctx)
 	case "/cost":
 		reply, err = h.cmdCost(ctx, update, group)
+	case "/budget":
+		reply, err = h.cmdBudget(ctx, update, group, args)
 	default:
 		reply = fmt.Sprintf("Unknown command: %s\n\nUse /help for available commands.", cmd)
 	}
@@ -950,4 +960,65 @@ func (h *CommandHandler) cmdCost(ctx context.Context, update contract.Update, gr
 	}
 
 	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// cmdBudget handles /budget [amount] — shows or sets the group's budget.
+// Without an argument it shows the current budget and usage.
+// With an argument it sets the new budget (admin only).
+func (h *CommandHandler) cmdBudget(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+
+	// Show current budget if no args
+	if args == "" {
+		currentCost, err := h.db.GetGroupTotalCost(ctx, update.ChatID)
+		if err != nil {
+			return "", fmt.Errorf("get group cost: %w", err)
+		}
+
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "💰 Budget Information\n\n")
+		fmt.Fprintf(&sb, "Max Budget: $%.2f\n", group.MaxBudget)
+		fmt.Fprintf(&sb, "Current Cost: $%.4f\n", currentCost)
+		if group.MaxBudget > 0 {
+			remaining := group.MaxBudget - currentCost
+			percent := (currentCost / group.MaxBudget) * 100
+			fmt.Fprintf(&sb, "Remaining: $%.4f (%.1f%% used)\n", remaining, percent)
+		}
+		sb.WriteString("\nUsage: /budget <amount> to set new budget (admin only)")
+
+		return strings.TrimRight(sb.String(), "\n"), nil
+	}
+
+	// Set new budget - requires admin check
+	userID := update.FromUser.ID
+	isAdmin, err := h.db.IsUserAllowed(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Only admins can change the budget. Ask an admin to use /budget <amount>.", nil
+	}
+
+	// Parse the new budget amount
+	args = strings.TrimSpace(args)
+	if strings.HasPrefix(args, "$") {
+		args = args[1:]
+	}
+	newBudget, err := strconv.ParseFloat(args, 64)
+	if err != nil {
+		return fmt.Sprintf("Invalid amount %q. Use /budget <amount> with a number like 10.0 or 50.00", args), nil
+	}
+	if newBudget < 0 {
+		return "Budget cannot be negative.", nil
+	}
+
+	// Update the group budget
+	group.MaxBudget = newBudget
+	if err := h.db.UpsertGroup(ctx, group); err != nil {
+		return "", fmt.Errorf("save budget: %w", err)
+	}
+
+	return fmt.Sprintf("Budget updated to: $%.2f", newBudget), nil
 }

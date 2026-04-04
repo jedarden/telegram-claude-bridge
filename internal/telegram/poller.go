@@ -19,9 +19,11 @@ const telegramAPIBase = "https://api.telegram.org"
 
 // Poller manages Telegram long-polling and buffers normalized updates for consumption.
 type Poller struct {
-	token   string
-	apiBase string
-	client  *http.Client
+	token     string
+	apiBase   string
+	client    *http.Client
+	version   string
+	commitSHA string
 
 	mu      sync.Mutex
 	offset  int64
@@ -33,16 +35,19 @@ type Poller struct {
 }
 
 // NewPoller creates a Poller. Pass an empty apiBase to use the production Telegram API.
-func NewPoller(token, apiBase string) *Poller {
+// The version and commitSHA parameters are used for health endpoint reporting.
+func NewPoller(token, apiBase, version, commitSHA string) *Poller {
 	if apiBase == "" {
 		apiBase = telegramAPIBase
 	}
 	return &Poller{
-		token:   token,
-		apiBase: apiBase,
-		client:  &http.Client{Timeout: 40 * time.Second},
-		started: time.Now(),
-		newData: make(chan struct{}, 1),
+		token:     token,
+		apiBase:   apiBase,
+		version:   version,
+		commitSHA: commitSHA,
+		client:    &http.Client{Timeout: 40 * time.Second},
+		started:   time.Now(),
+		newData:   make(chan struct{}, 1),
 	}
 }
 
@@ -154,6 +159,8 @@ func (p *Poller) Health() contract.HealthResponse {
 		LastUpdateID:    p.lastID,
 		UptimeSeconds:   int64(time.Since(p.started).Seconds()),
 		ContractVersion: contract.ContractVersion,
+		Version:         p.version,
+		CommitSHA:       p.commitSHA,
 	}
 }
 

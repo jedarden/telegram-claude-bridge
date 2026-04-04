@@ -16,6 +16,16 @@ import (
 	"github.com/jedarden/telegram-claude-bridge/internal/updater"
 )
 
+// Build-time version variables. Set via ldflags:
+// -X main.Version=$(git describe --tags --always)
+// -X main.CommitSHA=$(git rev-parse --short HEAD)
+// -X main.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+var (
+	Version   = "dev"
+	CommitSHA = "unknown"
+	BuildDate = "unknown"
+)
+
 func main() {
 	cfg, err := config.LoadBridgeConfig()
 	if err != nil {

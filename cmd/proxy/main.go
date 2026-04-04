@@ -19,13 +19,23 @@ import (
 	"github.com/jedarden/telegram-claude-bridge/internal/telegram"
 )
 
+// Build-time version variables. Set via ldflags:
+// -X main.Version=$(git describe --tags --always)
+// -X main.CommitSHA=$(git rev-parse --short HEAD)
+// -X main.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+var (
+	Version   = "dev"
+	CommitSHA = "unknown"
+	BuildDate = "unknown"
+)
+
 func main() {
 	cfg, err := config.LoadProxyConfig()
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
 
-	poller := telegram.NewPoller(cfg.TelegramToken, "")
+	poller := telegram.NewPoller(cfg.TelegramToken, "", Version, CommitSHA)
 	sender := telegram.NewSender(cfg.TelegramToken, "")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

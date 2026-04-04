@@ -189,7 +189,7 @@ func (u *Updater) fetchAndCompare(ctx context.Context) (string, bool, error) {
 	// Fetch origin/main
 	fetchCmd := exec.CommandContext(ctx, "git", "-C", u.repoPath, "fetch", "origin", "main")
 	if output, err := fetchCmd.CombinedOutput(); err != nil {
-		return "", false, fmt.Errorf("git fetch: %w", string(output))
+		return "", false, fmt.Errorf("git fetch: %v: %s", err, string(output))
 	}
 
 	// Get local HEAD
@@ -215,7 +215,7 @@ func (u *Updater) fetchAndCompare(ctx context.Context) (string, bool, error) {
 	// Pull the changes
 	pullCmd := exec.CommandContext(ctx, "git", "-C", u.repoPath, "pull", "origin", "main")
 	if output, err := pullCmd.CombinedOutput(); err != nil {
-		return "", false, fmt.Errorf("git pull: %w", string(output))
+		return "", false, fmt.Errorf("git pull: %v: %s", err, string(output))
 	}
 
 	return remoteSHA, true, nil
