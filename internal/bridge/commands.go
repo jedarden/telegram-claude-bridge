@@ -153,9 +153,11 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 	case "/removeuser":
 		reply, err = h.cmdRemoveUser(ctx, update, args)
 	case "/users":
-		reply, err = h.cmdUsers(ctx)
+		reply, err = h.cmdUsers(ctx, update)
 	case "/version":
 		reply, err = h.cmdVersion(ctx)
+	case "/context":
+		reply, err = h.cmdContext(ctx, update, group, args)
 	default:
 		reply = fmt.Sprintf("Unknown command: %s\n\nUse /help for available commands.", cmd)
 	}
@@ -1234,7 +1236,23 @@ func (h *CommandHandler) cmdRemoveUser(ctx context.Context, update contract.Upda
 }
 
 // cmdUsers handles /users — lists all allowed users (admin only).
-func (h *CommandHandler) cmdUsers(ctx context.Context) (string, error) {
+func (h *CommandHandler) cmdUsers(ctx context.Context, update contract.Update) (string, error) {
+	// Check if the command is being used in the General topic
+	isGeneral := update.ThreadID == nil || *update.ThreadID == generalTopicID
+	if !isGeneral {
+		return "User management commands only work in the General topic.", nil
+	}
+
+	// Check if the user is an admin
+	userID := update.FromUser.ID
+	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can list users.", nil
+	}
+
 	// Get all users
 	users, err := h.db.ListAllowedUsers(ctx)
 	if err != nil {
@@ -1245,16 +1263,52 @@ func (h *CommandHandler) cmdUsers(ctx context.Context) (string, error) {
 		return "No users in the allowed users list.", nil
 	}
 
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "Allowed users (%d):\n\n", len(users))
-		for _, u := range users {
-			fmt.Fprintf(&sb, "  • User ID: %d\n", u.UserID)
-			fmt.Fprintf(&sb, "    Role: %s\n", u.Role)
-			fmt.Fprintf(&sb, "    Added: %s\n\n", u.AddedAt.Format("2006-01-02 15:04:05"))
-		}
-
-		return strings.TrimRight(sb.String(), "\n"), nil
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Allowed users (%d):\n\n", len(users))
+	for _, u := range users {
+		fmt.Fprintf(&sb, "  • User ID: %d\n", u.UserID)
+		fmt.Fprintf(&sb, "    Role: %s\n", u.Role)
+		fmt.Fprintf(&sb, "    Added: %s\n\n", u.AddedAt.Format("2006-01-02 15:04:05"))
 	}
+
+	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// cmdContext handles /context <thread_id> — fetches context from another topic
+// and injects it into the next prompt for the current topic.
+func (h *CommandHandler) cmdContext(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	if args == "" {
+		return "Usage: /context <thread_id>\n\nFetches context from another topic and injects it into your next prompt.\n\nThe context is taken from the referenced topic's summary (if available) or its session metadata.", nil
+	}
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+
+	// Parse the thread_id from arguments
+	threadID, err := strconv.ParseInt(strings.TrimSpace(args), 10, 64)
+	if err != nil {
+		return fmt.Sprintf("Invalid thread_id %q — must be a number.", args), nil
+	}
+
+	// Get context from the referenced session
+	contextStr, err := h.sessionMgr.GetSessionContext(ctx, update.ChatID, threadID)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), nil
+	}
+
+	// Determine the target topic for storing the context
+	var targetThreadID int64
+	if update.ThreadID != nil {
+		targetThreadID = *update.ThreadID
+	} else {
+		return "Context commands only work within a topic session. Use /new to create a topic first.", nil
+	}
+
+	// Store the context for the current topic
+	h.sessionMgr.SetPendingContext(update.ChatID, targetThreadID, contextStr)
+
+	return fmt.Sprintf("Context from thread %d will be included in your next prompt.", threadID), nil
+}
 
 	// GenerateSessionSummary generates a summary for a session using Haiku.
 	// This is a standalone helper that can be used by both CommandHandler and SessionCleanup.

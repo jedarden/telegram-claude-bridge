@@ -43,19 +43,20 @@ type Group struct {
 
 // Session represents an active Claude Code session mapped to a (chat_id, thread_id) pair.
 type Session struct {
-	ChatID          int64
-	ThreadID        int64
-	SessionID       string
-	CWD             string
-	Model           string
-	Status          string
-	IconColor       int
-	CreatedAt       time.Time
-	LastActive      time.Time
-	MessageCount    int
-	PinnedMessageID int64  // ID of the pinned metadata message in this topic
-	TotalCostUSD    float64 // Total cost of all messages in this session (USD)
-	Summary         string // Summary of the session, generated on close
+	ChatID           int64
+	ThreadID         int64
+	SessionID        string
+	CWD              string
+	Model            string
+	Status           string
+	IconColor        int
+	CreatedAt        time.Time
+	LastActive       time.Time
+	MessageCount     int
+	PinnedMessageID  int64  // ID of the pinned metadata message in this topic
+	TotalCostUSD     float64 // Total cost of all messages in this session (USD)
+	Summary          string // Summary of the session, generated on close
+	NotificationMode string // Notification mode: "live" (default), "summary", "quiet"
 }
 
 // AllowedUser represents a user permitted to interact with the bot.
@@ -88,7 +89,7 @@ type CostEvent struct {
 	CreatedAt            time.Time
 }
 
-const schemaVersion = 8
+const schemaVersion = 9
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -165,6 +166,12 @@ var migrations = []string{
 
 		CREATE INDEX IF NOT EXISTS idx_cost_events_chat_thread ON cost_events(chat_id, thread_id);
 		CREATE INDEX IF NOT EXISTS idx_cost_events_created_at ON cost_events(created_at);`,
+		// Version 8 — add notification_mode to sessions
+		`ALTER TABLE sessions ADD COLUMN notification_mode TEXT NOT NULL DEFAULT 'live';`,
+
+		// Version 9 — add tool restrictions to groups
+		`ALTER TABLE groups ADD COLUMN allowed_tools TEXT;
+		 ALTER TABLE groups ADD COLUMN disallowed_tools TEXT;`,
 }
 
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
@@ -255,7 +262,8 @@ func (d *DB) migrate() error {
 func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 	row := d.db.QueryRowContext(ctx,
 		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec,
-		        COALESCE(permission_mode,'acceptEdits'), created_at
+		        COALESCE(permission_mode,'acceptEdits'),
+		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''), created_at
 		 FROM groups WHERE chat_id = ?`, chatID)
 	return scanGroup(row)
 }
@@ -263,16 +271,19 @@ func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 // UpsertGroup inserts or replaces a group record.
 func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, created_at)
+		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, allowed_tools, disallowed_tools, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(chat_id) DO UPDATE SET
 		   name            = excluded.name,
-		   cwd             = excluded.cwd,
+		   cwd              = excluded.cwd,
 		   default_model   = excluded.default_model,
 		   max_budget      = excluded.max_budget,
 		   timeout_sec     = excluded.timeout_sec,
-		   permission_mode = excluded.permission_mode`,
+		   permission_mode  = excluded.permission_mode,
+		   allowed_tools    = excluded.allowed_tools,
+		   disallowed_tools = excluded.disallowed_tools`,
 		g.ChatID, g.Name, g.CWD, g.DefaultModel, g.MaxBudget, g.TimeoutSec, g.PermissionMode,
+		nullableString(g.AllowedTools), nullableString(g.DisallowedTools),
 		g.CreatedAt.UTC().Format(time.RFC3339),
 	)
 	return err
@@ -282,7 +293,8 @@ func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 func (d *DB) ListGroups(ctx context.Context) ([]*Group, error) {
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec,
-		        COALESCE(permission_mode,'acceptEdits'), created_at
+		        COALESCE(permission_mode,'acceptEdits'),
+		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''), created_at
 		 FROM groups ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -327,7 +339,7 @@ type groupScanner interface {
 func scanGroup(s groupScanner) (*Group, error) {
 	var g Group
 	var createdAt string
-	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &g.PermissionMode, &createdAt)
+	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &g.PermissionMode, &g.AllowedTools, &g.DisallowedTools, &createdAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -345,7 +357,7 @@ func (d *DB) GetSession(ctx context.Context, chatID, threadID int64) (*Session, 
 	row := d.db.QueryRowContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
-		        COALESCE(summary,'')
+		        COALESCE(summary,''), COALESCE(notification_mode,'live')
 		 FROM sessions WHERE chat_id = ? AND thread_id = ?`, chatID, threadID)
 	return scanSession(row)
 }
@@ -365,10 +377,13 @@ func (d *DB) CreateSession(ctx context.Context, s *Session) error {
 	if s.IconColor == 0 {
 		s.IconColor = 7322096 // Default to light blue (0x6FB9F0)
 	}
+	if s.NotificationMode == "" {
+		s.NotificationMode = "live"
+	}
 	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO sessions
-		   (chat_id, thread_id, session_id, cwd, model, status, icon_color, created_at, last_active, message_count, pinned_message_id, total_cost_usd, summary)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		   (chat_id, thread_id, session_id, cwd, model, status, icon_color, created_at, last_active, message_count, pinned_message_id, total_cost_usd, summary, notification_mode)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.ChatID, s.ThreadID, s.SessionID, s.CWD, nullableString(s.Model), s.Status,
 		s.IconColor,
 		s.CreatedAt.UTC().Format(time.RFC3339),
@@ -377,6 +392,7 @@ func (d *DB) CreateSession(ctx context.Context, s *Session) error {
 		s.PinnedMessageID,
 		s.TotalCostUSD,
 		nullableString(s.Summary),
+		s.NotificationMode,
 	)
 	return err
 }
@@ -392,9 +408,10 @@ func (d *DB) UpdateSession(ctx context.Context, s *Session) error {
 		     icon_color    = ?,
 		     last_active   = ?,
 		     message_count = ?,
-			     pinned_message_id = ?,
-			     total_cost_usd    = ?,
-			     summary           = ?
+		     pinned_message_id = ?,
+		     total_cost_usd    = ?,
+		     summary           = ?,
+		     notification_mode = ?
 		 WHERE chat_id = ? AND thread_id = ?`,
 		s.SessionID, s.CWD, nullableString(s.Model), s.Status,
 		s.IconColor,
@@ -403,6 +420,7 @@ func (d *DB) UpdateSession(ctx context.Context, s *Session) error {
 		s.PinnedMessageID,
 		s.TotalCostUSD,
 		nullableString(s.Summary),
+		s.NotificationMode,
 		s.ChatID, s.ThreadID,
 	)
 	return err
@@ -413,6 +431,16 @@ func (d *DB) SetSessionIconColor(ctx context.Context, chatID, threadID int64, co
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE sessions SET icon_color = ? WHERE chat_id = ? AND thread_id = ?`,
 		color, chatID, threadID,
+	)
+	return err
+}
+
+// SetSessionNotificationMode updates only the notification_mode field for a session.
+// Valid modes are: "live" (default), "summary", "quiet".
+func (d *DB) SetSessionNotificationMode(ctx context.Context, chatID, threadID int64, mode string) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE sessions SET notification_mode = ? WHERE chat_id = ? AND thread_id = ?`,
+		mode, chatID, threadID,
 	)
 	return err
 }
@@ -444,7 +472,7 @@ func (d *DB) ListSessions(ctx context.Context, chatID int64) ([]*Session, error)
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
-		        COALESCE(summary,'')
+		        COALESCE(summary,''), COALESCE(notification_mode,'live')
 		 FROM sessions WHERE chat_id = ? ORDER BY last_active DESC`, chatID)
 	if err != nil {
 		return nil, err
@@ -467,7 +495,7 @@ func (d *DB) ListAllSessions(ctx context.Context) ([]*Session, error) {
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
-		        COALESCE(summary,'')
+		        COALESCE(summary,''), COALESCE(notification_mode,'live')
 		 FROM sessions ORDER BY last_active DESC`)
 	if err != nil {
 		return nil, err
@@ -515,7 +543,7 @@ func (d *DB) ListStaleSessions(ctx context.Context, ttl time.Duration) ([]*Sessi
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 			        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
-			        COALESCE(summary,'')
+			        COALESCE(summary,''), COALESCE(notification_mode,'live')
 			 FROM sessions
 			 WHERE status = 'active'
 			   AND datetime(last_active) < datetime('now', '-' || ? || ' seconds')
@@ -680,7 +708,7 @@ func scanSession(s sessionScanner) (*Session, error) {
 	err := s.Scan(
 		&sess.ChatID, &sess.ThreadID, &sess.SessionID, &sess.CWD,
 		&sess.Model, &sess.Status, &createdAt, &lastActive, &sess.MessageCount, &sess.IconColor,
-		&sess.PinnedMessageID, &sess.TotalCostUSD, &sess.Summary,
+		&sess.PinnedMessageID, &sess.TotalCostUSD, &sess.Summary, &sess.NotificationMode,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -690,6 +718,9 @@ func scanSession(s sessionScanner) (*Session, error) {
 	}
 	sess.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	sess.LastActive, _ = time.Parse(time.RFC3339, lastActive)
+	if sess.NotificationMode == "" {
+		sess.NotificationMode = "live"
+	}
 	return &sess, nil
 }
 
