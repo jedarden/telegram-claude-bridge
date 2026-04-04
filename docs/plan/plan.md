@@ -382,6 +382,8 @@ Processes bot commands. Commands are recognized in both the General topic and no
 | `/budget [usd]` | View or set the max budget per session for this group |
 | `/help` | Show available commands |
 | `/ping` | Health check — responds with latency to proxy and Claude |
+| `/version` | Show bridge and proxy versions (semver + commit hash) |
+| `/update` | (admin) Trigger self-update check and apply if available |
 
 **Topic commands (session-level):**
 
@@ -715,12 +717,97 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 
 ---
 
+## Self-Updating
+
+Both components update themselves from the repo without manual intervention.
+
+### Bridge (EX44)
+
+The bridge binary includes a self-update mechanism:
+
+1. **Check:** On a configurable interval (default: 5 minutes), the bridge calls `git -C <repo-path> fetch origin main --dry-run` to check for new commits.
+2. **Pull:** If new commits exist, run `git -C <repo-path> pull origin main`.
+3. **Build:** Run `go build -o <tmp-path> ./cmd/bridge/` in the repo directory.
+4. **Swap:** Replace the running binary: rename the new binary over the current one.
+5. **Restart:** The bridge exec's itself (or signals systemd to restart via `systemctl restart telegram-bridge`). Active Claude subprocesses are allowed to finish before shutdown (graceful drain with configurable timeout).
+6. **Notify:** Post a message to each group's General topic: `Bridge updated to <commit-hash> — <commit-subject>`.
+7. **Rollback:** If the new binary fails to start (systemd detects crash within `RestartSec`), systemd's `StartLimitBurst` prevents restart loops. The admin is notified via Telegram (the proxy is still running and can relay a hardcoded alert). Manual rollback: `git revert` + push triggers the next update cycle.
+
+The update check can also be triggered manually via `/update` command (admin only).
+
+**Systemd integration:**
+
+```ini
+[Service]
+ExecStart=/home/coding/telegram-claude-bridge/bin/bridge
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=60
+```
+
+If the bridge crashes 3 times within 60 seconds after an update, systemd stops restarting. This prevents a bad build from looping.
+
+### Proxy (ardenone-cluster)
+
+The proxy updates via the existing GitOps pipeline:
+
+1. CI builds a new container image on push to `main` (GitHub Actions, tagged with commit SHA)
+2. Image pushed to container registry
+3. Manifest in `declarative-config` references the new image tag (updated by CI or image automation)
+4. ArgoCD syncs the updated manifest → rolling restart of the proxy pod
+
+No self-update logic in the proxy binary — ArgoCD handles it. This is consistent with how all other workloads on ardenone-cluster deploy.
+
+### Versioning
+
+Both components follow semver (`MAJOR.MINOR.PATCH`). The version is embedded at build time via Go linker flags:
+
+```go
+// Set at build time
+var (
+    Version   = "dev"
+    CommitSHA = "unknown"
+    BuildDate = "unknown"
+)
+```
+
+```bash
+go build -ldflags "-X main.Version=0.3.1 -X main.CommitSHA=$(git rev-parse --short HEAD) -X main.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" ./cmd/bridge/
+```
+
+Version source of truth: git tags (`v0.1.0`, `v0.2.0`, etc.). The self-update build step reads the latest tag reachable from `main` via `git describe --tags --always` and injects it.
+
+**`/version` command output:**
+
+```
+Bridge: v0.3.1 (abc1234) built 2026-04-03T18:30:00Z
+Proxy:  v0.3.1 (def5678) uptime 4h12m
+Contract: 1.0
+```
+
+The bridge queries the proxy's `/health` endpoint (which returns `contract_version` and can be extended with `version` and `commit`) to display the proxy version alongside its own.
+
+**Version bump convention:**
+- `PATCH` — bug fixes, dependency updates, minor behavior changes
+- `MINOR` — new commands, new media types, new features
+- `MAJOR` — breaking data contract changes (proxy ↔ bridge API), SQLite schema changes that aren't auto-migratable
+
+### Update Safety
+
+- **Bridge:** The build happens locally on EX44 using the same Go toolchain that built the original. No downloading pre-built binaries from external sources.
+- **No auto-update on tag/release-only branches** — updates track `main` directly since this is a single-operator system.
+- **Build failure is a no-op** — if `go build` fails, the bridge logs the error, notifies via Telegram, and continues running the current binary.
+- **SQLite migrations:** If an update includes schema changes, the bridge runs migrations on startup before accepting messages. Migrations are idempotent and forward-only.
+
+---
+
 ## Deployment Summary
 
 | Component | Where | How | Config Source |
 |---|---|---|---|
 | Proxy | ardenone-cluster, `telegram-bridge` namespace | Deployment via ArgoCD, `FROM scratch` ~10MB image | `declarative-config` repo |
-| Bridge | Hetzner EX44 | Single Go binary, systemd unit | Local config file + SQLite |
+| Bridge | Hetzner EX44 | Single Go binary, systemd unit, self-updating from git | Local config file + SQLite |
 | Bot token | OpenBao on ardenone-cluster | Fetched at proxy startup | `secret/data/telegram-claude-bridge/bot-token` |
 | Manifests | `declarative-config` repo | GitOps via ArgoCD | `k8s/ardenone-cluster/telegram-bridge/` |
 | Source | `telegram-claude-bridge` repo | Go monorepo: `cmd/proxy/`, `cmd/bridge/` | This repo |
