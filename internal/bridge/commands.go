@@ -26,8 +26,9 @@ User commands:
 /sonnet — quick switch to claude-sonnet-4-6
 /opus — quick switch to claude-opus-4-6
 /color [name] — set topic icon color (active, complete, blocked, error, review, research)
+/notify [mode] — set notification mode (live, summary, quiet)
 /context <thread_id> — fetch context from another topic and inject it into the next prompt
-/info — show session info (model, cwd, session_id, messages)
+/info — show session info (model, cwd, session_id, messages, notification mode)
 /status — list active sessions in this group
 /sessions — list all sessions across all groups
 /close <thread_id> — close a session by topic thread_id
@@ -39,6 +40,7 @@ User commands:
 Admin commands:
 /cwd [path] — set this group's working directory
 /permission [mode] — set Claude's permission mode
+/config — view or set group configuration
 /budget [amount] — set group budget
 /update [do] — check for updates or apply update now
 /adduser <telegram_user_id> [role] — add a user (role: admin|user)
@@ -120,6 +122,8 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply, err = h.cmdCWD(ctx, update, group, args)
 	case "/permission":
 		reply, err = h.cmdPermission(ctx, update, group, args)
+	case "/config":
+		reply, err = h.cmdConfig(ctx, update, group, args)
 	case "/model":
 		reply, err = h.cmdModel(ctx, update, group, args)
 	case "/haiku":
@@ -130,6 +134,8 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply, err = h.cmdModel(ctx, update, group, "claude-opus-4-6")
 	case "/color":
 		reply, err = h.cmdColor(ctx, update, group, args)
+	case "/notify":
+		reply, err = h.cmdNotify(ctx, update, group, args)
 	case "/info":
 		reply, err = h.cmdInfo(ctx, update, group)
 	case "/status":
@@ -264,6 +270,128 @@ func (h *CommandHandler) cmdPermission(ctx context.Context, update contract.Upda
 		return "", fmt.Errorf("save group: %w", err)
 	}
 	return fmt.Sprintf("Permission mode set to: %s", mode), nil
+}
+
+// cmdConfig handles /config [setting] [value] — views or sets group configuration.
+// Without arguments it shows all settings. With a setting name and value, it sets that setting (admin only).
+func (h *CommandHandler) cmdConfig(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+
+	// Show all settings if no args
+	if args == "" {
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "📋 Group Configuration\n\n")
+		fmt.Fprintf(&sb, "Working Directory: %s\n", group.CWD)
+		fmt.Fprintf(&sb, "Default Model: %s\n", group.DefaultModel)
+		fmt.Fprintf(&sb, "Max Budget: $%.2f\n", group.MaxBudget)
+		fmt.Fprintf(&sb, "Timeout: %d seconds\n", group.TimeoutSec)
+
+		mode := group.PermissionMode
+		if mode == "" {
+			mode = defaultPermissionMode
+		}
+		fmt.Fprintf(&sb, "Permission Mode: %s\n", mode)
+
+		if group.AllowedTools != "" {
+			fmt.Fprintf(&sb, "Allowed Tools: %s\n", group.AllowedTools)
+		} else {
+			fmt.Fprintf(&sb, "Allowed Tools: (none)\n")
+		}
+
+		if group.DisallowedTools != "" {
+			fmt.Fprintf(&sb, "Disallowed Tools: %s\n", group.DisallowedTools)
+		} else {
+			fmt.Fprintf(&sb, "Disallowed Tools: (none)\n")
+		}
+
+		sb.WriteString("\nUsage: /config <setting> <value>\n")
+		sb.WriteString("Settings: permission_mode, allowed_tools, disallowed_tools\n\n")
+		sb.WriteString("Examples:\n")
+		sb.WriteString("  /config permission_mode dontAsk\n")
+		sb.WriteString("  /config allowed_tools [\"Read\",\"Grep\",\"Glob\"]\n")
+		sb.WriteString("  /config disallowed_tools [\"Bash\",\"Edit\"]")
+
+		return strings.TrimRight(sb.String(), "\n"), nil
+	}
+
+	// Parse setting name and value
+	parts := strings.Fields(args)
+	if len(parts) < 2 {
+		return "Usage: /config <setting> <value>\n\nSettings: permission_mode, allowed_tools, disallowed_tools\n\nExamples:\n  /config permission_mode dontAsk\n  /config allowed_tools [\"Read\",\"Grep\",\"Glob\"]\n  /config disallowed_tools [\"Bash\",\"Edit\"]", nil
+	}
+
+	setting := strings.ToLower(parts[0])
+	value := strings.Join(parts[1:], " ")
+
+	// Check admin access for setting values
+	userID := update.FromUser.ID
+	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can change group configuration.", nil
+	}
+
+	switch setting {
+	case "permission_mode", "permission-mode", "permissionmode":
+		mode := strings.TrimSpace(value)
+		if !validPermissionModes[mode] {
+			return fmt.Sprintf("Invalid permission mode %q.\n\nValid modes: acceptEdits, bypassPermissions, plan, dontAsk", mode), nil
+		}
+		group.PermissionMode = mode
+		if err := h.db.UpsertGroup(ctx, group); err != nil {
+			return "", fmt.Errorf("save group: %w", err)
+		}
+		return fmt.Sprintf("Permission mode set to: %s", mode), nil
+
+	case "allowed_tools", "allowed-tools", "allowedtools":
+		// Validate JSON array format
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" && !strings.HasPrefix(trimmed, "[") {
+			return "Allowed tools must be a JSON array.\n\nExample: /config allowed_tools [\"Read\",\"Grep\",\"Glob\"]", nil
+		}
+		if trimmed != "" {
+			var tools []string
+			if err := json.Unmarshal([]byte(trimmed), &tools); err != nil {
+				return fmt.Sprintf("Invalid JSON array: %v\n\nExample: /config allowed_tools [\"Read\",\"Grep\",\"Glob\"]", err), nil
+			}
+		}
+		group.AllowedTools = trimmed
+		if err := h.db.UpsertGroup(ctx, group); err != nil {
+			return "", fmt.Errorf("save group: %w", err)
+		}
+		if trimmed == "" {
+			return "Allowed tools cleared (all tools available).", nil
+		}
+		return fmt.Sprintf("Allowed tools set to: %s", trimmed), nil
+
+	case "disallowed_tools", "disallowed-tools", "disallowedtools":
+		// Validate JSON array format
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" && !strings.HasPrefix(trimmed, "[") {
+			return "Disallowed tools must be a JSON array.\n\nExample: /config disallowed_tools [\"Bash\",\"Edit\"]", nil
+		}
+		if trimmed != "" {
+			var tools []string
+			if err := json.Unmarshal([]byte(trimmed), &tools); err != nil {
+				return fmt.Sprintf("Invalid JSON array: %v\n\nExample: /config disallowed_tools [\"Bash\",\"Edit\"]", err), nil
+			}
+		}
+		group.DisallowedTools = trimmed
+		if err := h.db.UpsertGroup(ctx, group); err != nil {
+			return "", fmt.Errorf("save group: %w", err)
+		}
+		if trimmed == "" {
+			return "Disallowed tools cleared (no tools blocked).", nil
+		}
+		return fmt.Sprintf("Disallowed tools set to: %s", trimmed), nil
+
+	default:
+		return fmt.Sprintf("Unknown setting %q.\n\nValid settings: permission_mode, allowed_tools, disallowed_tools", setting), nil
+	}
 }
 
 // cmdStatus handles /status — lists active sessions for this group.
@@ -644,6 +772,60 @@ func colorToName(color int) string {
 	}
 }
 
+// cmdNotify handles /notify [mode] — sets the notification mode for this topic.
+// Valid modes: live (stream every update), summary (final response only), quiet (only notify on completion/error).
+func (h *CommandHandler) cmdNotify(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	if update.ThreadID == nil {
+		return "Notification mode commands only work within a topic session. Use /new to create a topic first.", nil
+	}
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+
+	// Get the current session
+	session, err := h.db.GetSession(ctx, update.ChatID, *update.ThreadID)
+	if err != nil {
+		return "", fmt.Errorf("get session: %w", err)
+	}
+	if session == nil {
+		return "No session found for this topic.", nil
+	}
+
+	// If no args, show current mode
+	if args == "" {
+		currentMode := session.NotificationMode
+		if currentMode == "" {
+			currentMode = "live"
+		}
+		return fmt.Sprintf("Notification mode: %s\n\nAvailable modes:\n  • live — stream every update with progressive editing\n  • summary — only send the final response (no streaming)\n  • quiet — only notify on completion or error", currentMode), nil
+	}
+
+	// Validate and set the new mode
+	newMode := strings.ToLower(strings.TrimSpace(args))
+	var valid bool
+	switch newMode {
+	case "live", "summary", "quiet":
+		valid = true
+	}
+
+	if !valid {
+		return fmt.Sprintf("Invalid notification mode %q.\n\nAvailable modes: live, summary, quiet", args), nil
+	}
+
+	session.NotificationMode = newMode
+	if err := h.db.UpdateSession(ctx, session); err != nil {
+		return "", fmt.Errorf("update session notification mode: %w", err)
+	}
+
+	// Update the pinned metadata message
+	if err := h.updatePinnedMetadata(ctx, update.ChatID, *update.ThreadID, session); err != nil {
+		log.Printf("[bridge/commands] update pinned metadata failed: %v", err)
+		// Non-fatal: continue anyway
+	}
+
+	return fmt.Sprintf("Notification mode set to: %s", newMode), nil
+}
+
 // editTopicColor calls POST /edit_topic on the proxy to change the icon color.
 func (h *CommandHandler) editTopicColor(ctx context.Context, chatID, threadID int64, iconColor int) error {
 	body := contract.EditTopicRequest{
@@ -800,6 +982,16 @@ func (h *CommandHandler) createClaudeSession(ctx context.Context, group *Group, 
 		"--cwd", group.CWD,
 		"--model", resolveSessionModel(nil, group),
 	}
+
+	// Add tool restrictions if configured
+	allowed, disallowed := resolveToolRestrictions(group)
+	if allowed != "" {
+		args = append(args, "--allowed-tools", allowed)
+	}
+	if disallowed != "" {
+		args = append(args, "--disallowed-tools", disallowed)
+	}
+
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Stdin = strings.NewReader(prompt)
 
@@ -956,6 +1148,11 @@ func (h *CommandHandler) cmdInfo(ctx context.Context, update contract.Update, gr
 	fmt.Fprintf(&sb, "Messages: %d\n", session.MessageCount)
 	fmt.Fprintf(&sb, "Cost: $%.4f\n", session.TotalCostUSD)
 	fmt.Fprintf(&sb, "Status: %s\n", session.Status)
+	notifyMode := session.NotificationMode
+	if notifyMode == "" {
+		notifyMode = "live"
+	}
+	fmt.Fprintf(&sb, "Notification mode: %s\n", notifyMode)
 	fmt.Fprintf(&sb, "Thread ID: %d\n", session.ThreadID)
 	fmt.Fprintf(&sb, "Started: %s", session.CreatedAt.Format("2006-01-02 15:04:05"))
 
@@ -985,13 +1182,18 @@ func (h *CommandHandler) updatePinnedMetadata(ctx context.Context, chatID, threa
 	}
 
 	// Build the new metadata text with consistent format
-	metadata := fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: %d\nCost: $%.2f",
+	notifyMode := session.NotificationMode
+	if notifyMode == "" {
+		notifyMode = "live"
+	}
+	metadata := fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: %d\nCost: $%.2f\nNotify: %s",
 		session.SessionID,
 		session.CWD,
 		model,
 		session.CreatedAt.Format("2006-01-02 15:04"),
 		session.MessageCount,
-		session.TotalCostUSD)
+		session.TotalCostUSD,
+		notifyMode)
 
 	// Edit the pinned message
 	editReq := contract.EditRequest{

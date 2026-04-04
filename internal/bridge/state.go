@@ -272,7 +272,7 @@ func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, allowed_tools, disallowed_tools, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(chat_id) DO UPDATE SET
 		   name            = excluded.name,
 		   cwd              = excluded.cwd,

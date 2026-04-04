@@ -438,12 +438,23 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		return
 	}
 
+	// Get the notification mode from the session (default to "live")
+	notificationMode := "live"
+	if session != nil && session.NotificationMode != "" {
+		notificationMode = session.NotificationMode
+	}
+
 	// Send a "Thinking…" placeholder immediately so the user has visual feedback
-	// while the Claude subprocess starts up.
-	placeholderID, err := m.sender.SendPlaceholder(ctx, key.chatID, tidPtr, origMsgID)
-	if err != nil {
-		log.Printf("[session_mgr] send placeholder (%d,%d): %v", key.chatID, key.threadID, err)
-		placeholderID = 0 // fall back to first-delta send
+	// while the Claude subprocess starts up. Skip for quiet mode.
+	var placeholderID int64
+	if notificationMode != "quiet" {
+		phID, err := m.sender.SendPlaceholder(ctx, key.chatID, tidPtr, origMsgID)
+		if err != nil {
+			log.Printf("[session_mgr] send placeholder (%d,%d): %v", key.chatID, key.threadID, err)
+			placeholderID = 0 // fall back to first-delta send
+		} else {
+			placeholderID = phID
+		}
 	}
 
 	timeoutSec := group.TimeoutSec
@@ -453,7 +464,7 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	out, err := m.invokeClaudeAPI(callCtx, session, group, prompt, key.chatID, tidPtr, origMsgID, placeholderID)
+	out, err := m.invokeClaudeAPI(callCtx, session, group, prompt, key.chatID, tidPtr, origMsgID, placeholderID, notificationMode)
 	if err != nil {
 		// Determine if this is a "blocked" state (waiting for permission) vs actual error
 		errMsg := err.Error()
@@ -541,6 +552,7 @@ func (m *SessionManager) resolveSessionGroup(ctx context.Context, key topicKey, 
 // chatID, threadID, and origMsgID are the Telegram coordinates used to post
 // the initial streaming message and subsequent edits. placeholderID is the
 // message ID of the "Thinking…" placeholder to edit in-place.
+// notificationMode controls streaming behavior: "live" (stream), "summary" (no stream), "quiet" (no stream, minimal output).
 func (m *SessionManager) invokeClaudeAPI(
 	ctx context.Context,
 	session *Session,
@@ -550,6 +562,7 @@ func (m *SessionManager) invokeClaudeAPI(
 	threadID *int64,
 	origMsgID int64,
 	placeholderID int64,
+	notificationMode string,
 ) (*claudeOutput, error) {
 	args := []string{
 		"-p",
@@ -559,6 +572,16 @@ func (m *SessionManager) invokeClaudeAPI(
 		"--cwd", group.CWD,
 		"--model", resolveSessionModel(session, group),
 	}
+
+	// Add tool restrictions if configured
+	allowed, disallowed := resolveToolRestrictions(group)
+	if allowed != "" {
+		args = append(args, "--allowed-tools", allowed)
+	}
+	if disallowed != "" {
+		args = append(args, "--disallowed-tools", disallowed)
+	}
+
 	if session != nil && session.SessionID != "" {
 		args = append(args, "--resume", session.SessionID)
 	}
@@ -587,11 +610,21 @@ func (m *SessionManager) invokeClaudeAPI(
 		out         claudeOutput
 	)
 
+	// Determine streaming behavior based on notification mode
+	// live: stream every update (default)
+	// summary: collect all text, send final result only
+	// quiet: collect all text, send minimal output only
+	enableStreaming := (notificationMode == "live")
+
 	// flushEdit sends the current accumulated text as an initial message or an
 	// edit of the streaming placeholder. Skipped if the debounce interval hasn't
 	// elapsed yet (unless force=true). Returns true if text was sent, false if
 	// skipped due to debounce.
 	flushEdit := func(force bool) bool {
+		// In summary/quiet mode, don't send progressive edits
+		if !enableStreaming {
+			return false
+		}
 		text := textBuf.String()
 		if text == "" {
 			return false
@@ -740,7 +773,23 @@ func (m *SessionManager) invokeClaudeAPI(
 		return nil, fmt.Errorf("claude error: %s", out.Result)
 	}
 
-	out.StreamMsgID = streamMsgID
+	// Handle notification modes for final output
+	if notificationMode == "summary" {
+		// Summary mode: replace placeholder with full result
+		// streamMsgID will be 0 since we didn't stream, so use placeholderID
+		if streamMsgID == 0 && placeholderID != 0 {
+			out.StreamMsgID = placeholderID
+		} else {
+			out.StreamMsgID = streamMsgID
+		}
+	} else if notificationMode == "quiet" {
+		// Quiet mode: replace result with minimal confirmation
+		out.Result = "Done ✓"
+		out.StreamMsgID = 0 // No streaming happened
+	} else {
+		// Live mode: normal streaming behavior
+		out.StreamMsgID = streamMsgID
+	}
 	return &out, nil
 }
 
@@ -841,13 +890,19 @@ func (m *SessionManager) formatMetadata(session *Session, group *Group) string {
 		model = defaultSessionModel
 	}
 
-	return fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: %d\nCost: $%.2f",
+	notifyMode := session.NotificationMode
+	if notifyMode == "" {
+		notifyMode = "live"
+	}
+
+	return fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: %d\nCost: $%.2f\nNotify: %s",
 		session.SessionID,
 		session.CWD,
 		model,
 		session.CreatedAt.Format("2006-01-02 15:04"),
 		session.MessageCount,
-		session.TotalCostUSD)
+		session.TotalCostUSD,
+		notifyMode)
 }
 
 
@@ -1033,6 +1088,32 @@ func resolvePermissionMode(group *Group) string {
 		return group.PermissionMode
 	}
 	return defaultPermissionMode
+}
+
+// resolveToolRestrictions returns the allowed and disallowed tools for a Claude invocation.
+// Parses JSON arrays from the group configuration and returns them as comma-separated strings.
+func resolveToolRestrictions(group *Group) (allowed, disallowed string) {
+	if group == nil {
+		return "", ""
+	}
+
+	// Parse allowed_tools JSON array
+	if group.AllowedTools != "" && group.AllowedTools != "[]" {
+		var tools []string
+		if err := json.Unmarshal([]byte(group.AllowedTools), &tools); err == nil && len(tools) > 0 {
+			allowed = strings.Join(tools, ",")
+		}
+	}
+
+	// Parse disallowed_tools JSON array
+	if group.DisallowedTools != "" && group.DisallowedTools != "[]" {
+		var tools []string
+		if err := json.Unmarshal([]byte(group.DisallowedTools), &tools); err == nil && len(tools) > 0 {
+			disallowed = strings.Join(tools, ",")
+		}
+	}
+
+	return allowed, disallowed
 }
 
 // modelTier returns the tier index for a given model name.

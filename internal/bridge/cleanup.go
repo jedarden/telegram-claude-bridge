@@ -105,10 +105,9 @@ func (sc *SessionCleanup) runCleanup(ctx context.Context) {
 					sess.ChatID, sess.ThreadID, summaryErr)
 			} else if summary != "" {
 				// Send the summary as a new message in the topic
-				tidPtr := &sess.ThreadID
 				summaryText := fmt.Sprintf("📋 <b>Session Summary</b>\n\n%s", summary)
 
-				msgID, sendErr := sc.sender.SendAndPinMetadata(ctx, sess.ChatID, tidPtr, summaryText)
+				msgID, sendErr := sc.sender.SendAndPinMetadata(ctx, sess.ChatID, sess.ThreadID, summaryText)
 				if sendErr != nil {
 					log.Printf("[cleanup] send summary failed for (%d,%d): %v",
 						sess.ChatID, sess.ThreadID, sendErr)

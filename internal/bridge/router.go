@@ -3,9 +3,85 @@ package bridge
 import (
 	"context"
 	"log"
+	"sync"
+	"time"
 
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
 )
+
+// Rate limiter configuration
+const (
+	// maxMessagesPerMinute is the maximum number of messages a single user can send per minute
+	maxMessagesPerMinute = 30
+	// rateLimitWindow is the time window for rate limiting
+	rateLimitWindow = time.Minute
+)
+
+// userLimiter tracks message count for a single user within a sliding window.
+type userLimiter struct {
+	messages []time.Time
+	mu       sync.Mutex
+}
+
+// check returns true if the user is within the rate limit, false if exceeded.
+func (ul *userLimiter) check() bool {
+	ul.mu.Lock()
+	defer ul.mu.Unlock()
+
+	now := time.Now()
+	// Remove messages older than the rate limit window
+	cutoff := now.Add(-rateLimitWindow)
+	valid := ul.messages[:0]
+	for _, t := range ul.messages {
+		if t.After(cutoff) {
+			valid = append(valid, t)
+		}
+	}
+	ul.messages = valid
+
+	// Check if user has exceeded the rate limit
+	if len(ul.messages) >= maxMessagesPerMinute {
+		return false
+	}
+
+	// Add current message
+	ul.messages = append(ul.messages, now)
+	return true
+}
+
+// rateLimiter manages per-user rate limiting.
+type rateLimiter struct {
+	limiters map[int64]*userLimiter
+	mu       sync.RWMutex
+}
+
+// newRateLimiter creates a new rate limiter.
+func newRateLimiter() *rateLimiter {
+	return &rateLimiter{
+		limiters: make(map[int64]*userLimiter),
+	}
+}
+
+// check returns true if the user is within the rate limit, false if exceeded.
+func (rl *rateLimiter) check(userID int64) bool {
+	rl.mu.RLock()
+	ul, exists := rl.limiters[userID]
+	rl.mu.RUnlock()
+
+	if !exists {
+		rl.mu.Lock()
+		// Double-check after acquiring write lock
+		if ul, exists = rl.limiters[userID]; !exists {
+			ul = &userLimiter{
+				messages: make([]time.Time, 0, maxMessagesPerMinute),
+			}
+			rl.limiters[userID] = ul
+		}
+		rl.mu.Unlock()
+	}
+
+	return ul.check()
+}
 
 // generalTopicID is Telegram's thread_id for the General topic in a forum group.
 // The General topic also appears as nil thread_id (message sent without thread context).
@@ -33,7 +109,8 @@ type CallbackHandlerFunc func(ctx context.Context, update contract.Update)
 // It is the security boundary: updates from unauthorized users are dropped here
 // before reaching any handler.
 type Router struct {
-	db *DB
+	db         *DB
+	rateLimiter *rateLimiter
 
 	// OnCommand is called for bot commands in the General topic.
 	OnCommand CommandHandlerFunc
@@ -50,17 +127,21 @@ type Router struct {
 
 // NewRouter returns a Router backed by db.
 func NewRouter(db *DB) *Router {
-	return &Router{db: db}
+	return &Router{
+		db:          db,
+		rateLimiter: newRateLimiter(),
+	}
 }
 
 // Route classifies update and dispatches it to the registered handler.
 //
 // Routing order:
 //  1. Drop updates from unauthorized users silently.
-//  2. callback_query → OnCallback
-//  3. service message → OnService
-//  4. General topic (thread_id nil or 1) + command → OnCommand
-//  5. Named topic (thread_id non-nil, non-1) → look up session, then OnSession;
+//  2. Rate limiting for non-callback, non-service messages.
+//  3. callback_query → OnCallback
+//  4. service message → OnService
+//  5. General topic (thread_id nil or 1) + command → OnCommand
+//  6. Named topic (thread_id non-nil, non-1) → look up session, then OnSession;
 //     if group is unregistered, drop silently.
 //
 // Non-command messages in the General topic are silently ignored.
@@ -75,7 +156,22 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 		return // silently drop
 	}
 
-	// ── 2. Callback query ────────────────────────────────────────────────────────
+	// ── 2. Rate limiting ──────────────────────────────────────────────────────────
+	// Apply rate limits to non-callback, non-service messages
+	if update.Type != "callback_query" && update.Type != "service" {
+		if !r.rateLimiter.check(update.FromUser.ID) {
+			// User has exceeded the rate limit - log and drop
+			username := ""
+			if update.FromUser.Username != nil {
+				username = *update.FromUser.Username
+			}
+			log.Printf("[router] rate limit exceeded for user %d (@%s), dropping message",
+				update.FromUser.ID, username)
+			return
+		}
+	}
+
+	// ── 3. Callback query ────────────────────────────────────────────────────────
 	if update.Type == "callback_query" {
 		if r.OnCallback != nil {
 			r.OnCallback(ctx, update)
@@ -83,7 +179,7 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 		return
 	}
 
-	// ── 3. Service message ───────────────────────────────────────────────────────
+	// ── 4. Service message ───────────────────────────────────────────────────────
 	if update.Type == "service" {
 		if r.OnService != nil {
 			r.OnService(ctx, update)
@@ -91,7 +187,7 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 		return
 	}
 
-	// ── 4. General topic ─────────────────────────────────────────────────────────
+	// ── 5. General topic ─────────────────────────────────────────────────────────
 	isGeneral := update.ThreadID == nil || *update.ThreadID == generalTopicID
 	if isGeneral {
 		if update.Content != nil && update.Content.IsCommand() && r.OnCommand != nil {
@@ -106,7 +202,7 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 		return
 	}
 
-	// ── 5. Named topic ───────────────────────────────────────────────────────────
+	// ── 6. Named topic ───────────────────────────────────────────────────────────
 	tid := *update.ThreadID
 
 	session, err := r.db.GetSession(ctx, update.ChatID, tid)
