@@ -165,6 +165,9 @@ func (u *Updater) checkAndUpdate() {
 	// Wait a moment for notifications to send
 	time.Sleep(2 * time.Second)
 
+	// Wait for active sessions to finish before restarting
+	u.WaitForShutdown(ctx)
+
 	// Replace the binary and restart
 	u.replaceAndRestart(newCommit)
 }
@@ -374,6 +377,7 @@ func (u *Updater) ManualUpdate(ctx context.Context, args string) string {
 	// Replace and restart
 	go func() {
 		time.Sleep(2 * time.Second)
+		u.WaitForShutdown(ctx)
 		u.replaceAndRestart(newCommit)
 	}()
 
