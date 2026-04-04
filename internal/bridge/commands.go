@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 )
 
 const helpText = `Available commands:
+/new <name> — create a new topic and start a Claude session
 /cwd [path] — show or set this group's working directory
 /permission [mode] — show or set Claude's permission mode (acceptEdits, bypassPermissions, plan, dontAsk)
 /status — list active sessions in this group
@@ -63,6 +65,8 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		err   error
 	)
 	switch cmd {
+	case "/new":
+		reply, err = h.cmdNew(ctx, update, group, args)
 	case "/cwd":
 		reply, err = h.cmdCWD(ctx, update, group, args)
 	case "/permission":
@@ -291,6 +295,158 @@ func (h *CommandHandler) closeTopic(ctx context.Context, chatID, threadID int64)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("proxy returned HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// cmdNew handles /new <name> — creates a new forum topic, starts a Claude session,
+// sends an initial message, and pins it.
+func (h *CommandHandler) cmdNew(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	if args == "" {
+		return "Usage: /new <topic name>\n\nExample: /new fix auth middleware", nil
+	}
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+
+	topicName := strings.TrimSpace(args)
+	if len(topicName) > 128 {
+		return "Topic name too long (max 128 characters).", nil
+	}
+
+	// Step 1: Create the forum topic via the proxy
+	iconColor := contract.IconColorLightBlue
+	createReq := contract.CreateTopicRequest{
+		ChatID:    update.ChatID,
+		Name:      topicName,
+		IconColor: &iconColor,
+	}
+	var createResp contract.CreateTopicResponse
+	if err := h.postJSON(ctx, "/create_topic", createReq, &createResp); err != nil {
+		return "", fmt.Errorf("create topic: %w", err)
+	}
+	if !createResp.OK {
+		return "", fmt.Errorf("create topic failed: not OK")
+	}
+	threadID := createResp.ThreadID
+
+	// Step 2: Run claude -p to create a session and get session_id
+	prompt := fmt.Sprintf("New task: %s. How can I help?", topicName)
+	sessionID, err := h.createClaudeSession(ctx, group, prompt)
+	if err != nil {
+		// Best-effort: try to close the topic we just created
+		_ = h.closeTopic(ctx, update.ChatID, threadID)
+		return "", fmt.Errorf("create Claude session: %w", err)
+	}
+
+	// Step 3: Create the session record in the database
+	session := &Session{
+		ChatID:    update.ChatID,
+		ThreadID:  threadID,
+		SessionID: sessionID,
+		CWD:       group.CWD,
+		Model:     resolveSessionModel(nil, group),
+		Status:    "active",
+	}
+	if err := h.db.CreateSession(ctx, session); err != nil {
+		return "", fmt.Errorf("create session record: %w", err)
+	}
+
+	// Step 4: Send the metadata message to the new topic
+	tidPtr := &threadID
+	startTime := time.Now().Format("2006-01-02 15:04:05")
+	metadata := fmt.Sprintf("Session: %s\nCWD: %s\nModel: %s\nStarted: %s",
+		sessionID, group.CWD, session.Model, startTime)
+	var sendReq contract.SendRequest
+	sendReq.ChatID = update.ChatID
+	sendReq.ThreadID = tidPtr
+	sendReq.Text = metadata
+	var sendResp contract.SendResponse
+	if err := h.postJSON(ctx, "/send", sendReq, &sendResp); err != nil {
+		return "", fmt.Errorf("send metadata message: %w", err)
+	}
+
+	// Step 5: Pin the metadata message
+	if err := h.pinMessage(ctx, update.ChatID, sendResp.MessageID); err != nil {
+		log.Printf("[bridge/commands] pin message failed: %v", err)
+		// Non-fatal: continue anyway
+	}
+
+	return fmt.Sprintf("Created topic: %s (thread_id: %d)", topicName, threadID), nil
+}
+
+// createClaudeSession runs claude -p with the given prompt and returns the session_id.
+func (h *CommandHandler) createClaudeSession(ctx context.Context, group *Group, prompt string) (string, error) {
+	args := []string{
+		"-p",
+		"--permission-mode", resolvePermissionMode(group),
+		"--cwd", group.CWD,
+		"--model", resolveSessionModel(nil, group),
+	}
+	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd.Stdin = strings.NewReader(prompt)
+
+	output, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("claude exited %d: %s", exitErr.ExitCode(), string(exitErr.Stderr))
+		}
+		return "", fmt.Errorf("run claude: %w", err)
+	}
+
+	// Parse JSON output to get session_id
+	var out claudeOutput
+	if err := json.Unmarshal(output, &out); err != nil {
+		return "", fmt.Errorf("parse claude output: %w", err)
+	}
+	if out.SessionID == "" {
+		return "", fmt.Errorf("claude returned empty session_id")
+	}
+	return out.SessionID, nil
+}
+
+// pinMessage calls POST /pin_message on the proxy.
+func (h *CommandHandler) pinMessage(ctx context.Context, chatID, messageID int64) error {
+	disableNotif := true
+	body := contract.PinMessageRequest{
+		ChatID:              chatID,
+		MessageID:           messageID,
+		DisableNotification: &disableNotif,
+	}
+	return h.postJSON(ctx, "/pin_message", body, nil)
+}
+
+// postJSON is a helper for POST requests to the proxy.
+func (h *CommandHandler) postJSON(ctx context.Context, path string, body, out any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.proxyURL+path, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var errResp contract.ErrorResponse
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		if errResp.ErrorCode == 0 {
+			errResp.ErrorCode = resp.StatusCode
+		}
+		if errResp.Description == "" {
+			errResp.Description = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		}
+		return &errResp
+	}
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return fmt.Errorf("decode response: %w", err)
+		}
 	}
 	return nil
 }
