@@ -366,7 +366,9 @@ Handles non-text message types before they reach Claude.
 
 #### 5. Command Handler
 
-Processes bot commands sent in the General topic.
+Processes bot commands. Commands are recognized in both the General topic and non-General topics, but the available commands differ by context.
+
+**General topic commands (group-level):**
 
 | Command | Action |
 |---|---|
@@ -381,7 +383,25 @@ Processes bot commands sent in the General topic.
 | `/help` | Show available commands |
 | `/ping` | Health check — responds with latency to proxy and Claude |
 
-Commands in non-General topics are passed through to Claude as regular messages (so Claude can interpret `/` prefixed text naturally).
+**Topic commands (session-level):**
+
+| Command | Action |
+|---|---|
+| `/model [name]` | View or set the model for this topic. Overrides group default. |
+| `/haiku` | Shortcut: set this topic to `claude-haiku-4-5` |
+| `/sonnet` | Shortcut: set this topic to `claude-sonnet-4-6` |
+| `/opus` | Shortcut: set this topic to `claude-opus-4-6` |
+| `/info` | Show session info: model, cwd, session_id, cost, message count |
+
+All other text in non-General topics is passed through to Claude as the prompt.
+
+**Model resolution order:** The bridge resolves which model to use for each CLI invocation in this order (first non-null wins):
+
+1. `sessions.model` — topic-level override (set via `/model`, `/haiku`, `/sonnet`, `/opus` in the topic)
+2. `groups.default_model` — group-level default (set via `/model` in General topic)
+3. Hardcoded fallback: `claude-sonnet-4-6`
+
+When a topic-level model is set, the bridge updates the pinned metadata message to reflect the current model.
 
 #### 6. Response Formatter
 
@@ -512,11 +532,15 @@ On session creation, the bridge pins a message in the topic:
 ```
 Session: abc123
 Project: ~/telegram-claude-bridge
-Model: claude-sonnet-4-6
+Model: claude-sonnet-4-6 (group default)
 Started: 2026-04-03 18:30 UTC
 ```
 
-Updated when settings change. Provides at-a-glance context.
+Updated when settings change (including model override via `/model`, `/haiku`, `/sonnet`, `/opus`). When a topic-level model override is active, the pinned message shows:
+
+```
+Model: claude-opus-4-6 (topic override)
+```
 
 #### Close/Reopen
 
