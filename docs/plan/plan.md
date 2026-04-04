@@ -397,11 +397,11 @@ All other text in non-General topics is passed through to Claude as the prompt �
 
 **Natural language model switching:**
 
-Before dispatching a message to Claude, the bridge runs a lightweight intent detector that recognizes natural model-change phrases in the message text. If detected, the bridge updates the topic's model, confirms the change with a short reply, and then forwards the rest of the message (if any) to Claude using the new model.
+Before dispatching a message to Claude, the bridge checks for model-change phrases in the message text. If detected, the bridge updates the topic's model, confirms the change with a short reply, and then forwards the rest of the message (if any) to Claude using the new model.
 
-Detection patterns (case-insensitive, matched against the full message):
+Detection is done by normalizing the message to lowercase and checking for known phrase substrings:
 
-| Pattern | Action |
+| Phrase | Action |
 |---|---|
 | "use opus", "switch to opus", "let's use opus", "need opus for this" | Set model to `claude-opus-4-6` |
 | "use sonnet", "switch to sonnet", "back to sonnet" | Set model to `claude-sonnet-4-6` |
@@ -409,7 +409,7 @@ Detection patterns (case-insensitive, matched against the full message):
 | "use a smarter model", "this needs more power", "think harder" | Escalate one tier (haiku→sonnet, sonnet→opus) |
 | "use a faster model", "keep it simple", "quick answer" | De-escalate one tier (opus→sonnet, sonnet→haiku) |
 
-Implementation: a small regex/keyword matcher — not an LLM call. The patterns are deliberately explicit so the detector doesn't misfire on messages that happen to contain the word "opus" in a different context (e.g., discussing a music file). The match requires a verb of intent ("use", "switch to", "need") paired with a model name or tier keyword.
+Implementation: `strings.ToLower()` then `strings.Contains()` against a table of known phrases. No regex. The phrases are deliberately specific — a verb of intent ("use", "switch to", "need") paired with a model name or tier keyword — so the detector doesn't misfire on messages that happen to contain "opus" in a different context.
 
 When a model change is detected:
 1. Update `sessions.model` in SQLite
