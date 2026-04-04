@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 )
 
@@ -37,6 +38,18 @@ type BridgeConfig struct {
 
 	// PollTimeout is the long-poll timeout passed to GET /updates (default: 30).
 	PollTimeout int
+
+	// UpdateIntervalMinutes is how often to check for updates (default: 5).
+	// Set to 0 to disable automatic updates.
+	UpdateIntervalMinutes int
+
+	// RepoPath is the path to the git repository for self-updates.
+	// If empty, defaults to the directory containing the binary.
+	RepoPath string
+
+	// BinaryPath is the path to the bridge binary (relative to RepoPath).
+	// If empty, defaults to "bridge".
+	BinaryPath string
 }
 
 // LoadProxyConfig reads ProxyConfig from environment variables.
@@ -97,6 +110,23 @@ func LoadBridgeConfig() (*BridgeConfig, error) {
 		}
 		cfg.PollTimeout = n
 	}
+
+	if v := os.Getenv("UPDATE_INTERVAL_MINUTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("UPDATE_INTERVAL_MINUTES must be a non-negative integer, got %q", v)
+		}
+		cfg.UpdateIntervalMinutes = n
+	}
+
+	// Default repo path to the binary's directory if not specified
+	if cfg.RepoPath = os.Getenv("REPO_PATH"); cfg.RepoPath == "" {
+		if exe, err := os.Executable(); err == nil {
+			cfg.RepoPath = filepath.Dir(exe)
+		}
+	}
+
+	cfg.BinaryPath = envOrDefault("BINARY_PATH", "bridge")
 
 	return cfg, nil
 }

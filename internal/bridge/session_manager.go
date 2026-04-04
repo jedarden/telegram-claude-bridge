@@ -114,12 +114,13 @@ type msgExtra struct {
 // StreamMsgID is non-zero when a live-edit streaming message was posted during
 // the subprocess run; processBatch edits it with the final canonical text.
 type claudeOutput struct {
-	Type         string  `json:"type"`
-	SessionID    string  `json:"session_id"`
-	Result       string  `json:"result"`
-	IsError      bool    `json:"is_error"`
-	TotalCostUSD float64 `json:"total_cost_usd"`
-	StreamMsgID  int64   // non-zero when streaming edits were posted
+	Type         string     `json:"type"`
+	SessionID    string     `json:"session_id"`
+	Result       string     `json:"result"`
+	IsError      bool       `json:"is_error"`
+	TotalCostUSD float64    `json:"total_cost_usd"`
+	Usage        *UsageInfo `json:"usage,omitempty"`
+	StreamMsgID  int64      // non-zero when streaming edits were posted
 }
 
 // streamLine is the envelope for each NDJSON line emitted by
@@ -131,6 +132,15 @@ type streamLine struct {
 	IsError      bool            `json:"is_error,omitempty"`
 	TotalCostUSD float64         `json:"total_cost_usd,omitempty"`
 	Event        json.RawMessage `json:"event,omitempty"`
+	Usage        *UsageInfo      `json:"usage,omitempty"`
+}
+
+// UsageInfo holds token usage information from stream output.
+type UsageInfo struct {
+	InputTokens         int `json:"input_tokens"`
+	OutputTokens        int `json:"output_tokens"`
+	CacheReadTokens     int `json:"cache_read_tokens"`
+	CacheCreationTokens int `json:"cache_creation_tokens"`
 }
 
 // contentBlockDelta is a content_block_delta event nested inside a stream_event
@@ -681,6 +691,7 @@ func (m *SessionManager) invokeClaudeAPI(
 			out.Result = env.Result
 			out.IsError = env.IsError
 			out.TotalCostUSD = env.TotalCostUSD
+			out.Usage = env.Usage
 		}
 	}
 
@@ -730,15 +741,7 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 		}
 
 		// Send and pin the initial metadata message
-		metadata := fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: %d\nCost: $%.2f",
-			sess.SessionID,
-			sess.CWD,
-			sess.Model,
-			sess.CreatedAt.Format("2006-01-02 15:04"),
-			sess.MessageCount,
-			sess.TotalCostUSD)
-
-		pinnedMsgID, err := m.sender.SendAndPinMetadata(ctx, key.chatID, key.threadID, metadata)
+		pinnedMsgID, err := m.createAndPinMetadata(ctx, sess, group)
 		if err != nil {
 			log.Printf("[session_mgr] send and pin metadata: %v", err)
 			// Non-fatal: continue without pinned message
@@ -756,6 +759,31 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 	existing.MessageCount++
 	existing.TotalCostUSD += out.TotalCostUSD
 	return m.db.UpdateSession(ctx, existing)
+}
+
+// createAndPinMetadata sends and pins a metadata message for a session.
+func (m *SessionManager) createAndPinMetadata(ctx context.Context, session *Session, group *Group) (int64, error) {
+	metadata := m.formatMetadata(session, group)
+	return m.sender.SendAndPinMetadata(ctx, session.ChatID, session.ThreadID, metadata)
+}
+
+// formatMetadata builds the metadata text for a session.
+func (m *SessionManager) formatMetadata(session *Session, group *Group) string {
+	model := session.Model
+	if model == "" && group != nil {
+		model = group.DefaultModel
+	}
+	if model == "" {
+		model = defaultSessionModel
+	}
+
+	return fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: %d\nCost: $%.2f",
+		session.SessionID,
+		session.CWD,
+		model,
+		session.CreatedAt.Format("2006-01-02 15:04"),
+		session.MessageCount,
+		session.TotalCostUSD)
 }
 
 
@@ -781,22 +809,8 @@ func (m *SessionManager) updatePinnedMetadata(ctx context.Context, session *Sess
 	m.pinnedUpdateLastSeen[key] = time.Now()
 	m.mu.Unlock()
 
-	model := session.Model
-	if model == "" && group != nil {
-		model = group.DefaultModel
-	}
-	if model == "" {
-		model = defaultSessionModel
-	}
-
 	// Build the metadata text
-	metadata := fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: %d\nCost: $%.2f",
-		session.SessionID,
-		session.CWD,
-		model,
-		session.CreatedAt.Format("2006-01-02 15:04"),
-		session.MessageCount,
-		session.TotalCostUSD)
+	metadata := m.formatMetadata(session, group)
 
 	// Edit the pinned message
 	return m.sender.EditMessage(ctx, session.ChatID, session.PinnedMessageID, metadata)

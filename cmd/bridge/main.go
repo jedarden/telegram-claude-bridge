@@ -5,12 +5,15 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/jedarden/telegram-claude-bridge/internal/bridge"
 	"github.com/jedarden/telegram-claude-bridge/internal/config"
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
 	"github.com/jedarden/telegram-claude-bridge/internal/health"
+	"github.com/jedarden/telegram-claude-bridge/internal/updater"
 )
 
 func main() {
@@ -36,7 +39,22 @@ func main() {
 	}
 	defer sender.Close()
 
-	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL)
+	// Create updater (disabled if interval is 0)
+	var upd *updater.Updater
+	if cfg.UpdateIntervalMinutes > 0 {
+		upd = updater.New(&updater.Config{
+			RepoPath:      cfg.RepoPath,
+			BinaryPath:    cfg.BinaryPath,
+			CheckInterval: time.Duration(cfg.UpdateIntervalMinutes) * time.Minute,
+			Sender:        sender,
+			DB:            db,
+			ProxyURL:      cfg.ProxyURL,
+		})
+		upd.Start()
+		defer upd.Stop()
+	}
+
+	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL, upd)
 	sessionMgr := bridge.NewSessionManager(db, sender, cfg.ProxyURL)
 	defer sessionMgr.Shutdown()
 

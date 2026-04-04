@@ -53,6 +53,7 @@ type Session struct {
 	MessageCount    int
 	PinnedMessageID int64  // ID of the pinned metadata message in this topic
 	TotalCostUSD    float64 // Total cost of all messages in this session (USD)
+	Summary         string // Summary of the session, generated on close
 }
 
 // AllowedUser represents a user permitted to interact with the bot.
@@ -71,7 +72,21 @@ type SentMessage struct {
 	CreatedAt time.Time
 }
 
-const schemaVersion = 5
+// CostEvent represents a single API invocation cost record.
+type CostEvent struct {
+	ID                   int64
+	ChatID               int64
+	ThreadID             int64
+	CostUSD              float64
+	InputTokens          int
+	OutputTokens         int
+	CacheReadTokens      int
+	CacheCreationTokens  int
+	Model                string
+	CreatedAt            time.Time
+}
+
+const schemaVersion = 7
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -128,6 +143,26 @@ var migrations = []string{
 
 		// Version 5 — add total_cost_usd to sessions
 		`ALTER TABLE sessions ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0;`,
+
+		// Version 6 — add summary to sessions
+		`ALTER TABLE sessions ADD COLUMN summary TEXT;`,
+
+		// Version 7 — add cost_events table for detailed cost tracking
+		`CREATE TABLE IF NOT EXISTS cost_events (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			chat_id     INTEGER NOT NULL,
+			thread_id   INTEGER NOT NULL,
+			cost_usd    REAL NOT NULL,
+			input_tokens  INTEGER,
+			output_tokens INTEGER,
+			cache_read_tokens INTEGER,
+			cache_creation_tokens INTEGER,
+			model       TEXT,
+			created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_cost_events_chat_thread ON cost_events(chat_id, thread_id);
+		CREATE INDEX IF NOT EXISTS idx_cost_events_created_at ON cost_events(created_at);`,
 }
 
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
@@ -307,7 +342,8 @@ func scanGroup(s groupScanner) (*Group, error) {
 func (d *DB) GetSession(ctx context.Context, chatID, threadID int64) (*Session, error) {
 	row := d.db.QueryRowContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
-		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd
+		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
+		        COALESCE(summary,'')
 		 FROM sessions WHERE chat_id = ? AND thread_id = ?`, chatID, threadID)
 	return scanSession(row)
 }
@@ -329,8 +365,8 @@ func (d *DB) CreateSession(ctx context.Context, s *Session) error {
 	}
 	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO sessions
-		   (chat_id, thread_id, session_id, cwd, model, status, icon_color, created_at, last_active, message_count, pinned_message_id, total_cost_usd)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		   (chat_id, thread_id, session_id, cwd, model, status, icon_color, created_at, last_active, message_count, pinned_message_id, total_cost_usd, summary)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.ChatID, s.ThreadID, s.SessionID, s.CWD, nullableString(s.Model), s.Status,
 		s.IconColor,
 		s.CreatedAt.UTC().Format(time.RFC3339),
@@ -338,6 +374,7 @@ func (d *DB) CreateSession(ctx context.Context, s *Session) error {
 		s.MessageCount,
 		s.PinnedMessageID,
 		s.TotalCostUSD,
+		nullableString(s.Summary),
 	)
 	return err
 }
@@ -352,9 +389,10 @@ func (d *DB) UpdateSession(ctx context.Context, s *Session) error {
 		     status        = ?,
 		     icon_color    = ?,
 		     last_active   = ?,
-		     message_count = ?
+		     message_count = ?,
 			     pinned_message_id = ?,
 			     total_cost_usd    = ?,
+			     summary           = ?
 		 WHERE chat_id = ? AND thread_id = ?`,
 		s.SessionID, s.CWD, nullableString(s.Model), s.Status,
 		s.IconColor,
@@ -362,6 +400,7 @@ func (d *DB) UpdateSession(ctx context.Context, s *Session) error {
 		s.MessageCount,
 		s.PinnedMessageID,
 		s.TotalCostUSD,
+		nullableString(s.Summary),
 		s.ChatID, s.ThreadID,
 	)
 	return err
@@ -402,7 +441,8 @@ func (d *DB) TouchSession(ctx context.Context, chatID, threadID int64) error {
 func (d *DB) ListSessions(ctx context.Context, chatID int64) ([]*Session, error) {
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
-		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd
+		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
+		        COALESCE(summary,'')
 		 FROM sessions WHERE chat_id = ? ORDER BY last_active DESC`, chatID)
 	if err != nil {
 		return nil, err
@@ -424,7 +464,8 @@ func (d *DB) ListSessions(ctx context.Context, chatID int64) ([]*Session, error)
 func (d *DB) ListAllSessions(ctx context.Context) ([]*Session, error) {
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
-		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd
+		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
+		        COALESCE(summary,'')
 		 FROM sessions ORDER BY last_active DESC`)
 	if err != nil {
 		return nil, err
@@ -475,6 +516,120 @@ func (d *DB) UpdateSessionCost(ctx context.Context, chatID, threadID int64, cost
 	return err
 }
 
+// ── cost_events ───────────────────────────────────────────────────────────────
+
+// RecordCostEvent inserts a new cost event record.
+func (d *DB) RecordCostEvent(ctx context.Context, e *CostEvent) error {
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now().UTC()
+	}
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO cost_events
+		   (chat_id, thread_id, cost_usd, input_tokens, output_tokens,
+		    cache_read_tokens, cache_creation_tokens, model, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.ChatID, e.ThreadID, e.CostUSD, e.InputTokens, e.OutputTokens,
+		e.CacheReadTokens, e.CacheCreationTokens, nullableString(e.Model),
+		e.CreatedAt.UTC().Format(time.RFC3339),
+	)
+	return err
+}
+
+// GetGroupTotalCost returns the sum of all costs for a group (all threads).
+func (d *DB) GetGroupTotalCost(ctx context.Context, chatID int64) (float64, error) {
+	var total float64
+	row := d.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events WHERE chat_id = ?`, chatID)
+	err := row.Scan(&total)
+	return total, err
+}
+
+// GetTopicTotalCost returns the sum of all costs for a specific topic/thread.
+func (d *DB) GetTopicTotalCost(ctx context.Context, chatID, threadID int64) (float64, error) {
+	var total float64
+	row := d.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events WHERE chat_id = ? AND thread_id = ?`,
+		chatID, threadID)
+	err := row.Scan(&total)
+	return total, err
+}
+
+// TopicCostSummary holds cost breakdown for a single topic.
+type TopicCostSummary struct {
+	ThreadID    int64
+	TotalCost   float64
+	EventCount  int
+}
+
+// GetCostsByTopic returns a list of topics with their costs for a group.
+func (d *DB) GetCostsByTopic(ctx context.Context, chatID int64) ([]*TopicCostSummary, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT thread_id,
+		        COALESCE(SUM(cost_usd), 0) as total_cost,
+		        COUNT(*) as event_count
+		 FROM cost_events
+		 WHERE chat_id = ?
+		 GROUP BY thread_id
+		 ORDER BY total_cost DESC`,
+		chatID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var summaries []*TopicCostSummary
+	for rows.Next() {
+		var s TopicCostSummary
+		if err := rows.Scan(&s.ThreadID, &s.TotalCost, &s.EventCount); err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, &s)
+	}
+	return summaries, rows.Err()
+}
+
+// DailyCostSummary holds cost data for a single day.
+type DailyCostSummary struct {
+	Date    string
+	TotalCost float64
+}
+
+// GetDailyCosts returns daily cost totals for a group within the last N days.
+func (d *DB) GetDailyCosts(ctx context.Context, chatID int64, days int) ([]*DailyCostSummary, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT DATE(created_at) as date,
+		        COALESCE(SUM(cost_usd), 0) as total_cost
+		 FROM cost_events
+		 WHERE chat_id = ?
+		   AND DATE(created_at) >= DATE('now', '-' || ? || ' days')
+		 GROUP BY DATE(created_at)
+		 ORDER BY date DESC`,
+		chatID, days)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var summaries []*DailyCostSummary
+	for rows.Next() {
+		var s DailyCostSummary
+		if err := rows.Scan(&s.Date, &s.TotalCost); err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, &s)
+	}
+	return summaries, rows.Err()
+}
+
+// UpdateSessionSummary updates the summary field for a session.
+func (d *DB) UpdateSessionSummary(ctx context.Context, chatID, threadID int64, summary string) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE sessions SET summary = ? WHERE chat_id = ? AND thread_id = ?`,
+		nullableString(summary), chatID, threadID,
+	)
+	return err
+}
+
 type sessionScanner interface {
 	Scan(dest ...any) error
 }
@@ -485,7 +640,7 @@ func scanSession(s sessionScanner) (*Session, error) {
 	err := s.Scan(
 		&sess.ChatID, &sess.ThreadID, &sess.SessionID, &sess.CWD,
 		&sess.Model, &sess.Status, &createdAt, &lastActive, &sess.MessageCount, &sess.IconColor,
-		&sess.PinnedMessageID, &sess.TotalCostUSD,
+		&sess.PinnedMessageID, &sess.TotalCostUSD, &sess.Summary,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil

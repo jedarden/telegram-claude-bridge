@@ -29,6 +29,7 @@ const helpText = `Available commands:
 /status — list active sessions in this group
 /sessions — list all sessions across all groups
 /close <thread_id> — close a session by topic thread_id
+/update [do] — check for updates or apply update now
 /ping — check proxy latency
 /help — show this message`
 
@@ -46,15 +47,32 @@ type CommandHandler struct {
 	sender   *Sender
 	proxyURL string
 	client   *http.Client
+	updater  UpdaterInterface
+}
+
+// UpdaterInterface defines the interface for update commands.
+// This allows CommandHandler to work with or without an updater.
+type UpdaterInterface interface {
+	CheckForUpdates(ctx context.Context) *UpdateResult
+	ManualUpdate(ctx context.Context, args string) string
+}
+
+// UpdateResult is the result of an update check.
+type UpdateResult struct {
+	HasUpdate bool
+	NewCommit string
+	Error     error
 }
 
 // NewCommandHandler returns a CommandHandler backed by db and sender.
-func NewCommandHandler(db *DB, sender *Sender, proxyURL string) *CommandHandler {
+// updater is optional; pass nil to disable update commands.
+func NewCommandHandler(db *DB, sender *Sender, proxyURL string, updater UpdaterInterface) *CommandHandler {
 	return &CommandHandler{
 		db:       db,
 		sender:   sender,
 		proxyURL: proxyURL,
 		client:   &http.Client{Timeout: 10 * time.Second},
+		updater:  updater,
 	}
 }
 
@@ -95,6 +113,8 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply, err = h.cmdSessions(ctx)
 	case "/close":
 		reply, err = h.cmdClose(ctx, update, group, args)
+	case "/update":
+		reply, err = h.cmdUpdate(ctx, args)
 	case "/help":
 		reply = helpText
 	case "/ping":
@@ -266,6 +286,39 @@ func (h *CommandHandler) cmdClose(ctx context.Context, update contract.Update, g
 		return fmt.Sprintf("Session for thread %d is already closed.", threadID), nil
 	}
 
+	// Generate and pin summary before closing
+	summary, summaryErr := h.generateSessionSummary(ctx, session, group)
+	if summaryErr != nil {
+		log.Printf("[bridge/commands] generate summary failed for (%d, %d): %v", update.ChatID, threadID, summaryErr)
+		// Continue with closing even if summary fails
+	}
+
+	if summary != "" {
+		// Send the summary as a new message in the topic
+		tidPtr := &threadID
+		summaryText := fmt.Sprintf("📋 <b>Session Summary</b>\n\n%s", summary)
+		var sendReq contract.SendRequest
+		sendReq.ChatID = update.ChatID
+		sendReq.ThreadID = tidPtr
+		sendReq.Text = summaryText
+		var sendResp contract.SendResponse
+		if sendErr := h.postJSON(ctx, "/send", sendReq, &sendResp); sendErr != nil {
+			log.Printf("[bridge/commands] send summary failed for (%d, %d): %v", update.ChatID, threadID, sendErr)
+		} else {
+			// Pin the summary message
+			if pinErr := h.pinMessage(ctx, update.ChatID, sendResp.MessageID); pinErr != nil {
+				log.Printf("[bridge/commands] pin summary failed for (%d, %d): %v", update.ChatID, threadID, pinErr)
+				// Non-fatal: continue anyway
+			}
+		}
+
+		// Store the summary in the database
+		if storeErr := h.db.UpdateSessionSummary(ctx, update.ChatID, threadID, summary); storeErr != nil {
+			log.Printf("[bridge/commands] store summary failed for (%d, %d): %v", update.ChatID, threadID, storeErr)
+			// Non-fatal: continue anyway
+		}
+	}
+
 	if err := h.db.CloseSession(ctx, update.ChatID, threadID); err != nil {
 		return "", fmt.Errorf("close session: %w", err)
 	}
@@ -283,7 +336,49 @@ func (h *CommandHandler) cmdClose(ctx context.Context, update contract.Update, g
 		log.Printf("[bridge/commands] close_topic failed for (%d, %d): %v", update.ChatID, threadID, topicErr)
 		return fmt.Sprintf("Session closed and marked complete (thread %d). Note: could not close Telegram topic: %v", threadID, topicErr), nil
 	}
+
 	return fmt.Sprintf("Session closed and marked complete (thread %d).", threadID), nil
+}
+
+// generateSessionSummary sends a summary prompt to Claude and returns the result.
+// Uses Haiku (the cheapest model) regardless of the session's model setting.
+func (h *CommandHandler) generateSessionSummary(ctx context.Context, session *Session, group *Group) (string, error) {
+	// Use a timeout context for summary generation
+	summCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	args := []string{
+		"-p",
+		"--output-format", "json",
+		"--model", "claude-haiku-4-5", // Always use the cheapest model for summaries
+		"--permission-mode", resolvePermissionMode(group),
+		"--cwd", group.CWD,
+	}
+	if session.SessionID != "" {
+		args = append(args, "--resume", session.SessionID)
+	}
+
+	cmd := exec.CommandContext(summCtx, "claude", args...)
+	cmd.Stdin = strings.NewReader("Summarize what was accomplished in this session in 2-3 bullet points. Note any unfinished work or open questions.")
+
+	output, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("claude exited %d: %s", exitErr.ExitCode(), string(exitErr.Stderr))
+		}
+		return "", fmt.Errorf("run claude: %w", err)
+	}
+
+	// Parse JSON output
+	var out claudeOutput
+	if err := json.Unmarshal(output, &out); err != nil {
+		return "", fmt.Errorf("parse claude output: %w", err)
+	}
+	if out.IsError {
+		return "", fmt.Errorf("claude error: %s", out.Result)
+	}
+
+	return out.Result, nil
 }
 
 // cmdPing handles /ping — measures round-trip latency to the proxy /health endpoint.
@@ -300,6 +395,48 @@ func (h *CommandHandler) cmdPing(ctx context.Context) (string, error) {
 	resp.Body.Close()
 	latency := time.Since(start).Round(time.Millisecond)
 	return fmt.Sprintf("pong (%s round-trip to proxy)", latency), nil
+}
+
+// cmdUpdate handles /update [do] — checks for or applies updates.
+func (h *CommandHandler) cmdUpdate(ctx context.Context, args string) (string, error) {
+	if h.updater == nil {
+		return "Update functionality not enabled.", nil
+	}
+
+	// Parse arguments: "" means check, "do" means apply now
+	args = strings.TrimSpace(args)
+	if args == "" || args == "check" {
+		// Check for updates only
+		return h.checkUpdates(ctx), nil
+	}
+	if args == "do" {
+		// Apply the update
+		return h.applyUpdate(ctx), nil
+	}
+	return "Usage: /update or /update do", nil
+}
+
+// checkUpdates returns a status message about available updates.
+func (h *CommandHandler) checkUpdates(ctx context.Context) string {
+	if h.updater == nil {
+		return "Update functionality not enabled."
+	}
+	result := h.updater.CheckForUpdates(ctx)
+	if result.Error != nil {
+		return fmt.Sprintf("⚠️ Update check failed: %v", result.Error)
+	}
+	if !result.HasUpdate {
+		return "✅ No updates available"
+	}
+	return fmt.Sprintf("📦 Update available: %s\n\nUse /update do to update now.", result.NewCommit[:8])
+}
+
+// applyUpdate triggers an update and restart.
+func (h *CommandHandler) applyUpdate(ctx context.Context) string {
+	if h.updater == nil {
+		return "Update functionality not enabled."
+	}
+	return h.updater.ManualUpdate(ctx, "do")
 }
 
 // cmdColor handles /color [name] — sets the topic icon color manually.
@@ -496,7 +633,7 @@ func (h *CommandHandler) cmdNew(ctx context.Context, update contract.Update, gro
 	// Step 4: Send the metadata message to the new topic
 	tidPtr := &threadID
 	startTime := time.Now().Format("2006-01-02 15:04:05")
-	metadata := fmt.Sprintf("Session: %s\nCWD: %s\nModel: %s\nStarted: %s",
+	metadata := fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: 0\nCost: $0.00",
 		sessionID, group.CWD, session.Model, startTime)
 	var sendReq contract.SendRequest
 	sendReq.ChatID = update.ChatID
@@ -511,17 +648,13 @@ func (h *CommandHandler) cmdNew(ctx context.Context, update contract.Update, gro
 	if err := h.pinMessage(ctx, update.ChatID, sendResp.MessageID); err != nil {
 		log.Printf("[bridge/commands] pin message failed: %v", err)
 		// Non-fatal: continue anyway
+	}
 
-		// Step 6: Record the pinned message so we can find it for updates later
-		if err := h.db.RecordSentMessage(ctx, &SentMessage{
-			ChatID:    update.ChatID,
-			ThreadID:  threadID,
-			MessageID: sendResp.MessageID,
-			Purpose:   "metadata",
-		}); err != nil {
-			log.Printf("[bridge/commands] record pinned message failed: %v", err)
-			// Non-fatal: continue anyway
-		}
+	// Step 6: Store the pinned message ID in the session
+	session.PinnedMessageID = sendResp.MessageID
+	if err := h.db.UpdateSession(ctx, session); err != nil {
+		log.Printf("[bridge/commands] update session with pinned message id: %v", err)
+		// Non-fatal: continue anyway
 	}
 
 	return fmt.Sprintf("Created topic: %s (thread_id: %d)", topicName, threadID), nil
@@ -699,13 +832,9 @@ func (h *CommandHandler) cmdInfo(ctx context.Context, update contract.Update, gr
 
 // updatePinnedMetadata updates the pinned metadata message for a session.
 func (h *CommandHandler) updatePinnedMetadata(ctx context.Context, chatID, threadID int64, session *Session) error {
-	// Find the pinned metadata message in sent_messages
-	pinnedMsg, err := h.db.FindSentMessageByPurpose(ctx, chatID, threadID, "metadata")
-	if err != nil {
-		return fmt.Errorf("find pinned message: %w", err)
-	}
-	if pinnedMsg == nil {
-		// No pinned message found - this is okay, it may have been deleted
+	// Check if the session has a pinned message ID
+	if session.PinnedMessageID == 0 {
+		// No pinned message to update
 		return nil
 	}
 
@@ -723,14 +852,19 @@ func (h *CommandHandler) updatePinnedMetadata(ctx context.Context, chatID, threa
 		model = defaultSessionModel
 	}
 
-	// Build the new metadata text
-	metadata := fmt.Sprintf("Session: %s\nCWD: %s\nModel: %s\nStarted: %s",
-		session.SessionID, session.CWD, model, session.CreatedAt.Format("2006-01-02 15:04:05"))
+	// Build the new metadata text with consistent format
+	metadata := fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: %d\nCost: $%.2f",
+		session.SessionID,
+		session.CWD,
+		model,
+		session.CreatedAt.Format("2006-01-02 15:04"),
+		session.MessageCount,
+		session.TotalCostUSD)
 
 	// Edit the pinned message
 	editReq := contract.EditRequest{
 		ChatID:    chatID,
-		MessageID: pinnedMsg.MessageID,
+		MessageID: session.PinnedMessageID,
 		Text:      metadata,
 	}
 	return h.postJSON(ctx, "/edit", editReq, nil)
