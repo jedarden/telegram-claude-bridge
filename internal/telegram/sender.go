@@ -129,6 +129,104 @@ func (s *Sender) SendChatAction(ctx context.Context, req contract.ChatActionRequ
 	return apiErr
 }
 
+// CreateForumTopic creates a new forum topic via Telegram's createForumTopic method.
+func (s *Sender) CreateForumTopic(ctx context.Context, req contract.CreateTopicRequest) (*contract.CreateTopicResponse, *contract.ErrorResponse) {
+	body := map[string]any{
+		"chat_id": req.ChatID,
+		"name":    req.Name,
+	}
+	if req.IconColor != nil {
+		body["icon_color"] = *req.IconColor
+	}
+
+	tgResp, apiErr := s.call(ctx, "createForumTopic", body)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	var topic struct {
+		MessageThreadID int64  `json:"message_thread_id"`
+		Name            string `json:"name"`
+		IconColor       int    `json:"icon_color"`
+	}
+	if err := json.Unmarshal(tgResp.Result, &topic); err != nil {
+		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: "bad response from Telegram"}
+	}
+	resp := &contract.CreateTopicResponse{
+		OK:       true,
+		ThreadID: topic.MessageThreadID,
+		Name:     topic.Name,
+	}
+	if topic.IconColor != 0 {
+		resp.IconColor = &topic.IconColor
+	}
+	return resp, nil
+}
+
+// EditForumTopic edits a forum topic via Telegram's editForumTopic method.
+func (s *Sender) EditForumTopic(ctx context.Context, req contract.EditTopicRequest) *contract.ErrorResponse {
+	body := map[string]any{
+		"chat_id":           req.ChatID,
+		"message_thread_id": req.ThreadID,
+	}
+	if req.Name != nil {
+		body["name"] = *req.Name
+	}
+	if req.IconColor != nil {
+		body["icon_color"] = *req.IconColor
+	}
+	_, apiErr := s.call(ctx, "editForumTopic", body)
+	return apiErr
+}
+
+// CloseForumTopic closes a forum topic via Telegram's closeForumTopic method.
+func (s *Sender) CloseForumTopic(ctx context.Context, req contract.TopicRequest) *contract.ErrorResponse {
+	body := map[string]any{
+		"chat_id":           req.ChatID,
+		"message_thread_id": req.ThreadID,
+	}
+	_, apiErr := s.call(ctx, "closeForumTopic", body)
+	return apiErr
+}
+
+// ReopenForumTopic reopens a forum topic via Telegram's reopenForumTopic method.
+func (s *Sender) ReopenForumTopic(ctx context.Context, req contract.TopicRequest) *contract.ErrorResponse {
+	body := map[string]any{
+		"chat_id":           req.ChatID,
+		"message_thread_id": req.ThreadID,
+	}
+	_, apiErr := s.call(ctx, "reopenForumTopic", body)
+	return apiErr
+}
+
+// PinChatMessage pins a message via Telegram's pinChatMessage method.
+func (s *Sender) PinChatMessage(ctx context.Context, req contract.PinMessageRequest) *contract.ErrorResponse {
+	body := map[string]any{
+		"chat_id":    req.ChatID,
+		"message_id": req.MessageID,
+	}
+	if req.DisableNotification != nil {
+		body["disable_notification"] = *req.DisableNotification
+	}
+	_, apiErr := s.call(ctx, "pinChatMessage", body)
+	return apiErr
+}
+
+// AnswerCallbackQuery answers a callback query via Telegram's answerCallbackQuery method.
+func (s *Sender) AnswerCallbackQuery(ctx context.Context, req contract.AnswerCallbackRequest) *contract.ErrorResponse {
+	body := map[string]any{
+		"callback_query_id": req.CallbackQueryID,
+	}
+	if req.Text != nil {
+		body["text"] = *req.Text
+	}
+	if req.ShowAlert != nil {
+		body["show_alert"] = *req.ShowAlert
+	}
+	_, apiErr := s.call(ctx, "answerCallbackQuery", body)
+	return apiErr
+}
+
 // call POSTs a JSON body to the given Telegram Bot API method and returns the parsed response.
 func (s *Sender) call(ctx context.Context, method string, body map[string]any) (*tgAPIResponse, *contract.ErrorResponse) {
 	data, err := json.Marshal(body)

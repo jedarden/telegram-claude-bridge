@@ -35,6 +35,12 @@ func main() {
 	mux.HandleFunc("/send", handleSend(sender))
 	mux.HandleFunc("/edit", handleEdit(sender))
 	mux.HandleFunc("/send_chat_action", handleSendChatAction(sender))
+	mux.HandleFunc("/create_topic", handleCreateTopic(sender))
+	mux.HandleFunc("/edit_topic", handleEditTopic(sender))
+	mux.HandleFunc("/close_topic", handleCloseTopic(sender))
+	mux.HandleFunc("/reopen_topic", handleReopenTopic(sender))
+	mux.HandleFunc("/pin_message", handlePinMessage(sender))
+	mux.HandleFunc("/answer_callback", handleAnswerCallback(sender))
 
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
@@ -163,6 +169,139 @@ func handleSendChatAction(s *telegram.Sender) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(contract.OKResponse{OK: true}); err != nil {
 			log.Printf("send_chat_action encode: %v", err)
+		}
+	}
+}
+
+func handleCreateTopic(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req contract.CreateTopicRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "invalid JSON: "+err.Error())
+			return
+		}
+		resp, apiErr := s.CreateForumTopic(r.Context(), req)
+		if apiErr != nil {
+			writeTelegramError(w, apiErr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("create_topic encode: %v", err)
+		}
+	}
+}
+
+func handleEditTopic(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req contract.EditTopicRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "invalid JSON: "+err.Error())
+			return
+		}
+		if apiErr := s.EditForumTopic(r.Context(), req); apiErr != nil {
+			writeTelegramError(w, apiErr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(contract.OKResponse{OK: true}); err != nil {
+			log.Printf("edit_topic encode: %v", err)
+		}
+	}
+}
+
+func handleCloseTopic(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req contract.TopicRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "invalid JSON: "+err.Error())
+			return
+		}
+		if apiErr := s.CloseForumTopic(r.Context(), req); apiErr != nil {
+			writeTelegramError(w, apiErr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(contract.OKResponse{OK: true}); err != nil {
+			log.Printf("close_topic encode: %v", err)
+		}
+	}
+}
+
+func handleReopenTopic(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req contract.TopicRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "invalid JSON: "+err.Error())
+			return
+		}
+		if apiErr := s.ReopenForumTopic(r.Context(), req); apiErr != nil {
+			writeTelegramError(w, apiErr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(contract.OKResponse{OK: true}); err != nil {
+			log.Printf("reopen_topic encode: %v", err)
+		}
+	}
+}
+
+func handlePinMessage(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req contract.PinMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "invalid JSON: "+err.Error())
+			return
+		}
+		if apiErr := s.PinChatMessage(r.Context(), req); apiErr != nil {
+			writeTelegramError(w, apiErr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(contract.OKResponse{OK: true}); err != nil {
+			log.Printf("pin_message encode: %v", err)
+		}
+	}
+}
+
+func handleAnswerCallback(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req contract.AnswerCallbackRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "invalid JSON: "+err.Error())
+			return
+		}
+		if apiErr := s.AnswerCallbackQuery(r.Context(), req); apiErr != nil {
+			writeTelegramError(w, apiErr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(contract.OKResponse{OK: true}); err != nil {
+			log.Printf("answer_callback encode: %v", err)
 		}
 	}
 }
