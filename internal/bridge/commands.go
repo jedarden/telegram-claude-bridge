@@ -17,23 +17,33 @@ import (
 )
 
 const helpText = `Available commands:
+
+User commands:
 /new <name> — create a new topic and start a Claude session
-/cwd [path] — show or set this group's working directory
-/permission [mode] — show or set Claude's permission mode (acceptEdits, bypassPermissions, plan, dontAsk)
+/cwd — show this group's working directory
 /model [name] — view or set model for this topic
 /haiku — quick switch to claude-haiku-4-5
 /sonnet — quick switch to claude-sonnet-4-6
 /opus — quick switch to claude-opus-4-6
 /color [name] — set topic icon color (active, complete, blocked, error, review, research)
+/context <thread_id> — fetch context from another topic and inject it into the next prompt
 /info — show session info (model, cwd, session_id, messages)
 /status — list active sessions in this group
 /sessions — list all sessions across all groups
 /close <thread_id> — close a session by topic thread_id
-/update [do] — check for updates or apply update now
 /cost — show cost information for this group or topic
-/budget [amount] — show or set group budget (admin only)
 /ping — check proxy latency
-/help — show this message`
+/version — show version information
+/help — show this message
+
+Admin commands:
+/cwd [path] — set this group's working directory
+/permission [mode] — set Claude's permission mode
+/budget [amount] — set group budget
+/update [do] — check for updates or apply update now
+/adduser <telegram_user_id> [role] — add a user (role: admin|user)
+/removeuser <telegram_user_id> — remove a user
+/users — list all users`
 
 // validPermissionModes lists the --permission-mode values accepted by Claude CLI.
 var validPermissionModes = map[string]bool{
@@ -50,6 +60,7 @@ type CommandHandler struct {
 	proxyURL  string
 	client    *http.Client
 	updater   UpdaterInterface
+	sessionMgr *SessionManager // optional, for context commands
 	bridgeVer string
 	bridgeSHA string
 	buildDate string
@@ -83,6 +94,11 @@ func NewCommandHandler(db *DB, sender *Sender, proxyURL string, updater UpdaterI
 		bridgeSHA: commitSHA,
 		buildDate: buildDate,
 	}
+}
+
+// SetSessionManager sets the session manager for context commands.
+func (h *CommandHandler) SetSessionManager(sessionMgr *SessionManager) {
+	h.sessionMgr = sessionMgr
 }
 
 // Handle implements CommandHandlerFunc. It dispatches the update to the
@@ -123,7 +139,7 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 	case "/close":
 		reply, err = h.cmdClose(ctx, update, group, args)
 	case "/update":
-		reply, err = h.cmdUpdate(ctx, args)
+		reply, err = h.cmdUpdate(ctx, update, args)
 	case "/help":
 		reply = helpText
 	case "/ping":
@@ -132,6 +148,12 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply, err = h.cmdCost(ctx, update, group)
 	case "/budget":
 		reply, err = h.cmdBudget(ctx, update, group, args)
+	case "/adduser":
+		reply, err = h.cmdAddUser(ctx, update, args)
+	case "/removeuser":
+		reply, err = h.cmdRemoveUser(ctx, update, args)
+	case "/users":
+		reply, err = h.cmdUsers(ctx)
 	case "/version":
 		reply, err = h.cmdVersion(ctx)
 	default:
@@ -153,13 +175,23 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 // cmdCWD handles /cwd [path].
 // Without an argument it shows the current working directory (or reports the
 // group is unregistered). With an argument it validates the path and upserts
-// the group record.
+// the group record (admin only).
 func (h *CommandHandler) cmdCWD(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
 	if args == "" {
 		if group == nil {
 			return "This group is not registered. Use /cwd <path> to register it.", nil
 		}
 		return fmt.Sprintf("Working directory: %s", group.CWD), nil
+	}
+
+	// Setting the working directory requires admin access
+	userID := update.FromUser.ID
+	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can set the working directory.", nil
 	}
 
 	// Validate that the path exists on the local filesystem.
@@ -196,7 +228,7 @@ func (h *CommandHandler) cmdCWD(ctx context.Context, update contract.Update, gro
 
 // cmdPermission handles /permission [mode].
 // Without an argument it shows the current permission mode. With an argument it
-// validates and updates the mode for this group.
+// validates and updates the mode for this group (admin only).
 func (h *CommandHandler) cmdPermission(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
 	if group == nil {
 		return "This group is not registered. Use /cwd <path> to register it.", nil
@@ -208,6 +240,16 @@ func (h *CommandHandler) cmdPermission(ctx context.Context, update contract.Upda
 			mode = defaultPermissionMode
 		}
 		return fmt.Sprintf("Permission mode: %s\n\nValid modes: acceptEdits, bypassPermissions, plan, dontAsk", mode), nil
+	}
+
+	// Setting permission mode requires admin access
+	userID := update.FromUser.ID
+	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can set the permission mode.", nil
 	}
 
 	mode := strings.TrimSpace(args)
@@ -412,10 +454,68 @@ func (h *CommandHandler) cmdPing(ctx context.Context) (string, error) {
 	return fmt.Sprintf("pong (%s round-trip to proxy)", latency), nil
 }
 
-// cmdUpdate handles /update [do] — checks for or applies updates.
-func (h *CommandHandler) cmdUpdate(ctx context.Context, args string) (string, error) {
+// cmdVersion handles /version — shows version information for bridge, proxy, and contract.
+func (h *CommandHandler) cmdVersion(ctx context.Context) (string, error) {
+	// Fetch proxy health info to get version and uptime
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.proxyURL+"/health", nil)
+	if err != nil {
+		return "", fmt.Errorf("build request: %w", err)
+	}
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("proxy health request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var proxyHealth contract.HealthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&proxyHealth); err != nil {
+		return "", fmt.Errorf("decode proxy health: %w", err)
+	}
+
+	// Format uptime from seconds
+	uptime := fmt.Sprintf("%ds", proxyHealth.UptimeSeconds)
+	if proxyHealth.UptimeSeconds >= 3600 {
+		hours := proxyHealth.UptimeSeconds / 3600
+		mins := (proxyHealth.UptimeSeconds % 3600) / 60
+		uptime = fmt.Sprintf("%dh%dm", hours, mins)
+	} else if proxyHealth.UptimeSeconds >= 60 {
+		mins := proxyHealth.UptimeSeconds / 60
+		secs := proxyHealth.UptimeSeconds % 60
+		uptime = fmt.Sprintf("%dm%ds", mins, secs)
+	}
+
+	// Build version string
+	var sb strings.Builder
+	// Version string may already have "v" prefix from git describe
+	ver := h.bridgeVer
+	if !strings.HasPrefix(ver, "v") {
+		ver = "v" + ver
+	}
+	fmt.Fprintf(&sb, "Bridge: %s (%s) built %s\n", ver, h.bridgeSHA, h.buildDate)
+	if proxyHealth.Version != "" {
+		fmt.Fprintf(&sb, "Proxy:  v%s (%s) uptime %s\n", proxyHealth.Version, proxyHealth.CommitSHA, uptime)
+	} else {
+		fmt.Fprintf(&sb, "Proxy:  (unknown version) uptime %s\n", uptime)
+	}
+	fmt.Fprintf(&sb, "Contract: %s", contract.ContractVersion)
+
+	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// cmdUpdate handles /update [do] — checks for or applies updates (admin only).
+func (h *CommandHandler) cmdUpdate(ctx context.Context, update contract.Update, args string) (string, error) {
 	if h.updater == nil {
 		return "Update functionality not enabled.", nil
+	}
+
+	// Check for update requires admin access
+	userID := update.FromUser.ID
+	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can check for or apply updates.", nil
 	}
 
 	// Parse arguments: "" means check, "do" means apply now
@@ -602,6 +702,17 @@ func (h *CommandHandler) cmdNew(ctx context.Context, update contract.Update, gro
 		return "This group is not registered. Use /cwd <path> to register it.", nil
 	}
 
+	// Log user attribution for topic creation
+	userID := update.FromUser.ID
+	username := ""
+	if update.FromUser.Username != nil {
+		username = *update.FromUser.Username
+	}
+	userStr := fmt.Sprintf("user_id=%d", userID)
+	if username != "" {
+		userStr += fmt.Sprintf(" (@%s)", username)
+	}
+
 	topicName := strings.TrimSpace(args)
 	if len(topicName) > 128 {
 		return "Topic name too long (max 128 characters).", nil
@@ -671,6 +782,10 @@ func (h *CommandHandler) cmdNew(ctx context.Context, update contract.Update, gro
 		log.Printf("[bridge/commands] update session with pinned message id: %v", err)
 		// Non-fatal: continue anyway
 	}
+
+	// Log topic creation with user attribution
+	log.Printf("[bridge/commands] topic created by %s: chat_id=%d thread_id=%d name=%s",
+		userStr, update.ChatID, threadID, topicName)
 
 	return fmt.Sprintf("Created topic: %s (thread_id: %d)", topicName, threadID), nil
 }
@@ -995,12 +1110,12 @@ func (h *CommandHandler) cmdBudget(ctx context.Context, update contract.Update, 
 
 	// Set new budget - requires admin check
 	userID := update.FromUser.ID
-	isAdmin, err := h.db.IsUserAllowed(ctx, userID)
+	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
 	if err != nil {
 		return "", fmt.Errorf("check admin status: %w", err)
 	}
 	if !isAdmin {
-		return "Only admins can change the budget. Ask an admin to use /budget <amount>.", nil
+		return "Permission denied. Only admins can change the budget.", nil
 	}
 
 	// Parse the new budget amount
@@ -1024,3 +1139,161 @@ func (h *CommandHandler) cmdBudget(ctx context.Context, update contract.Update, 
 
 	return fmt.Sprintf("Budget updated to: $%.2f", newBudget), nil
 }
+
+// cmdAddUser handles /adduser <telegram_user_id> [role] — adds a user to the allowed_users table (admin only).
+func (h *CommandHandler) cmdAddUser(ctx context.Context, update contract.Update, args string) (string, error) {
+	// Check if the command is being used in the General topic
+	isGeneral := update.ThreadID == nil || *update.ThreadID == generalTopicID
+	if !isGeneral {
+		return "User management commands only work in the General topic.", nil
+	}
+
+	// Check if the user is an admin
+	userID := update.FromUser.ID
+	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can add users.", nil
+	}
+
+	// Parse arguments
+	parts := strings.Fields(args)
+	if len(parts) < 1 {
+		return "Usage: /adduser <telegram_user_id> [role]\n\nrole: admin or user (default: user)\n\nExample: /adduser 123456789 admin", nil
+	}
+
+	targetUserID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return fmt.Sprintf("Invalid user ID %q. User ID must be a number.", parts[0]), nil
+	}
+
+	// Default role is "user"
+	role := "user"
+	if len(parts) >= 2 {
+		role = strings.ToLower(parts[1])
+		if role != "admin" && role != "user" {
+			return fmt.Sprintf("Invalid role %q. Role must be 'admin' or 'user'.", role), nil
+		}
+	}
+
+	// Add the user
+	user := &AllowedUser{
+		UserID:  targetUserID,
+		Role:    role,
+		AddedAt: time.Now().UTC(),
+	}
+	if err := h.db.UpsertAllowedUser(ctx, user); err != nil {
+		return "", fmt.Errorf("add user: %w", err)
+	}
+
+	return fmt.Sprintf("Added user %d with role: %s", targetUserID, role), nil
+}
+
+// cmdRemoveUser handles /removeuser <telegram_user_id> — removes a user from the allowed_users table (admin only).
+func (h *CommandHandler) cmdRemoveUser(ctx context.Context, update contract.Update, args string) (string, error) {
+	// Check if the command is being used in the General topic
+	isGeneral := update.ThreadID == nil || *update.ThreadID == generalTopicID
+	if !isGeneral {
+		return "User management commands only work in the General topic.", nil
+	}
+
+	// Check if the user is an admin
+	userID := update.FromUser.ID
+	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can remove users.", nil
+	}
+
+	// Parse arguments
+	parts := strings.Fields(args)
+	if len(parts) < 1 {
+		return "Usage: /removeuser <telegram_user_id>\n\nExample: /removeuser 123456789", nil
+	}
+
+	targetUserID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return fmt.Sprintf("Invalid user ID %q. User ID must be a number.", parts[0]), nil
+	}
+
+	// Prevent removing yourself
+	if targetUserID == userID {
+		return "You cannot remove yourself from the allowed users list.", nil
+	}
+
+	// Remove the user
+	if err := h.db.DeleteAllowedUser(ctx, targetUserID); err != nil {
+		return "", fmt.Errorf("remove user: %w", err)
+	}
+
+	return fmt.Sprintf("Removed user %d from the allowed users list.", targetUserID), nil
+}
+
+// cmdUsers handles /users — lists all allowed users (admin only).
+func (h *CommandHandler) cmdUsers(ctx context.Context) (string, error) {
+	// Get all users
+	users, err := h.db.ListAllowedUsers(ctx)
+	if err != nil {
+		return "", fmt.Errorf("list users: %w", err)
+	}
+
+	if len(users) == 0 {
+		return "No users in the allowed users list.", nil
+	}
+
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "Allowed users (%d):\n\n", len(users))
+		for _, u := range users {
+			fmt.Fprintf(&sb, "  • User ID: %d\n", u.UserID)
+			fmt.Fprintf(&sb, "    Role: %s\n", u.Role)
+			fmt.Fprintf(&sb, "    Added: %s\n\n", u.AddedAt.Format("2006-01-02 15:04:05"))
+		}
+
+		return strings.TrimRight(sb.String(), "\n"), nil
+	}
+
+	// GenerateSessionSummary generates a summary for a session using Haiku.
+	// This is a standalone helper that can be used by both CommandHandler and SessionCleanup.
+	// Returns (summary, error) — summary is empty if generation fails.
+	func GenerateSessionSummary(ctx context.Context, session *Session, group *Group, proxyURL string) (string, error) {
+		// Use a timeout context for summary generation
+		summCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+
+		args := []string{
+			"-p",
+			"--output-format", "json",
+			"--model", "claude-haiku-4-5", // Always use the cheapest model for summaries
+			"--permission-mode", resolvePermissionMode(group),
+			"--cwd", group.CWD,
+		}
+		if session.SessionID != "" {
+			args = append(args, "--resume", session.SessionID)
+		}
+
+		cmd := exec.CommandContext(summCtx, "claude", args...)
+		cmd.Stdin = strings.NewReader("Summarize what was accomplished in this session in 2-3 bullet points. Note any unfinished work or open questions.")
+
+		output, err := cmd.Output()
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				return "", fmt.Errorf("claude exited %d: %s", exitErr.ExitCode(), string(exitErr.Stderr))
+			}
+			return "", fmt.Errorf("run claude: %w", err)
+		}
+
+		// Parse JSON output
+		var out claudeOutput
+		if err := json.Unmarshal(output, &out); err != nil {
+			return "", fmt.Errorf("parse claude output: %w", err)
+		}
+		if out.IsError {
+			return "", fmt.Errorf("claude error: %s", out.Result)
+		}
+
+		return out.Result, nil
+	}

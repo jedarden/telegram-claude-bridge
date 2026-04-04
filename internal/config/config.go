@@ -63,6 +63,11 @@ type BridgeConfig struct {
 	// CloseInactiveTopics controls whether to close Telegram topics for inactive sessions.
 	// If false, sessions are marked inactive but topics remain open for reference.
 	CloseInactiveTopics bool
+
+	// AdminUserID is the Telegram user ID of the initial admin user.
+	// This user is automatically granted admin access on startup if not already in the database.
+	// Set to 0 to disable auto-admin bootstrapping.
+	AdminUserID int64
 }
 
 // LoadProxyConfig reads ProxyConfig from environment variables.
@@ -177,6 +182,14 @@ func LoadBridgeConfig() (*BridgeConfig, error) {
 		default:
 			return nil, fmt.Errorf("CLOSE_INACTIVE_TOPICS must be a boolean value (0/1, true/false, yes/no, on/off), got %q", v)
 		}
+	}
+
+	if v := os.Getenv("ADMIN_USER_ID"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("ADMIN_USER_ID must be an integer, got %q", v)
+		}
+		cfg.AdminUserID = n
 	}
 
 	return cfg, nil

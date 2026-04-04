@@ -29,14 +29,16 @@ type DB struct {
 
 // Group represents a configured Telegram group/supergroup.
 type Group struct {
-	ChatID         int64
-	Name           string
-	CWD            string
-	DefaultModel   string
-	MaxBudget      float64
-	TimeoutSec     int
-	PermissionMode string
-	CreatedAt      time.Time
+	ChatID           int64
+	Name             string
+	CWD              string
+	DefaultModel     string
+	MaxBudget        float64
+	TimeoutSec       int
+	PermissionMode   string
+	AllowedTools     string // JSON array of tool names, or empty for all tools
+	DisallowedTools  string // JSON array of tool names, or empty for no restrictions
+	CreatedAt        time.Time
 }
 
 // Session represents an active Claude Code session mapped to a (chat_id, thread_id) pair.
@@ -86,7 +88,7 @@ type CostEvent struct {
 	CreatedAt            time.Time
 }
 
-const schemaVersion = 7
+const schemaVersion = 8
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -702,6 +704,28 @@ func (d *DB) IsUserAllowed(ctx context.Context, userID int64) (bool, error) {
 	return count > 0, err
 }
 
+// GetUserRole returns the role for a user ("admin" or "user").
+// Returns empty string if user not found.
+func (d *DB) GetUserRole(ctx context.Context, userID int64) (string, error) {
+	var role string
+	err := d.db.QueryRowContext(ctx,
+		`SELECT role FROM allowed_users WHERE user_id = ?`, userID,
+	).Scan(&role)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return role, err
+}
+
+// IsUserAdmin returns true if the user has an "admin" role.
+func (d *DB) IsUserAdmin(ctx context.Context, userID int64) (bool, error) {
+	role, err := d.GetUserRole(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	return role == "admin", nil
+}
+
 // GetAllowedUser returns the allowed user record, or (nil, nil) if not found.
 func (d *DB) GetAllowedUser(ctx context.Context, userID int64) (*AllowedUser, error) {
 	row := d.db.QueryRowContext(ctx,
@@ -763,6 +787,23 @@ func (d *DB) ListAllowedUsers(ctx context.Context) ([]*AllowedUser, error) {
 		users = append(users, &u)
 	}
 	return users, rows.Err()
+}
+
+// EnsureAdminUser ensures a user exists as an admin in the database.
+// If the user doesn't exist, they are added with the admin role.
+// If they exist with a different role, their role is updated to admin.
+func (d *DB) EnsureAdminUser(ctx context.Context, userID int64) error {
+	u := &AllowedUser{
+		UserID:  userID,
+		Role:    "admin",
+		AddedAt: time.Now().UTC(),
+	}
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO allowed_users (user_id, role, added_at) VALUES (?, ?, ?)
+		 ON CONFLICT(user_id) DO UPDATE SET role = excluded.role`,
+		u.UserID, u.Role, u.AddedAt.UTC().Format(time.RFC3339),
+	)
+	return err
 }
 
 // ── sent_messages ─────────────────────────────────────────────────────────────

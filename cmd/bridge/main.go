@@ -38,6 +38,14 @@ func main() {
 	}
 	defer db.Close()
 
+	// Bootstrap initial admin user if configured
+	if cfg.AdminUserID > 0 {
+		if err := db.EnsureAdminUser(context.Background(), cfg.AdminUserID); err != nil {
+			log.Fatalf("bootstrap admin user: %v", err)
+		}
+		log.Printf("[bridge] bootstrapped admin user %d", cfg.AdminUserID)
+	}
+
 	// Initialize health checker with structured JSON logging
 	checker := health.NewChecker(cfg.ProxyURL+"/health", db.SqlDB())
 

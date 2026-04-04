@@ -15,6 +15,9 @@ StartLimitBurst=3
 StartLimitIntervalSec=60
 Environment=PATH=/home/coding/.local/bin:/usr/local/go/bin:/usr/bin:/bin
 Environment=HOME=/home/coding
+Environment=REPO_PATH=/home/coding/telegram-claude-bridge
+Environment=BINARY_PATH=bin/bridge
+Environment=UPDATE_INTERVAL_MINUTES=5
 
 [Install]
 WantedBy=multi-user.target

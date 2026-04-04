@@ -76,6 +76,7 @@ type SessionManager struct {
 	mu                  sync.Mutex
 	topics              map[topicKey]*topicWorker
 	pinnedUpdateLastSeen map[topicKey]time.Time // debounce: track last pinned msg update time
+	pendingContext       map[topicKey]string    // pending context to inject into next prompt
 }
 
 type topicKey struct {
@@ -163,6 +164,7 @@ func NewSessionManager(db *DB, sender *Sender, proxyURL string) *SessionManager 
 		proxyURL:            proxyURL,
 		topics:              make(map[topicKey]*topicWorker),
 		pinnedUpdateLastSeen: make(map[topicKey]time.Time),
+		pendingContext:       make(map[topicKey]string),
 	}
 }
 
@@ -250,6 +252,19 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	tid := key.threadID
 	tidPtr := &tid
 	origMsgID := last.update.MessageID
+
+	// Log user attribution for this batch
+	userID := last.update.FromUser.ID
+	username := ""
+	if last.update.FromUser.Username != nil {
+		username = *last.update.FromUser.Username
+	}
+	userStr := fmt.Sprintf("user_id=%d", userID)
+	if username != "" {
+		userStr += fmt.Sprintf(" (@%s)", username)
+	}
+	log.Printf("[session_mgr] processing batch (%d,%d) from %s: %d messages",
+		key.chatID, key.threadID, userStr, len(batch))
 
 	// Re-fetch session and group from DB for freshness: a previous batch in this
 	// worker may have created the session since the router dispatched this message.
@@ -409,7 +424,7 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		}
 	}
 
-	prompt := buildSessionPrompt(batch, extras)
+	prompt := m.buildSessionPrompt(key, batch, extras)
 	if prompt == "" {
 		return // no content to process
 	}
@@ -868,7 +883,8 @@ func (m *SessionManager) updatePinnedMetadata(ctx context.Context, session *Sess
 // extras maps each batch index to resolved attachment data (image path or transcription).
 // Single message: used as-is.
 // Multiple messages: previous ones listed under a header, last one highlighted.
-func buildSessionPrompt(batch []sessionMsg, extras []msgExtra) string {
+// If pending context exists for the topic, it's prepended to the prompt.
+func (m *SessionManager) buildSessionPrompt(key topicKey, batch []sessionMsg, extras []msgExtra) string {
 	texts := make([]string, 0, len(batch))
 	for i, msg := range batch {
 		var ex msgExtra
@@ -879,18 +895,35 @@ func buildSessionPrompt(batch []sessionMsg, extras []msgExtra) string {
 			texts = append(texts, t)
 		}
 	}
+
+	// Build the base prompt
+	var basePrompt string
 	switch len(texts) {
 	case 0:
 		return ""
 	case 1:
-		return texts[0]
+		basePrompt = texts[0]
 	default:
-		return fmt.Sprintf(
+		basePrompt = fmt.Sprintf(
 			"Previous messages while processing:\n\n%s\n\nLatest message:\n%s",
 			strings.Join(texts[:len(texts)-1], "\n\n"),
 			texts[len(texts)-1],
 		)
 	}
+
+	// Check for pending context and prepend it
+	m.mu.Lock()
+	pendingCtx, hasPending := m.pendingContext[key]
+	if hasPending {
+		delete(m.pendingContext, key) // Clear after use
+	}
+	m.mu.Unlock()
+
+	if hasPending && pendingCtx != "" {
+		return fmt.Sprintf("Context from another topic:\n\n%s\n\n---\n\n%s", pendingCtx, basePrompt)
+	}
+
+	return basePrompt
 }
 
 // sessionMsgText extracts the prompt text from an update.
@@ -1159,4 +1192,59 @@ func isBlockedError(errMsg string) bool {
 		}
 	}
 	return false
+}
+
+// SetPendingContext stores context to be injected into the next prompt for a topic.
+func (m *SessionManager) SetPendingContext(chatID, threadID int64, context string) {
+	key := topicKey{chatID: chatID, threadID: threadID}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pendingContext[key] = context
+}
+
+// GetSessionContext retrieves context from another session for use with /context.
+// Returns the summary if available, otherwise returns a formatted metadata string.
+func (m *SessionManager) GetSessionContext(ctx context.Context, chatID, threadID int64) (string, error) {
+	session, err := m.db.GetSession(ctx, chatID, threadID)
+	if err != nil {
+		return "", fmt.Errorf("get session: %w", err)
+	}
+	if session == nil {
+		return "", fmt.Errorf("no session found for thread %d", threadID)
+	}
+
+	// If the session has a summary, use it
+	if session.Summary != "" {
+		return fmt.Sprintf("From thread %d:\n\n%s", threadID, session.Summary), nil
+	}
+
+	// Otherwise, format a context string from the session metadata
+	group, err := m.db.GetGroup(ctx, chatID)
+	if err != nil {
+		return "", fmt.Errorf("get group: %w", err)
+	}
+
+	model := session.Model
+	if model == "" && group != nil {
+		model = group.DefaultModel
+	}
+	if model == "" {
+		model = defaultSessionModel
+	}
+
+	contextStr := fmt.Sprintf("From thread %d:\n\nSession: %s\nProject: %s\nModel: %s\nMessages: %d\nStatus: %s\nStarted: %s",
+		threadID,
+		session.SessionID,
+		session.CWD,
+		model,
+		session.MessageCount,
+		session.Status,
+		session.CreatedAt.Format("2006-01-02 15:04:05"))
+
+	// Add cost info if there's any cost recorded
+	if session.TotalCostUSD > 0 {
+		contextStr += fmt.Sprintf("\nCost: $%.4f", session.TotalCostUSD)
+	}
+
+	return contextStr, nil
 }
