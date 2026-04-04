@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
@@ -262,6 +264,156 @@ func (s *Sender) AnswerCallbackQuery(ctx context.Context, req contract.AnswerCal
 	}
 	_, apiErr := s.call(ctx, "answerCallbackQuery", body)
 	return apiErr
+}
+
+// SendPhoto sends a photo via Telegram's sendPhoto method.
+func (s *Sender) SendPhoto(ctx context.Context, req contract.SendPhotoRequest, fileData []byte, filename string) (*contract.SendResponse, *contract.ErrorResponse) {
+	fields := map[string]string{
+		"chat_id": strconv.FormatInt(req.ChatID, 10),
+	}
+	if req.ThreadID != nil {
+		fields["message_thread_id"] = strconv.FormatInt(*req.ThreadID, 10)
+	}
+	if req.Caption != nil {
+		fields["caption"] = *req.Caption
+	}
+	if req.ParseMode != nil {
+		fields["parse_mode"] = *req.ParseMode
+	}
+	if req.ReplyToMessageID != nil {
+		fields["reply_to_message_id"] = strconv.FormatInt(*req.ReplyToMessageID, 10)
+	}
+	return s.callMultipart(ctx, "sendPhoto", fields, "photo", filename, fileData)
+}
+
+// SendDocument sends a document via Telegram's sendDocument method.
+func (s *Sender) SendDocument(ctx context.Context, req contract.SendDocumentRequest, fileData []byte, filename string) (*contract.SendResponse, *contract.ErrorResponse) {
+	fields := map[string]string{
+		"chat_id": strconv.FormatInt(req.ChatID, 10),
+	}
+	if req.ThreadID != nil {
+		fields["message_thread_id"] = strconv.FormatInt(*req.ThreadID, 10)
+	}
+	if req.Caption != nil {
+		fields["caption"] = *req.Caption
+	}
+	if req.ParseMode != nil {
+		fields["parse_mode"] = *req.ParseMode
+	}
+	if req.ReplyToMessageID != nil {
+		fields["reply_to_message_id"] = strconv.FormatInt(*req.ReplyToMessageID, 10)
+	}
+	if req.FileName != nil {
+		filename = *req.FileName
+	}
+	return s.callMultipart(ctx, "sendDocument", fields, "document", filename, fileData)
+}
+
+// SendAudio sends an audio file via Telegram's sendAudio method.
+func (s *Sender) SendAudio(ctx context.Context, req contract.SendAudioRequest, fileData []byte, filename string) (*contract.SendResponse, *contract.ErrorResponse) {
+	fields := map[string]string{
+		"chat_id": strconv.FormatInt(req.ChatID, 10),
+	}
+	if req.ThreadID != nil {
+		fields["message_thread_id"] = strconv.FormatInt(*req.ThreadID, 10)
+	}
+	if req.Caption != nil {
+		fields["caption"] = *req.Caption
+	}
+	if req.ParseMode != nil {
+		fields["parse_mode"] = *req.ParseMode
+	}
+	if req.Duration != nil {
+		fields["duration"] = strconv.Itoa(*req.Duration)
+	}
+	if req.Title != nil {
+		fields["title"] = *req.Title
+	}
+	if req.ReplyToMessageID != nil {
+		fields["reply_to_message_id"] = strconv.FormatInt(*req.ReplyToMessageID, 10)
+	}
+	return s.callMultipart(ctx, "sendAudio", fields, "audio", filename, fileData)
+}
+
+// SendVideo sends a video file via Telegram's sendVideo method.
+func (s *Sender) SendVideo(ctx context.Context, req contract.SendVideoRequest, fileData []byte, filename string) (*contract.SendResponse, *contract.ErrorResponse) {
+	fields := map[string]string{
+		"chat_id": strconv.FormatInt(req.ChatID, 10),
+	}
+	if req.ThreadID != nil {
+		fields["message_thread_id"] = strconv.FormatInt(*req.ThreadID, 10)
+	}
+	if req.Caption != nil {
+		fields["caption"] = *req.Caption
+	}
+	if req.ParseMode != nil {
+		fields["parse_mode"] = *req.ParseMode
+	}
+	if req.Duration != nil {
+		fields["duration"] = strconv.Itoa(*req.Duration)
+	}
+	if req.Width != nil {
+		fields["width"] = strconv.Itoa(*req.Width)
+	}
+	if req.Height != nil {
+		fields["height"] = strconv.Itoa(*req.Height)
+	}
+	if req.ReplyToMessageID != nil {
+		fields["reply_to_message_id"] = strconv.FormatInt(*req.ReplyToMessageID, 10)
+	}
+	return s.callMultipart(ctx, "sendVideo", fields, "video", filename, fileData)
+}
+
+// callMultipart POSTs a multipart/form-data body to a Telegram Bot API method.
+// fields contains string form values; fileField/filename/fileData describe the file part.
+func (s *Sender) callMultipart(ctx context.Context, method string, fields map[string]string, fileField, filename string, fileData []byte) (*contract.SendResponse, *contract.ErrorResponse) {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+
+	for k, v := range fields {
+		if err := mw.WriteField(k, v); err != nil {
+			return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: fmt.Sprintf("write field %s: %v", k, err)}
+		}
+	}
+
+	fw, err := mw.CreateFormFile(fileField, filename)
+	if err != nil {
+		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: fmt.Sprintf("create form file: %v", err)}
+	}
+	if _, err := fw.Write(fileData); err != nil {
+		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: fmt.Sprintf("write file data: %v", err)}
+	}
+	mw.Close()
+
+	apiURL := fmt.Sprintf("%s/bot%s/%s", s.apiBase, s.token, method)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, &body)
+	if err != nil {
+		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: fmt.Sprintf("build request: %v", err)}
+	}
+	httpReq.Header.Set("Content-Type", mw.FormDataContentType())
+
+	// Use downloadClient (no fixed timeout) so context controls the deadline for large uploads.
+	resp, err := s.downloadClient.Do(httpReq)
+	if err != nil {
+		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: fmt.Sprintf("Telegram unreachable: %v", err)}
+	}
+	defer resp.Body.Close()
+
+	var tgResp tgAPIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tgResp); err != nil {
+		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: fmt.Sprintf("decode response: %v", err)}
+	}
+	if !tgResp.OK {
+		return nil, tgResp.toErrorResponse()
+	}
+
+	var msg struct {
+		MessageID int64 `json:"message_id"`
+	}
+	if err := json.Unmarshal(tgResp.Result, &msg); err != nil {
+		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: "bad response from Telegram"}
+	}
+	return &contract.SendResponse{OK: true, MessageID: msg.MessageID}, nil
 }
 
 // call POSTs a JSON body to the given Telegram Bot API method and returns the parsed response.

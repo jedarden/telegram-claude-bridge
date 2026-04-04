@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -45,6 +46,10 @@ func main() {
 	mux.HandleFunc("/pin_message", handlePinMessage(sender))
 	mux.HandleFunc("/answer_callback", handleAnswerCallback(sender))
 	mux.HandleFunc("GET /file/{file_id}", handleFile(sender))
+	mux.HandleFunc("/send_photo", handleSendPhoto(sender))
+	mux.HandleFunc("/send_document", handleSendDocument(sender))
+	mux.HandleFunc("/send_audio", handleSendAudio(sender))
+	mux.HandleFunc("/send_video", handleSendVideo(sender))
 
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
@@ -373,6 +378,228 @@ func handleFile(s *telegram.Sender) http.HandlerFunc {
 
 		if _, err := io.Copy(w, resp.Body); err != nil {
 			log.Printf("file stream %s: %v", fileID, err)
+		}
+	}
+}
+
+const (
+	maxPhotoSize    = 10 * 1024 * 1024 // 10MB
+	maxMediaSize    = 50 * 1024 * 1024 // 50MB for document/audio/video
+	multipartMemory = 32 * 1024 * 1024 // max memory for multipart parsing (rest goes to disk)
+)
+
+// parseMediaForm parses a multipart form with the given size limit and returns the
+// required chat_id. Returns false and writes an error if parsing or chat_id fails.
+func parseMediaForm(w http.ResponseWriter, r *http.Request, maxSize int64) (chatID int64, ok bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxSize+4096) // +4096 for form fields
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeProxyError(w, http.StatusRequestEntityTooLarge, 413, fmt.Sprintf("file exceeds %dMB limit", maxSize/1024/1024))
+		} else {
+			writeProxyError(w, http.StatusBadRequest, 400, "invalid multipart form: "+err.Error())
+		}
+		return 0, false
+	}
+	chatIDStr := r.FormValue("chat_id")
+	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+	if err != nil || chatID == 0 {
+		writeProxyError(w, http.StatusBadRequest, 400, "invalid or missing chat_id")
+		return 0, false
+	}
+	return chatID, true
+}
+
+// optionalInt64 parses a form value as int64, returning nil if absent.
+func optionalInt64(r *http.Request, key string) *int64 {
+	if v := r.FormValue(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return &n
+		}
+	}
+	return nil
+}
+
+// optionalInt parses a form value as int, returning nil if absent.
+func optionalInt(r *http.Request, key string) *int {
+	if v := r.FormValue(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return &n
+		}
+	}
+	return nil
+}
+
+// optionalStr returns a pointer to the form value if non-empty, else nil.
+func optionalStr(r *http.Request, key string) *string {
+	if v := r.FormValue(key); v != "" {
+		return &v
+	}
+	return nil
+}
+
+func handleSendPhoto(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		chatID, ok := parseMediaForm(w, r, maxPhotoSize)
+		if !ok {
+			return
+		}
+		req := contract.SendPhotoRequest{
+			ChatID:           chatID,
+			ThreadID:         optionalInt64(r, "thread_id"),
+			Caption:          optionalStr(r, "caption"),
+			ParseMode:        optionalStr(r, "parse_mode"),
+			ReplyToMessageID: optionalInt64(r, "reply_to_message_id"),
+		}
+		file, header, err := r.FormFile("photo")
+		if err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "missing photo file")
+			return
+		}
+		defer file.Close()
+		data, err := io.ReadAll(file)
+		if err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "failed to read photo")
+			return
+		}
+		resp, apiErr := s.SendPhoto(r.Context(), req, data, header.Filename)
+		if apiErr != nil {
+			writeTelegramError(w, apiErr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("send_photo encode: %v", err)
+		}
+	}
+}
+
+func handleSendDocument(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		chatID, ok := parseMediaForm(w, r, maxMediaSize)
+		if !ok {
+			return
+		}
+		req := contract.SendDocumentRequest{
+			ChatID:           chatID,
+			ThreadID:         optionalInt64(r, "thread_id"),
+			Caption:          optionalStr(r, "caption"),
+			ParseMode:        optionalStr(r, "parse_mode"),
+			ReplyToMessageID: optionalInt64(r, "reply_to_message_id"),
+			FileName:         optionalStr(r, "file_name"),
+		}
+		file, header, err := r.FormFile("document")
+		if err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "missing document file")
+			return
+		}
+		defer file.Close()
+		data, err := io.ReadAll(file)
+		if err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "failed to read document")
+			return
+		}
+		resp, apiErr := s.SendDocument(r.Context(), req, data, header.Filename)
+		if apiErr != nil {
+			writeTelegramError(w, apiErr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("send_document encode: %v", err)
+		}
+	}
+}
+
+func handleSendAudio(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		chatID, ok := parseMediaForm(w, r, maxMediaSize)
+		if !ok {
+			return
+		}
+		req := contract.SendAudioRequest{
+			ChatID:           chatID,
+			ThreadID:         optionalInt64(r, "thread_id"),
+			Caption:          optionalStr(r, "caption"),
+			ParseMode:        optionalStr(r, "parse_mode"),
+			Duration:         optionalInt(r, "duration"),
+			Title:            optionalStr(r, "title"),
+			ReplyToMessageID: optionalInt64(r, "reply_to_message_id"),
+		}
+		file, header, err := r.FormFile("audio")
+		if err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "missing audio file")
+			return
+		}
+		defer file.Close()
+		data, err := io.ReadAll(file)
+		if err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "failed to read audio")
+			return
+		}
+		resp, apiErr := s.SendAudio(r.Context(), req, data, header.Filename)
+		if apiErr != nil {
+			writeTelegramError(w, apiErr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("send_audio encode: %v", err)
+		}
+	}
+}
+
+func handleSendVideo(s *telegram.Sender) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		chatID, ok := parseMediaForm(w, r, maxMediaSize)
+		if !ok {
+			return
+		}
+		req := contract.SendVideoRequest{
+			ChatID:           chatID,
+			ThreadID:         optionalInt64(r, "thread_id"),
+			Caption:          optionalStr(r, "caption"),
+			ParseMode:        optionalStr(r, "parse_mode"),
+			Duration:         optionalInt(r, "duration"),
+			Width:            optionalInt(r, "width"),
+			Height:           optionalInt(r, "height"),
+			ReplyToMessageID: optionalInt64(r, "reply_to_message_id"),
+		}
+		file, header, err := r.FormFile("video")
+		if err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "missing video file")
+			return
+		}
+		defer file.Close()
+		data, err := io.ReadAll(file)
+		if err != nil {
+			writeProxyError(w, http.StatusBadRequest, 400, "failed to read video")
+			return
+		}
+		resp, apiErr := s.SendVideo(r.Context(), req, data, header.Filename)
+		if apiErr != nil {
+			writeTelegramError(w, apiErr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("send_video encode: %v", err)
 		}
 	}
 }
