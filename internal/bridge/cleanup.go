@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 )
@@ -89,6 +90,41 @@ func (sc *SessionCleanup) runCleanup(ctx context.Context) {
 	log.Printf("[cleanup] found %d stale sessions", len(stale))
 
 	for _, sess := range stale {
+		// Generate and post summary before marking inactive
+		group, err := sc.db.GetGroup(ctx, sess.ChatID)
+		if err != nil {
+			log.Printf("[cleanup] failed to get group for (%d,%d): %v",
+				sess.ChatID, sess.ThreadID, err)
+		}
+
+		// Generate summary if we have a valid group
+		if group != nil {
+			summary, summaryErr := GenerateSessionSummary(ctx, sess, group, "")
+			if summaryErr != nil {
+				log.Printf("[cleanup] generate summary failed for (%d,%d): %v",
+					sess.ChatID, sess.ThreadID, summaryErr)
+			} else if summary != "" {
+				// Send the summary as a new message in the topic
+				tidPtr := &sess.ThreadID
+				summaryText := fmt.Sprintf("📋 <b>Session Summary</b>\n\n%s", summary)
+
+				msgID, sendErr := sc.sender.SendAndPinMetadata(ctx, sess.ChatID, tidPtr, summaryText)
+				if sendErr != nil {
+					log.Printf("[cleanup] send summary failed for (%d,%d): %v",
+						sess.ChatID, sess.ThreadID, sendErr)
+				} else {
+					log.Printf("[cleanup] posted summary for (%d,%d), msg_id=%d",
+						sess.ChatID, sess.ThreadID, msgID)
+				}
+
+				// Store the summary in the database
+				if storeErr := sc.db.UpdateSessionSummary(ctx, sess.ChatID, sess.ThreadID, summary); storeErr != nil {
+					log.Printf("[cleanup] store summary failed for (%d,%d): %v",
+						sess.ChatID, sess.ThreadID, storeErr)
+				}
+			}
+		}
+
 		// Update status to inactive
 		if err := sc.db.SetSessionStatus(ctx, sess.ChatID, sess.ThreadID, "inactive"); err != nil {
 			log.Printf("[cleanup] failed to set inactive status for (%d,%d): %v",
