@@ -444,26 +444,25 @@ func (m *SessionManager) invokeClaudeAPI(
 			return false
 		}
 
-		// Check for overflow before sending
+		// When text exceeds 4096 chars, we stop editing the current message and
+		// send a new one for overflow. The current message is finalized with a
+		// truncated preview, and the rest of the text is sent to a new message.
 		if runeLen(text) > maxMessageLen {
-			// Text exceeds 4096 chars - need to handle overflow
-			// Send the current message with truncated content and prepare for overflow
-			overflowChunk := text
-			if len(text) > maxMessageLen {
-				// Truncate to max length (approximate, will be refined by chunkText)
-				overflowChunk = string([]rune(text)[:maxMessageLen])
-			}
+			// Split the text at the boundary
+			splitAt := runeByteLen(text, maxMessageLen)
+			currentChunk := text[:splitAt]
 
+			// Send/edit the current message with the truncated content
 			if streamMsgID == 0 {
-				// First overflow - use the placeholder or send new message
+				// First message - use placeholder or send new
 				if placeholderID != 0 {
-					if err := m.sender.EditMessage(ctx, chatID, placeholderID, overflowChunk); err != nil {
+					if err := m.sender.EditMessage(ctx, chatID, placeholderID, currentChunk); err != nil {
 						log.Printf("[session_mgr] edit placeholder (%d,%d): %v", chatID, *threadID, err)
 						return false
 					}
 					streamMsgID = placeholderID
 				} else {
-					id, err := m.sender.sendInitialStream(ctx, chatID, threadID, origMsgID, overflowChunk)
+					id, err := m.sender.sendInitialStream(ctx, chatID, threadID, origMsgID, currentChunk)
 					if err != nil {
 						log.Printf("[session_mgr] send initial stream (%d,%d): %v", chatID, *threadID, err)
 						return false
@@ -471,23 +470,26 @@ func (m *SessionManager) invokeClaudeAPI(
 					streamMsgID = id
 				}
 			} else {
-				if err := m.sender.EditMessage(ctx, chatID, streamMsgID, overflowChunk); err != nil {
+				// Edit the current streaming message with truncated content
+				if err := m.sender.EditMessage(ctx, chatID, streamMsgID, currentChunk); err != nil {
 					log.Printf("[session_mgr] edit stream (%d,%d): %v", chatID, *threadID, err)
 					return false
 				}
 			}
-			lastEdit = time.Now()
 
-			// Send overflow to new message
-			remainingText := text[runeByteLen(text, maxMessageLen):]
-			newMsgID, err := m.sender.SendStreamOverflow(ctx, chatID, threadID, remainingText)
+			// Send the overflow as a new message and continue streaming into it
+			overflowText := text[splitAt:]
+			newMsgID, err := m.sender.SendStreamOverflow(ctx, chatID, threadID, overflowText)
 			if err != nil {
 				log.Printf("[session_mgr] send overflow (%d,%d): %v", chatID, *threadID, err)
+				// Keep streaming into the old message on error
 			} else {
 				streamMsgID = newMsgID
-				// Clear buffer and start accumulating for the new message
+				// Continue streaming into the new message - set buffer to overflow content
 				textBuf.Reset()
+				textBuf.WriteString(overflowText)
 			}
+			lastEdit = time.Now()
 			return true
 		}
 
@@ -512,7 +514,9 @@ func (m *SessionManager) invokeClaudeAPI(
 			if err := m.sender.EditMessage(ctx, chatID, streamMsgID, text); err != nil {
 				// Telegram returns 400 "message is not modified" if text hasn't changed.
 				// Treat this as a no-op rather than an error.
-				log.Printf("[session_mgr] edit stream (%d,%d): %v", chatID, *threadID, err)
+				if apiErr, ok := err.(*contract.ErrorResponse); !ok || apiErr.ErrorCode != 400 {
+					log.Printf("[session_mgr] edit stream (%d,%d): %v", chatID, *threadID, err)
+				}
 			}
 		}
 		lastEdit = time.Now()
