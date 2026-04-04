@@ -79,6 +79,31 @@ func (s *Sender) SendTyping(ctx context.Context, chatID int64, threadID *int64) 
 	}
 }
 
+// SendPlaceholder sends a "Thinking…" placeholder message as a reply to origMsgID
+// and returns the sent message ID. This placeholder is edited progressively during
+// Claude streaming. If sending fails, 0 is returned (caller falls back to first-delta send).
+func (s *Sender) SendPlaceholder(ctx context.Context, chatID int64, threadID *int64, origMsgID int64) (int64, error) {
+	req := contract.SendRequest{
+		ChatID:           chatID,
+		ThreadID:         threadID,
+		Text:             "Thinking…",
+		ReplyToMessageID: &origMsgID,
+	}
+	var resp contract.SendResponse
+	if err := s.postWithRetry(ctx, "/send", req, &resp); err != nil {
+		return 0, err
+	}
+	// Store in sent_messages table for potential later edits.
+	if _, dbErr := s.db.ExecContext(ctx,
+		`INSERT INTO sent_messages (chat_id, thread_id, orig_msg_id, sent_msg_id, chunk_index, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		chatID, nullableInt64(threadID), origMsgID, resp.MessageID, 0, time.Now().Unix(),
+	); dbErr != nil {
+		log.Printf("[bridge/sender] db insert failed: %v", dbErr)
+	}
+	return resp.MessageID, nil
+}
+
 // SendResponse sends text back to the user, chunking at paragraph boundaries
 // when the text exceeds 4096 characters. The first chunk is sent as a reply
 // to origMsgID; subsequent chunks are standalone messages in the same topic.
@@ -144,6 +169,29 @@ func (s *Sender) EditMessage(ctx context.Context, chatID, messageID int64, text 
 	}, nil)
 }
 
+// SendStreamOverflow sends a new message when streaming content overflows
+// the 4096 character limit. Returns the new message ID for continued editing.
+func (s *Sender) SendStreamOverflow(ctx context.Context, chatID int64, threadID *int64, text string) (int64, error) {
+	req := contract.SendRequest{
+		ChatID:   chatID,
+		ThreadID: threadID,
+		Text:     text,
+	}
+	var resp contract.SendResponse
+	if err := s.postWithRetry(ctx, "/send", req, &resp); err != nil {
+		return 0, err
+	}
+	// Store in sent_messages table (chunk_index will be updated by caller)
+	if _, dbErr := s.db.ExecContext(ctx,
+		`INSERT INTO sent_messages (chat_id, thread_id, orig_msg_id, sent_msg_id, chunk_index, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		chatID, nullableInt64(threadID), int64(0), resp.MessageID, 0, time.Now().Unix(),
+	); dbErr != nil {
+		log.Printf("[bridge/sender] db insert failed: %v", dbErr)
+	}
+	return resp.MessageID, nil
+}
+
 // SendStreamFinal concludes a streaming response. If streamMsgID is non-zero it
 // edits that message with the first chunk of the final text and sends any
 // overflow chunks as new (non-reply) messages in the same topic. If streamMsgID
@@ -184,48 +232,229 @@ func (s *Sender) SendStreamFinal(ctx context.Context, chatID int64, threadID *in
 	return nil
 }
 
-// chunkText splits text into ≤4096-rune chunks at natural boundaries.
+// chunkText splits HTML text into ≤4096-rune chunks at natural boundaries.
 //
 // Algorithm:
 //  1. If text ≤ 4096 runes → return as-is.
-//  2. Find the last paragraph break (\n\n) before the limit.
-//  3. If none, find the last newline (\n) before the limit.
-//  4. If none, hard-cut at 4096 runes.
+//  2. Identify code block boundaries (<pre>...</pre>).
+//  3. Find split points in priority order:
+//     a) Paragraph break (\n\n) outside code blocks
+//     b) After </pre> (between code blocks)
+//     c) Single newline (\n) outside code blocks
+//     d) Hard cut at 4096 (last resort)
+//  4. When splitting, close unclosed HTML tags at split point and reopen in next chunk.
 func chunkText(text string) []string {
 	if runeLen(text) <= maxMessageLen {
 		return []string{text}
 	}
 
+	// Find all code block boundaries to know where we can't split.
+	blocks := findCodeBlocks(text)
+
 	var chunks []string
-	for len(text) > 0 {
-		if runeLen(text) <= maxMessageLen {
-			chunks = append(chunks, text)
+	openTags := "" // Tags that need reopening in next chunk (e.g., "<b><pre>")
+	remaining := text
+	offset := 0    // Byte offset into the original text
+
+	for len(remaining) > 0 {
+		if runeLen(remaining) <= maxMessageLen {
+			// Final chunk — prepend any open tags, then close them
+			chunk := openTags + remaining
+			balanced, _ := balanceTags(chunk, "")
+			chunks = append(chunks, balanced)
 			break
 		}
 
-		// Byte length of the first maxMessageLen runes — the window we examine.
-		windowBytes := runeByteLen(text, maxMessageLen)
-		window := text[:windowBytes]
+		// Find split point based on remaining content (not including open tags)
+		windowBytes := runeByteLen(remaining, maxMessageLen)
+		splitIdx := findBestSplitPoint(remaining[:windowBytes], blocks, offset)
 
-		// 1. Last paragraph break.
-		if idx := strings.LastIndex(window, "\n\n"); idx > 0 {
-			chunks = append(chunks, text[:idx])
-			text = strings.TrimLeft(text[idx+2:], "\n")
-			continue
+		if splitIdx <= 0 {
+			splitIdx = windowBytes
 		}
 
-		// 2. Last newline.
-		if idx := strings.LastIndex(window, "\n"); idx > 0 {
-			chunks = append(chunks, text[:idx])
-			text = text[idx+1:]
-			continue
-		}
+		// Balance tags in this chunk (prepend open tags from previous split)
+		chunkContent := openTags + remaining[:splitIdx]
+		chunk, newOpenTags := balanceTags(chunkContent, "")
+		chunks = append(chunks, chunk)
 
-		// 3. Hard cut.
-		chunks = append(chunks, window)
-		text = text[windowBytes:]
+		// Set up for next iteration
+		offset += splitIdx
+		remaining = remaining[splitIdx:]
+		// newOpenTags.reopenTags are the tags we need to reopen
+		openTags = newOpenTags.reopenTags
 	}
+
 	return chunks
+}
+
+// codeBlock represents a <pre>...</pre> region in the HTML.
+type codeBlock struct {
+	start int // byte offset of <
+	end   int // byte offset after >
+}
+
+// findCodeBlocks scans HTML for all <pre>...</pre> blocks and returns their positions.
+func findCodeBlocks(html string) []codeBlock {
+	var blocks []codeBlock
+	i := 0
+	for {
+		start := strings.Index(html[i:], "<pre>")
+		if start < 0 {
+			break
+		}
+		start += i
+		end := strings.Index(html[start:], "</pre>")
+		if end < 0 {
+			// Unclosed block — treat rest as code block
+			blocks = append(blocks, codeBlock{start: start, end: len(html)})
+			break
+		}
+		end += start + 6 // Position after </pre>
+		blocks = append(blocks, codeBlock{start: start, end: end})
+		i = end
+	}
+	return blocks
+}
+
+// isInsideCodeBlock returns true if position is within any code block.
+func isInsideCodeBlock(pos int, blocks []codeBlock) bool {
+	for _, b := range blocks {
+		if pos >= b.start && pos < b.end {
+			return true
+		}
+	}
+	return false
+}
+
+// findBestSplitPoint finds the optimal position to split text within window,
+// respecting code block boundaries. offset is the byte offset of window within
+// the original text (for code block position calculations).
+func findBestSplitPoint(window string, blocks []codeBlock, offset int) int {
+	// Priority 1a: Paragraph break (\n\n) outside code blocks
+	lastIdx := 0
+	for {
+		idx := strings.Index(window[lastIdx:], "\n\n")
+		if idx < 0 {
+			break
+		}
+		pos := lastIdx + idx
+		// Convert relative position to absolute for code block check
+		absPos := offset + pos
+		if !isInsideCodeBlock(absPos, blocks) {
+			return pos + 2 // Split after the \n\n
+		}
+		lastIdx = pos + 2
+	}
+
+	// Priority 1b: After </pre> (between code blocks)
+	for _, b := range blocks {
+		// Convert absolute block end to relative position in window
+		relEnd := b.end - offset
+		if relEnd > 0 && relEnd < len(window) {
+			// Make sure we're actually at a split boundary
+			if strings.HasPrefix(window[relEnd:], "\n") {
+				return relEnd + 1
+			}
+			return relEnd
+		}
+	}
+
+	// Priority 1c: Single newline (\n) outside code blocks
+	lastIdx = 0
+	for {
+		idx := strings.Index(window[lastIdx:], "\n")
+		if idx < 0 {
+			break
+		}
+		pos := lastIdx + idx
+		// Convert relative position to absolute for code block check
+		absPos := offset + pos
+		if !isInsideCodeBlock(absPos, blocks) {
+			return pos + 1
+		}
+		lastIdx = pos + 1
+	}
+
+	// Priority 1d: No good split found — caller will hard cut
+	return -1
+}
+
+// tagBalanceResult contains tags to close at end of chunk and tags to reopen at start of next.
+type tagBalanceResult struct {
+	closeTags  string // e.g., "</b></pre>"
+	reopenTags string // e.g., "<b><pre>"
+}
+
+// balanceTags ensures HTML tags are balanced at the split point.
+// Returns the chunk with close tags appended, and the tags that need reopening.
+func balanceTags(chunk string, currentOpen string) (string, tagBalanceResult) {
+	// Track which tags are open in this chunk
+	var openStack []string
+	i := 0
+
+	for i < len(chunk) {
+		// Find next tag start
+		if chunk[i] != '<' {
+			i++
+			continue
+		}
+
+		// Find tag end
+		tagEnd := strings.IndexByte(chunk[i:], '>')
+		if tagEnd < 0 {
+			break
+		}
+		tagEnd += i
+
+		tag := chunk[i+1 : tagEnd]
+		isClosing := strings.HasPrefix(tag, "/")
+
+		if isClosing {
+			tagName := tag[1:]
+			// Pop matching open tag
+			for j := len(openStack) - 1; j >= 0; j-- {
+				if openStack[j] == tagName {
+					openStack = append(openStack[:j], openStack[j+1:]...)
+					break
+				}
+			}
+		} else {
+			// It's an opening tag — extract tag name
+			tagName := tag
+			if space := strings.IndexByte(tagName, ' '); space > 0 {
+				tagName = tagName[:space]
+			}
+			// Track block-level tags that need closing
+			if tagName == "pre" || tagName == "blockquote" || tagName == "b" || tagName == "i" || tagName == "s" || tagName == "code" {
+				openStack = append(openStack, tagName)
+			}
+		}
+
+		i = tagEnd + 1
+	}
+
+	// Build close tags (in reverse order of opening)
+	var closeBuf strings.Builder
+	for j := len(openStack) - 1; j >= 0; j-- {
+		closeBuf.WriteString("</")
+		closeBuf.WriteString(openStack[j])
+		closeBuf.WriteByte('>')
+	}
+
+	// Build reopen tags (in original order)
+	var reopenBuf strings.Builder
+	for _, tag := range openStack {
+		reopenBuf.WriteByte('<')
+		reopenBuf.WriteString(tag)
+		reopenBuf.WriteByte('>')
+	}
+
+	closeTags := closeBuf.String()
+	return chunk + closeTags, tagBalanceResult{
+		closeTags:  closeTags,
+		reopenTags: reopenBuf.String(),
+	}
 }
 
 // runeLen returns the number of runes in s (equivalent to len([]rune(s)) but
