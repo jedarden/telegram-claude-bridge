@@ -161,9 +161,9 @@ All intelligence lives here: routing, session management, media processing, Clau
 
 ### Technology
 
-- **Language:** Python 3.11+ (async, best ecosystem for Claude Agent SDK and media processing)
+- **Language:** Python 3.11+ (async, best ecosystem for media processing libraries)
 - **Framework:** `asyncio` with `aiohttp` for HTTP client to proxy
-- **Claude integration:** `claude-agent-sdk` (Python) for native async streaming, type-safe sessions, custom permission callbacks
+- **Claude integration:** Headless Claude Code CLI via `asyncio.create_subprocess_exec`. Invoked with `-p` (print mode), `--output-format stream-json` for streaming, `--resume` for session continuity.
 - **Media processing:** `openai-whisper` for audio transcription, `ffmpeg` for video frame/audio extraction
 - **State:** SQLite via `aiosqlite`
 - **Runtime:** systemd unit on EX44
@@ -177,7 +177,7 @@ All intelligence lives here: routing, session management, media processing, Clau
 │  ┌──────────┐  ┌──────────────┐  ┌───────────────────────┐ │
 │  │  Poller   │→│   Router     │→│   Session Manager      │ │
 │  │          │  │              │  │                        │ │
-│  │ GET      │  │ (chat_id,   │  │ Claude Agent SDK       │ │
+│  │ GET      │  │ (chat_id,   │  │ claude -p (headless)   │ │
 │  │ /updates │  │  thread_id) │  │ --resume session_id    │ │
 │  │          │  │  → handler  │  │ --cwd project_dir      │ │
 │  └──────────┘  └──────────────┘  └───────────────────────┘ │
@@ -236,39 +236,102 @@ Looks up `(chat_id, thread_id)` in the SQLite routing table:
 
 #### 3. Session Manager
 
-Manages Claude Code sessions via the Claude Agent SDK.
+Manages Claude Code sessions via the headless CLI (`claude -p`).
 
-Each active session is a `ClaudeSDKClient` instance with:
-- `resume=session_id` (from SQLite)
-- `cwd=project_dir` (from group config)
-- `permission_mode="plan"` (default — ask before destructive actions)
-- `max_budget_usd` (configurable per group)
-- `include_partial_messages=True` (for streaming)
+Each prompt is a subprocess invocation:
 
-**Session lifecycle:**
-- **Create:** On first message to a new topic. Generate session ID, store in SQLite, instantiate SDK client.
-- **Resume:** On subsequent messages. Load session ID from SQLite, instantiate SDK client with `resume=session_id`.
-- **Destroy:** On topic close/delete or `/close` command. Remove from SQLite. Claude Code session persists on disk but is no longer routed to.
+```
+claude -p "<prompt>" \
+  --output-format stream-json \
+  --resume <session_id> \
+  --cwd <project_dir> \
+  --permission-mode plan \
+  --max-budget-usd 5.0
+```
 
-**Concurrency:** One active Claude session per topic. Messages arriving while a session is processing are queued per-topic and batched into the next prompt (prevents race conditions and preserves message ordering).
+Key CLI flags:
+- `-p` — print mode, single request, exits after response
+- `--output-format stream-json` — NDJSON streaming for progressive Telegram updates
+- `--output-format json` — single JSON response with `result`, `session_id`, `is_error`, `duration_ms`, `total_cost_usd`
+- `--resume <session_id>` — continue an existing conversation
+- `--cwd <dir>` — working directory (project root)
+- `--permission-mode plan` — Claude proposes changes before executing
+- `--max-budget-usd` — spending cap per invocation
+- `--max-turns` — limit autonomous tool loops
+- `--model` — override model per session
+- `--append-system-prompt` — inject session context (topic name, group info)
+- `--allowedTools` / `--disallowedTools` — restrict tool access per group
 
-**Timeouts:** 5-minute default per prompt. Configurable via `/timeout` command. On timeout, send error message to topic and leave session intact for retry.
+**Stream-json output** is NDJSON (one JSON object per line). Key event types:
+- `{"type": "system", ...}` — init, session info
+- `{"type": "assistant", ...}` — complete assistant messages with TextBlock/ToolUseBlock content
+- `{"type": "result", ...}` — final metadata: `result`, `session_id`, `is_error`, `duration_ms`, `total_cost_usd`, `usage`
+
+For streaming text deltas, add `--include-partial-messages`. This emits `stream_event` objects containing `content_block_delta` with `text_delta` — used for progressive Telegram message editing.
+
+**Capturing session_id on first invocation:**
+
+```
+claude -p "prompt" --output-format json --cwd /project | jq -r '.session_id'
+```
+
+The bridge stores this in SQLite and passes `--resume <session_id>` on all subsequent invocations for that topic.
+
+**Prompt input via stdin** (preferred — avoids shell injection from user text):
+
+```
+echo "<user message>" | claude -p --output-format stream-json --resume <session_id> --cwd <dir>
+```
+
+Or with `asyncio.create_subprocess_exec`:
 
 ```python
-class SessionManager:
-    def __init__(self, state: StateDB, sender: Sender):
-        self.active: dict[tuple[int, int], asyncio.Task] = {}
-        self.queues: dict[tuple[int, int], asyncio.Queue] = {}
+proc = await asyncio.create_subprocess_exec(
+    "claude", "-p",
+    "--output-format", "stream-json",
+    "--resume", session_id,
+    "--cwd", project_dir,
+    "--permission-mode", "plan",
+    stdin=asyncio.subprocess.PIPE,
+    stdout=asyncio.subprocess.PIPE,
+    stderr=asyncio.subprocess.PIPE,
+)
+proc.stdin.write(prompt.encode())
+proc.stdin.close()
 
-    async def handle(self, update: Update, session_info: SessionInfo):
-        key = (update.chat_id, update.thread_id)
-        if key in self.active:
-            await self.queues[key].put(update)
-            return
-        self.active[key] = asyncio.create_task(
-            self._run_session(update, session_info)
-        )
+async for line in proc.stdout:
+    event = json.loads(line)
+    # stream to Telegram via edit-in-place
 ```
+
+**Session lifecycle:**
+- **Create:** On first message to a new topic. Invoke `claude -p` without `--resume`. Parse `session_id` from the JSON/stream-json output. Store in SQLite.
+- **Resume:** On subsequent messages. Invoke `claude -p --resume <session_id>`. Claude Code restores full conversation context.
+- **Destroy:** On topic close/delete or `/close` command. Remove from SQLite routing table. The Claude Code session files persist on disk (~/.claude/) but are no longer routed to.
+
+**Concurrency:** One active subprocess per topic. Messages arriving while Claude is processing are queued per-topic and batched into the next prompt. This prevents race conditions and preserves message ordering.
+
+**Timeouts:** 5-minute default per prompt. The subprocess is killed after the timeout. Configurable via `/timeout` command. On timeout, send error message to the topic and leave the session intact for retry.
+
+```python
+try:
+    stdout, stderr = await asyncio.wait_for(
+        proc.communicate(), timeout=timeout_sec
+    )
+except asyncio.TimeoutError:
+    proc.kill()
+    await proc.wait()
+    # notify user in Telegram
+```
+
+**File/image attachments:** Files downloaded from the proxy are saved to a temp directory and referenced in the prompt text. Claude Code's `Read` tool can process images, PDFs, code files, and notebooks from the filesystem. The prompt includes the file path:
+
+```
+[User sent an image: /tmp/telegram-bridge/12345/photo.jpg]
+Please analyze this screenshot.
+```
+
+Claude Code will use its `Read` tool to open the file.
 
 #### 4. Media Processor
 
@@ -278,7 +341,7 @@ Handles non-text message types before they reach Claude.
 - Download from proxy via `GET /file/<file_id>`
 - Resize to ~800px on the long edge (save tokens, ~1334 tokens per 1000x1000)
 - Save to `/tmp/telegram-bridge/<chat_id>/<message_id>.jpg`
-- Pass to Claude via SDK file attachment or `--add-file`
+- Reference in prompt text so Claude Code's `Read` tool can open it
 
 **Voice/Audio:**
 - Download from proxy
@@ -295,7 +358,7 @@ Handles non-text message types before they reach Claude.
 
 **Documents:**
 - Download from proxy
-- If Claude-compatible (text, code, PDF, images, notebooks): pass directly via file attachment
+- If Claude-compatible (text, code, PDF, images, notebooks): save to temp dir, reference path in prompt
 - If incompatible (Office docs, archives): attempt conversion or notify user of limitation
 
 **Cleanup:** Temp files cleaned up after session processes the message. Configurable retention for debugging.
@@ -407,15 +470,14 @@ CREATE TABLE sent_messages (
 
 #### Input Handling
 
-- User messages are passed to Claude via SDK (not shell), eliminating shell injection.
-- No user-controlled input is interpolated into shell commands.
+- User messages are passed to Claude via stdin pipe to the subprocess, never interpolated into shell commands or CLI arguments.
 - File paths from Telegram are never used directly — files are saved with generated names in a sandboxed temp directory.
 
 #### Claude Code Permissions
 
-- Default `permission_mode="plan"` — Claude proposes changes before executing.
+- Default `--permission-mode plan` — Claude proposes changes before executing.
 - Configurable per group. Options: `plan` (default), `acceptEdits` (auto-approve file edits), `dontAsk` (full autonomy for trusted contexts).
-- `allowedTools` and `disallowedTools` configurable per group to restrict what Claude can do.
+- `--allowedTools` and `--disallowedTools` configurable per group to restrict what Claude can do.
 
 ### Topic Lifecycle Management
 
@@ -502,7 +564,8 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 ## Phase 2: Streaming and Formatting
 
 ### 2.1 — Progressive Streaming
-- Use Claude Agent SDK `include_partial_messages=True`
+- Use `--output-format stream-json --include-partial-messages` to get text deltas
+- Parse NDJSON lines from stdout, extract `text_delta` from `stream_event` objects
 - Send placeholder message, edit in-place as text streams
 - Debounce edits to 1/second
 - Handle overflow (>4096 chars) by sending new messages
@@ -512,10 +575,11 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 - Code-block-aware message chunking
 - Oversized code blocks sent as document attachments
 
-### 2.3 — Inline Keyboards for Tool Approval
-- When Claude requests permission (plan mode), send an inline keyboard with Approve/Deny buttons
-- Map `callback_query` back to the correct session
-- Timeout auto-deny after configurable period
+### 2.3 — Permission Handling
+- Default `--permission-mode plan` means Claude proposes before executing
+- The CLI blocks on stdin waiting for approval — the bridge can detect tool approval prompts in the stream and send inline keyboards to Telegram
+- Callback query response writes approval/denial to the subprocess stdin
+- Alternative: use `--permission-mode acceptEdits` or `--permission-mode dontAsk` for trusted groups to skip interactive approval
 
 **Deliverable:** Streamed responses with proper formatting and interactive tool approval.
 
@@ -619,13 +683,14 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 | Decision | Options | Leaning | Notes |
 |---|---|---|---|
 | Proxy language | Go vs Python | Python | Consistency with bridge, simpler for a thin proxy |
-| Claude integration | Agent SDK vs CLI subprocess | Agent SDK | Native async streaming, type-safe sessions, lower overhead |
-| SDK fallback to CLI | Yes vs SDK-only | Yes | CLI subprocess as fallback if SDK fails — pattern from existing implementations |
+| Claude integration | Headless CLI | **Decided: CLI** | `claude -p` with `--output-format stream-json`, `--resume` for sessions. Subprocess per prompt. |
+| Bridge language | Python vs TypeScript vs Go vs Rust | TBD | See language evaluation below |
 | Message format proxy→bridge | Normalized envelope vs raw Telegram JSON | Normalized | Keeps bridge decoupled from Telegram API specifics, proxy handles schema changes |
 | Media transfer proxy→bridge | Inline in update vs separate `/file` endpoint | Separate `/file` | Keeps update payloads small, avoids large base64 blobs |
 | Whisper model | turbo vs base vs small | turbo | Best accuracy-to-speed ratio |
 | Private chat topics | Support vs groups only | Groups only (initially) | Bot API 9.4 supports private chat topics, but groups are the primary use case |
 | Response format | HTML vs MarkdownV2 | HTML | MarkdownV2 escaping is unreliable — universal consensus from existing implementations |
+| Permission mode | plan vs acceptEdits vs dontAsk | plan (default) | Configurable per group. `plan` gives interactive approval via Telegram inline keyboards. |
 
 ---
 
