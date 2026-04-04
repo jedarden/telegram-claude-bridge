@@ -62,6 +62,15 @@ type sessionMsg struct {
 	group   *Group   // non-nil when session is nil; nil when session is non-nil
 }
 
+// msgExtra holds per-message resolved attachment data used during prompt building.
+// Only the field relevant to the content type is populated.
+type msgExtra struct {
+	imagePath     string   // local path for photo attachments (ContentTypePhoto)
+	transcription string   // whisper transcription text (ContentTypeVoice / ContentTypeAudio)
+	audioTitle    string   // audio track title, if set (ContentTypeAudio only)
+	cleanupPaths  []string // all temp files to remove after prompt is sent
+}
+
 // claudeOutput holds the results of a Claude CLI invocation.
 // StreamMsgID is non-zero when a live-edit streaming message was posted during
 // the subprocess run; processBatch edits it with the final canonical text.
@@ -206,31 +215,65 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		return
 	}
 
-	// Download any photo attachments before building the prompt.
-	tempFiles := make([]string, len(batch))
+	// Start a continuous typing indicator early if any message requires audio
+	// transcription (Whisper can take 10-30 s for long recordings).
+	var stopTyping func()
+	for _, msg := range batch {
+		if msg.update.Content != nil &&
+			(msg.update.Content.Type == contract.ContentTypeVoice ||
+				msg.update.Content.Type == contract.ContentTypeAudio) {
+			stopTyping = m.startTyping(ctx, key.chatID, tidPtr)
+			break
+		}
+	}
+
+	// Resolve attachments: download photos and transcribe voice/audio.
+	extras := make([]msgExtra, len(batch))
 	for i, msg := range batch {
-		if msg.update.Content != nil && msg.update.Content.Type == contract.ContentTypePhoto &&
-			msg.update.Content.FileID != nil {
+		if msg.update.Content == nil || msg.update.Content.FileID == nil {
+			continue
+		}
+		switch msg.update.Content.Type {
+		case contract.ContentTypePhoto:
 			path, err := m.processPhoto(ctx, key.chatID, msg.update.MessageID, *msg.update.Content.FileID)
 			if err != nil {
 				log.Printf("[session_mgr] photo download (%d,%d) msg %d: %v",
 					key.chatID, key.threadID, msg.update.MessageID, err)
 			} else {
-				tempFiles[i] = path
+				extras[i] = msgExtra{imagePath: path, cleanupPaths: []string{path}}
 			}
+		case contract.ContentTypeVoice, contract.ContentTypeAudio:
+			text, paths, err := m.processAudio(ctx, key.chatID, msg.update.MessageID, msg.update.Content)
+			if err != nil {
+				log.Printf("[session_mgr] audio transcription (%d,%d) msg %d: %v",
+					key.chatID, key.threadID, msg.update.MessageID, err)
+			}
+			ex := msgExtra{transcription: text, cleanupPaths: paths}
+			if msg.update.Content.Title != nil {
+				ex.audioTitle = *msg.update.Content.Title
+			}
+			extras[i] = ex
 		}
 	}
+
+	// Transcription complete — stop the audio typing loop.
+	if stopTyping != nil {
+		stopTyping()
+	}
+
 	defer func() {
-		for _, path := range tempFiles {
-			if path != "" {
-				if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-					log.Printf("[session_mgr] cleanup %s: %v", path, err)
+		for _, ex := range extras {
+			for _, p := range ex.cleanupPaths {
+				if p != "" {
+					if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+						log.Printf("[session_mgr] cleanup %s: %v", p, err)
+					}
 				}
 			}
 		}
 	}()
 
-	prompt := buildSessionPrompt(batch, tempFiles)
+	prompt := buildSessionPrompt(batch, extras)
 	if prompt == "" {
 		return // no content to process
 	}
@@ -456,17 +499,17 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 }
 
 // buildSessionPrompt constructs the prompt from a batch of messages.
-// tempFiles maps each batch index to a downloaded image path (empty string if none).
+// extras maps each batch index to resolved attachment data (image path or transcription).
 // Single message: used as-is.
 // Multiple messages: previous ones listed under a header, last one highlighted.
-func buildSessionPrompt(batch []sessionMsg, tempFiles []string) string {
+func buildSessionPrompt(batch []sessionMsg, extras []msgExtra) string {
 	texts := make([]string, 0, len(batch))
 	for i, msg := range batch {
-		var imagePath string
-		if i < len(tempFiles) {
-			imagePath = tempFiles[i]
+		var ex msgExtra
+		if i < len(extras) {
+			ex = extras[i]
 		}
-		if t := sessionMsgText(msg.update, imagePath); t != "" {
+		if t := sessionMsgText(msg.update, ex); t != "" {
 			texts = append(texts, t)
 		}
 	}
@@ -485,9 +528,9 @@ func buildSessionPrompt(batch []sessionMsg, tempFiles []string) string {
 }
 
 // sessionMsgText extracts the prompt text from an update.
-// For photo messages, imagePath is the local path to the downloaded (and resized) file.
-// Returns "" for unsupported content types or when a photo could not be downloaded.
-func sessionMsgText(update contract.Update, imagePath string) string {
+// ex carries attachment data resolved before calling this function (image path,
+// transcription text, etc.). Returns "" for unsupported types or failed downloads.
+func sessionMsgText(update contract.Update, ex msgExtra) string {
 	if update.Content == nil {
 		return ""
 	}
@@ -498,14 +541,28 @@ func sessionMsgText(update contract.Update, imagePath string) string {
 		}
 		return *update.Content.Text
 	case contract.ContentTypePhoto:
-		if imagePath == "" {
+		if ex.imagePath == "" {
 			return "" // download failed; skip silently
 		}
 		if update.Content.Caption != nil && *update.Content.Caption != "" {
 			return fmt.Sprintf("[Image: %s]\nCaption: %s\nPlease analyze this image.",
-				imagePath, *update.Content.Caption)
+				ex.imagePath, *update.Content.Caption)
 		}
-		return fmt.Sprintf("[User sent an image: %s]\nPlease analyze this image.", imagePath)
+		return fmt.Sprintf("[User sent an image: %s]\nPlease analyze this image.", ex.imagePath)
+	case contract.ContentTypeVoice:
+		if ex.transcription == "" {
+			return "" // transcription failed; skip silently
+		}
+		return fmt.Sprintf("[Voice message transcription]: %s\n\nPlease respond to the above.", ex.transcription)
+	case contract.ContentTypeAudio:
+		if ex.transcription == "" {
+			return "" // transcription failed; skip silently
+		}
+		if ex.audioTitle != "" {
+			return fmt.Sprintf("[Audio file %q transcription]: %s\n\nPlease respond to the above.",
+				ex.audioTitle, ex.transcription)
+		}
+		return fmt.Sprintf("[Audio transcription]: %s\n\nPlease respond to the above.", ex.transcription)
 	}
 	return ""
 }
