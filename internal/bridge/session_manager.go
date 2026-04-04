@@ -27,7 +27,7 @@ const (
 	scannerMaxBuf = 1 << 20 // 1MB
 
 	// streamDebounce is the minimum interval between progressive Telegram edits.
-	streamDebounce = 500 * time.Millisecond
+	streamDebounce = 1 * time.Second
 )
 
 // SessionManager manages per-topic Claude Code subprocess sessions.
@@ -274,6 +274,13 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 				ex.videoCaption = *msg.update.Content.Caption
 			}
 			extras[i] = ex
+		case contract.ContentTypeDocument:
+			docPath, unsupportedMsg, paths, err := m.processDocument(ctx, key.chatID, msg.update.MessageID, msg.update.Content)
+			if err != nil {
+				log.Printf("[session_mgr] document processing (%d,%d) msg %d: %v",
+					key.chatID, key.threadID, msg.update.MessageID, err)
+			}
+			extras[i] = msgExtra{docPath: docPath, docMsg: unsupportedMsg, cleanupPaths: paths}
 		}
 	}
 
@@ -301,6 +308,14 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 
 	m.sender.SendTyping(ctx, key.chatID, tidPtr)
 
+	// Send a "Thinking…" placeholder immediately so the user has visual feedback
+	// while the Claude subprocess starts up.
+	placeholderID, err := m.sender.SendPlaceholder(ctx, key.chatID, tidPtr, origMsgID)
+	if err != nil {
+		log.Printf("[session_mgr] send placeholder (%d,%d): %v", key.chatID, key.threadID, err)
+		placeholderID = 0 // fall back to first-delta send
+	}
+
 	timeoutSec := group.TimeoutSec
 	if timeoutSec <= 0 {
 		timeoutSec = defaultSessionTimeout
@@ -308,7 +323,7 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	out, err := m.invokeClaudeAPI(callCtx, session, group, prompt, key.chatID, tidPtr, origMsgID)
+	out, err := m.invokeClaudeAPI(callCtx, session, group, prompt, key.chatID, tidPtr, origMsgID, placeholderID)
 	if err != nil {
 		if callCtx.Err() == context.DeadlineExceeded {
 			log.Printf("[session_mgr] timeout for (%d,%d) after %ds", key.chatID, key.threadID, timeoutSec)
@@ -368,7 +383,8 @@ func (m *SessionManager) resolveSessionGroup(ctx context.Context, key topicKey, 
 // progressive Telegram edits, and returns the final parsed output.
 //
 // chatID, threadID, and origMsgID are the Telegram coordinates used to post
-// the initial streaming message and subsequent edits.
+// the initial streaming message and subsequent edits. placeholderID is the
+// message ID of the "Thinking…" placeholder to edit in-place.
 func (m *SessionManager) invokeClaudeAPI(
 	ctx context.Context,
 	session *Session,
@@ -377,6 +393,7 @@ func (m *SessionManager) invokeClaudeAPI(
 	chatID int64,
 	threadID *int64,
 	origMsgID int64,
+	placeholderID int64,
 ) (*claudeOutput, error) {
 	args := []string{
 		"-p",
@@ -416,28 +433,90 @@ func (m *SessionManager) invokeClaudeAPI(
 
 	// flushEdit sends the current accumulated text as an initial message or an
 	// edit of the streaming placeholder. Skipped if the debounce interval hasn't
-	// elapsed yet (unless force=true).
-	flushEdit := func(force bool) {
+	// elapsed yet (unless force=true). Returns true if text was sent, false if
+	// skipped due to debounce.
+	flushEdit := func(force bool) bool {
 		text := textBuf.String()
 		if text == "" {
-			return
+			return false
 		}
 		if !force && time.Since(lastEdit) < streamDebounce {
-			return
+			return false
 		}
-		if streamMsgID == 0 {
-			id, err := m.sender.sendInitialStream(ctx, chatID, threadID, origMsgID, text)
-			if err != nil {
-				log.Printf("[session_mgr] send initial stream (%d,%d): %v", chatID, *threadID, err)
-				return
+
+		// Check for overflow before sending
+		if runeLen(text) > maxMessageLen {
+			// Text exceeds 4096 chars - need to handle overflow
+			// Send the current message with truncated content and prepare for overflow
+			overflowChunk := text
+			if len(text) > maxMessageLen {
+				// Truncate to max length (approximate, will be refined by chunkText)
+				overflowChunk = string([]rune(text)[:maxMessageLen])
 			}
-			streamMsgID = id
+
+			if streamMsgID == 0 {
+				// First overflow - use the placeholder or send new message
+				if placeholderID != 0 {
+					if err := m.sender.EditMessage(ctx, chatID, placeholderID, overflowChunk); err != nil {
+						log.Printf("[session_mgr] edit placeholder (%d,%d): %v", chatID, *threadID, err)
+						return false
+					}
+					streamMsgID = placeholderID
+				} else {
+					id, err := m.sender.sendInitialStream(ctx, chatID, threadID, origMsgID, overflowChunk)
+					if err != nil {
+						log.Printf("[session_mgr] send initial stream (%d,%d): %v", chatID, *threadID, err)
+						return false
+					}
+					streamMsgID = id
+				}
+			} else {
+				if err := m.sender.EditMessage(ctx, chatID, streamMsgID, overflowChunk); err != nil {
+					log.Printf("[session_mgr] edit stream (%d,%d): %v", chatID, *threadID, err)
+					return false
+				}
+			}
+			lastEdit = time.Now()
+
+			// Send overflow to new message
+			remainingText := text[runeByteLen(text, maxMessageLen):]
+			newMsgID, err := m.sender.SendStreamOverflow(ctx, chatID, threadID, remainingText)
+			if err != nil {
+				log.Printf("[session_mgr] send overflow (%d,%d): %v", chatID, *threadID, err)
+			} else {
+				streamMsgID = newMsgID
+				// Clear buffer and start accumulating for the new message
+				textBuf.Reset()
+			}
+			return true
+		}
+
+		// Normal path - text fits in one message
+		if streamMsgID == 0 {
+			// Use placeholder if available, otherwise send new message
+			if placeholderID != 0 {
+				if err := m.sender.EditMessage(ctx, chatID, placeholderID, text); err != nil {
+					log.Printf("[session_mgr] edit placeholder (%d,%d): %v", chatID, *threadID, err)
+					return false
+				}
+				streamMsgID = placeholderID
+			} else {
+				id, err := m.sender.sendInitialStream(ctx, chatID, threadID, origMsgID, text)
+				if err != nil {
+					log.Printf("[session_mgr] send initial stream (%d,%d): %v", chatID, *threadID, err)
+					return false
+				}
+				streamMsgID = id
+			}
 		} else {
 			if err := m.sender.EditMessage(ctx, chatID, streamMsgID, text); err != nil {
+				// Telegram returns 400 "message is not modified" if text hasn't changed.
+				// Treat this as a no-op rather than an error.
 				log.Printf("[session_mgr] edit stream (%d,%d): %v", chatID, *threadID, err)
 			}
 		}
 		lastEdit = time.Now()
+		return true
 	}
 
 	for scanner.Scan() {
@@ -476,6 +555,9 @@ func (m *SessionManager) invokeClaudeAPI(
 			out.TotalCostUSD = env.TotalCostUSD
 		}
 	}
+
+	// Final flush to ensure all accumulated text is sent
+	flushEdit(true)
 
 	if err := scanner.Err(); err != nil {
 		_ = cmd.Process.Kill()
@@ -616,6 +698,22 @@ func sessionMsgText(update contract.Update, ex msgExtra) string {
 			return strings.Join(parts, "\n")
 		}
 		return "" // processing failed; skip silently
+	case contract.ContentTypeDocument:
+		if ex.docPath == "" {
+			return "" // download failed; skip silently
+		}
+		var fileName string
+		if update.Content.FileName != nil {
+			fileName = *update.Content.FileName
+		} else {
+			fileName = "uploaded file"
+		}
+		if ex.docMsg != "" {
+			return fmt.Sprintf("[Document: %s]\nPath: %s\n\n%s\n\nPlease analyze this document.",
+				fileName, ex.docPath, ex.docMsg)
+		}
+		return fmt.Sprintf("[Document: %s]\nPath: %s\n\nPlease analyze this document.",
+			fileName, ex.docPath)
 	}
 	return ""
 }
