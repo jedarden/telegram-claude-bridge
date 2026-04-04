@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -57,9 +58,17 @@ func main() {
 	sessionMgr := bridge.NewSessionManager(db, sender, cfg.ProxyURL)
 	defer sessionMgr.Shutdown()
 
+	// Create session cleanup (disabled if interval is 0)
+	cleanup := bridge.NewSessionCleanup(db, sender, cfg.SessionCleanupInterval, cfg.SessionTTL, cfg.CloseInactiveTopics)
+	cleanup.Start()
+	defer cleanup.Stop()
+
+	serviceHandler := bridge.NewServiceHandler(db, sender, cfg.ProxyURL, &http.Client{Timeout: 10 * time.Second})
+
 	router := bridge.NewRouter(db)
 	router.OnCommand = cmdHandler.Handle
 	router.OnSession = sessionMgr.Handle
+	router.OnService = serviceHandler.Handle
 
 	updates := make(chan contract.Update, 64)
 	poller := bridge.NewPoller(cfg.ProxyURL, cfg.PollTimeout, updates)

@@ -190,6 +190,14 @@ func (s *Sender) EditTopicIconColor(ctx context.Context, chatID, threadID int64,
 	}, nil)
 }
 
+// CloseTopic closes a forum topic via the proxy.
+func (s *Sender) CloseTopic(ctx context.Context, chatID, threadID int64) error {
+	return s.postWithRetry(ctx, "/close_topic", contract.TopicRequest{
+		ChatID:   chatID,
+		ThreadID: threadID,
+	}, nil)
+}
+
 // SendAndPinMetadata sends a metadata message to the topic and pins it.
 // Returns the message ID of the sent message, or 0 on failure.
 func (s *Sender) SendAndPinMetadata(ctx context.Context, chatID, threadID int64, text string) (int64, error) {

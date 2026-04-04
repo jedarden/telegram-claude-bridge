@@ -507,6 +507,44 @@ func (d *DB) SetSessionPinnedMessageID(ctx context.Context, chatID, threadID int
 	return err
 }
 
+// ListStaleSessions returns sessions where last_active is older than ttl.
+// Only returns sessions with status='active' — already inactive/closed sessions are excluded.
+func (d *DB) ListStaleSessions(ctx context.Context, ttl time.Duration) ([]*Session, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
+			        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
+			        COALESCE(summary,'')
+			 FROM sessions
+			 WHERE status = 'active'
+			   AND datetime(last_active) < datetime('now', '-' || ? || ' seconds')
+			 ORDER BY last_active ASC`,
+		int64(ttl.Seconds()),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []*Session
+	for rows.Next() {
+		s, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, s)
+	}
+	return sessions, rows.Err()
+}
+
+// SetSessionStatus updates the status field for a session.
+func (d *DB) SetSessionStatus(ctx context.Context, chatID, threadID int64, status string) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE sessions SET status = ? WHERE chat_id = ? AND thread_id = ?`,
+		status, chatID, threadID,
+	)
+	return err
+}
+
 // UpdateSessionCost adds to the total_cost_usd for a session.
 func (d *DB) UpdateSessionCost(ctx context.Context, chatID, threadID int64, costUSD float64) error {
 	_, err := d.db.ExecContext(ctx,

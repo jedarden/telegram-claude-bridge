@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 // ProxyConfig holds configuration for the proxy component.
@@ -50,6 +51,18 @@ type BridgeConfig struct {
 	// BinaryPath is the path to the bridge binary (relative to RepoPath).
 	// If empty, defaults to "bridge".
 	BinaryPath string
+
+	// SessionCleanupInterval is how often to run session cleanup (default: 1 hour).
+	// Set to 0 to disable session cleanup.
+	SessionCleanupInterval time.Duration
+
+	// SessionTTL is the time after which a session is considered stale (default: 7 days).
+	// Stale sessions are marked as inactive and optionally closed.
+	SessionTTL time.Duration
+
+	// CloseInactiveTopics controls whether to close Telegram topics for inactive sessions.
+	// If false, sessions are marked inactive but topics remain open for reference.
+	CloseInactiveTopics bool
 }
 
 // LoadProxyConfig reads ProxyConfig from environment variables.
@@ -127,6 +140,44 @@ func LoadBridgeConfig() (*BridgeConfig, error) {
 	}
 
 	cfg.BinaryPath = envOrDefault("BINARY_PATH", "bridge")
+
+	// Session cleanup configuration
+	defaultCleanupInterval := 1 * time.Hour
+	if v := os.Getenv("SESSION_CLEANUP_INTERVAL_MINUTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("SESSION_CLEANUP_INTERVAL_MINUTES must be a non-negative integer, got %q", v)
+		}
+		if n == 0 {
+			cfg.SessionCleanupInterval = 0 // disabled
+		} else {
+			cfg.SessionCleanupInterval = time.Duration(n) * time.Minute
+		}
+	} else {
+		cfg.SessionCleanupInterval = defaultCleanupInterval
+	}
+
+	defaultTTL := 7 * 24 * time.Hour // 7 days
+	if v := os.Getenv("SESSION_TTL_HOURS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("SESSION_TTL_HOURS must be a positive integer, got %q", v)
+		}
+		cfg.SessionTTL = time.Duration(n) * time.Hour
+	} else {
+		cfg.SessionTTL = defaultTTL
+	}
+
+	if v := os.Getenv("CLOSE_INACTIVE_TOPICS"); v != "" {
+		switch v {
+		case "1", "true", "yes", "on":
+			cfg.CloseInactiveTopics = true
+		case "0", "false", "no", "off":
+			cfg.CloseInactiveTopics = false
+		default:
+			return nil, fmt.Errorf("CLOSE_INACTIVE_TOPICS must be a boolean value (0/1, true/false, yes/no, on/off), got %q", v)
+		}
+	}
 
 	return cfg, nil
 }
