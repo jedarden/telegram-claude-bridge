@@ -393,11 +393,33 @@ Processes bot commands. Commands are recognized in both the General topic and no
 | `/opus` | Shortcut: set this topic to `claude-opus-4-6` |
 | `/info` | Show session info: model, cwd, session_id, cost, message count |
 
-All other text in non-General topics is passed through to Claude as the prompt.
+All other text in non-General topics is passed through to Claude as the prompt — but the bridge scans it for model-change intent first (see below).
+
+**Natural language model switching:**
+
+Before dispatching a message to Claude, the bridge runs a lightweight intent detector that recognizes natural model-change phrases in the message text. If detected, the bridge updates the topic's model, confirms the change with a short reply, and then forwards the rest of the message (if any) to Claude using the new model.
+
+Detection patterns (case-insensitive, matched against the full message):
+
+| Pattern | Action |
+|---|---|
+| "use opus", "switch to opus", "let's use opus", "need opus for this" | Set model to `claude-opus-4-6` |
+| "use sonnet", "switch to sonnet", "back to sonnet" | Set model to `claude-sonnet-4-6` |
+| "use haiku", "switch to haiku", "quick mode" | Set model to `claude-haiku-4-5` |
+| "use a smarter model", "this needs more power", "think harder" | Escalate one tier (haiku→sonnet, sonnet→opus) |
+| "use a faster model", "keep it simple", "quick answer" | De-escalate one tier (opus→sonnet, sonnet→haiku) |
+
+Implementation: a small regex/keyword matcher — not an LLM call. The patterns are deliberately explicit so the detector doesn't misfire on messages that happen to contain the word "opus" in a different context (e.g., discussing a music file). The match requires a verb of intent ("use", "switch to", "need") paired with a model name or tier keyword.
+
+When a model change is detected:
+1. Update `sessions.model` in SQLite
+2. Reply with a short confirmation: `Model → claude-opus-4-6`
+3. Update the pinned metadata message
+4. If the message contains additional text beyond the model-change phrase, strip the intent phrase and forward the remainder to Claude with the new model. If the message is *only* a model-change request, no Claude invocation is made.
 
 **Model resolution order:** The bridge resolves which model to use for each CLI invocation in this order (first non-null wins):
 
-1. `sessions.model` — topic-level override (set via `/model`, `/haiku`, `/sonnet`, `/opus` in the topic)
+1. `sessions.model` — topic-level override (set via `/model`, `/haiku`, `/sonnet`, `/opus`, or natural language in the topic)
 2. `groups.default_model` — group-level default (set via `/model` in General topic)
 3. Hardcoded fallback: `claude-sonnet-4-6`
 
