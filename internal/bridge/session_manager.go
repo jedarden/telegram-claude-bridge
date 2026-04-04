@@ -450,6 +450,9 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		// Non-fatal: still deliver the response.
 	}
 
+	// Re-fetch the session to get the latest data (including MessageCount and TotalCostUSD)
+	session, _ = m.db.GetSession(ctx, key.chatID, key.threadID)
+
 	// Update topic color to blue (active) on successful invocation
 	_ = m.updateTopicColor(ctx, key.chatID, key.threadID, ColorActive)
 
@@ -466,7 +469,7 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	}
 
 	// Update the pinned metadata message with the new message count and cost
-	if session != nil {
+	if session != nil && session.PinnedMessageID != 0 {
 		if err := m.updatePinnedMetadata(ctx, session, group); err != nil {
 			log.Printf("[session_mgr] update pinned metadata (%d,%d): %v", key.chatID, key.threadID, err)
 			// Non-fatal: continue anyway

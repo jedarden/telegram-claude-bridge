@@ -4,7 +4,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+WatchdogSec=60
 User=coding
 ExecStart=/home/coding/telegram-claude-bridge/bin/bridge
 WorkingDirectory=/home/coding/telegram-claude-bridge

@@ -104,6 +104,18 @@ func (s *Sender) SendPlaceholder(ctx context.Context, chatID int64, threadID *in
 	return resp.MessageID, nil
 }
 
+// SendToGeneral sends a text message to the General topic (thread_id = 1) of a group.
+// This is used for system notifications like reconnection events.
+func (s *Sender) SendToGeneral(ctx context.Context, chatID int64, text string) error {
+	threadID := int64(1) // General topic
+	req := contract.SendRequest{
+		ChatID:   chatID,
+		ThreadID: &threadID,
+		Text:     text,
+	}
+	return s.postWithRetry(ctx, "/send", req, nil)
+}
+
 // SendResponse sends text back to the user, chunking at paragraph boundaries
 // when the text exceeds 4096 characters. The first chunk is sent as a reply
 // to origMsgID; subsequent chunks are standalone messages in the same topic.
@@ -167,6 +179,42 @@ func (s *Sender) EditMessage(ctx context.Context, chatID, messageID int64, text 
 		MessageID: messageID,
 		Text:      text,
 	}, nil)
+}
+
+// EditTopicIconColor updates the icon color of a forum topic via the proxy.
+func (s *Sender) EditTopicIconColor(ctx context.Context, chatID, threadID int64, iconColor int) error {
+	return s.postWithRetry(ctx, "/edit_topic", contract.EditTopicRequest{
+		ChatID:    chatID,
+		ThreadID:  threadID,
+		IconColor: &iconColor,
+	}, nil)
+}
+
+// SendAndPinMetadata sends a metadata message to the topic and pins it.
+// Returns the message ID of the sent message, or 0 on failure.
+func (s *Sender) SendAndPinMetadata(ctx context.Context, chatID, threadID int64, text string) (int64, error) {
+	req := contract.SendRequest{
+		ChatID:   chatID,
+		ThreadID: &threadID,
+		Text:     text,
+	}
+	var resp contract.SendResponse
+	if err := s.postWithRetry(ctx, "/send", req, &resp); err != nil {
+		return 0, err
+	}
+
+	// Pin the message with notification disabled
+	disableNotif := true
+	if err := s.postWithRetry(ctx, "/pin_message", contract.PinMessageRequest{
+		ChatID:              chatID,
+		MessageID:           resp.MessageID,
+		DisableNotification: &disableNotif,
+	}, nil); err != nil {
+		log.Printf("[bridge/sender] pin metadata message failed: %v", err)
+		// Non-fatal: return the message ID anyway
+	}
+
+	return resp.MessageID, nil
 }
 
 // SendStreamOverflow sends a new message when streaming content overflows
