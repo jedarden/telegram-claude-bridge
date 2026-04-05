@@ -214,8 +214,11 @@ func (m *SessionManager) Shutdown() {
 	}
 }
 
-// runWorker is the per-topic goroutine. It serialises Claude CLI invocations,
-// batching any messages that accumulate while the subprocess is running.
+// runWorker is the per-topic goroutine. It dispatches Claude invocations to
+// background goroutines so it is never blocked waiting for Claude to finish.
+// Messages that arrive while an invocation is running are buffered in-memory
+// and processed as a batch once the goroutine completes, preserving ordering
+// while keeping the worker available for future messages.
 func (m *SessionManager) runWorker(ctx context.Context, key topicKey, worker *topicWorker) {
 	defer func() {
 		m.mu.Lock()
@@ -223,28 +226,68 @@ func (m *SessionManager) runWorker(ctx context.Context, key topicKey, worker *to
 		m.mu.Unlock()
 	}()
 
+	var (
+		activeDone <-chan struct{} // closed when the active invocation goroutine exits
+		pending    []sessionMsg   // messages buffered while an invocation is running
+	)
+
 	for {
-		// Block until a message arrives or the worker context is cancelled.
-		var first sessionMsg
 		select {
-		case first = <-worker.ch:
+		case msg := <-worker.ch:
+			if activeDone != nil {
+				// Invocation in progress — buffer for later to preserve ordering.
+				pending = append(pending, msg)
+			} else {
+				// Idle — drain the inbox and start an invocation goroutine.
+				activeDone = m.startInvocation(ctx, key, drainWith(worker.ch, msg))
+			}
+
+		case <-activeDone:
+			activeDone = nil
+			// Absorb any messages that landed in the inbox during the final tick.
+		absorb:
+			for {
+				select {
+				case msg := <-worker.ch:
+					pending = append(pending, msg)
+				default:
+					break absorb
+				}
+			}
+			if len(pending) > 0 {
+				batch := pending
+				pending = nil
+				activeDone = m.startInvocation(ctx, key, batch)
+			}
+
 		case <-ctx.Done():
 			return
 		}
+	}
+}
 
-		// Drain any messages that already arrived while we were idle.
-		batch := []sessionMsg{first}
-	drain:
-		for {
-			select {
-			case msg := <-worker.ch:
-				batch = append(batch, msg)
-			default:
-				break drain
-			}
-		}
-
+// startInvocation spawns a goroutine that calls processBatch and returns a
+// channel that is closed when the goroutine exits.
+func (m *SessionManager) startInvocation(ctx context.Context, key topicKey, batch []sessionMsg) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
 		m.processBatch(ctx, key, batch)
+	}()
+	return done
+}
+
+// drainWith returns a slice containing first followed by every message
+// immediately available in ch (non-blocking).
+func drainWith(ch <-chan sessionMsg, first sessionMsg) []sessionMsg {
+	batch := []sessionMsg{first}
+	for {
+		select {
+		case msg := <-ch:
+			batch = append(batch, msg)
+		default:
+			return batch
+		}
 	}
 }
 
