@@ -47,7 +47,7 @@ func main() {
 	}
 
 	// Initialize health checker with structured JSON logging
-	checker := health.NewChecker(cfg.ProxyURL+"/health", db.SqlDB())
+	checker := health.NewChecker(cfg.ProxyURL, db.SqlDB())
 
 	// The sender uses its own database for tracking sent message IDs.
 	sender, err := bridge.NewSender(cfg.ProxyURL, cfg.DBPath+".sender")
