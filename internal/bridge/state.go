@@ -89,7 +89,7 @@ type CostEvent struct {
 	CreatedAt            time.Time
 }
 
-const schemaVersion = 9
+const schemaVersion = 10
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -172,6 +172,12 @@ var migrations = []string{
 		// Version 9 — add tool restrictions to groups
 		`ALTER TABLE groups ADD COLUMN allowed_tools TEXT;
 		 ALTER TABLE groups ADD COLUMN disallowed_tools TEXT;`,
+
+		// Version 10 — raise default timeout from 300s to 1800s for existing groups.
+		// Only updates groups still at the old hardcoded default (300); groups
+		// explicitly configured to another value are left untouched.
+		// timeout_sec = 0 is now the sentinel for "no timeout".
+		`UPDATE groups SET timeout_sec = 1800 WHERE timeout_sec = 300;`,
 }
 
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,

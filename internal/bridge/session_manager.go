@@ -19,8 +19,11 @@ import (
 const (
 	topicQueueCapacity    = 32
 	defaultSessionModel   = "claude-sonnet-4-6"
-	defaultSessionTimeout = 300
+	defaultSessionTimeout = 1800 // 30 minutes; use noTimeout (0) for no deadline
 	defaultPermissionMode = "bypassPermissions"
+
+	// noTimeout is the sentinel value for timeout_sec meaning "run indefinitely".
+	noTimeout = 0
 
 	// scannerMaxBuf is the max line size for the bufio.Scanner reading stream-json
 	// output. Claude responses can exceed the 64KB default.
@@ -458,13 +461,21 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	}
 
 	timeoutSec := group.TimeoutSec
-	if timeoutSec <= 0 {
+	if timeoutSec < noTimeout {
 		timeoutSec = defaultSessionTimeout
 	}
-	callCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
-	defer cancel()
 
-	out, err := m.invokeClaudeAPI(callCtx, session, group, prompt, key.chatID, tidPtr, origMsgID, placeholderID, notificationMode)
+	// callCtx governs the claude subprocess lifetime.
+	// ctx (the worker context) is kept for Telegram sends so they survive a
+	// subprocess timeout — the final streamed flush must still reach Telegram.
+	callCtx := ctx
+	var cancelCall context.CancelFunc
+	if timeoutSec > noTimeout {
+		callCtx, cancelCall = context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+		defer cancelCall()
+	}
+
+	out, err := m.invokeClaudeAPI(callCtx, ctx, session, group, prompt, key.chatID, tidPtr, origMsgID, placeholderID, notificationMode)
 	if err != nil {
 		// Determine if this is a "blocked" state (waiting for permission) vs actual error
 		errMsg := err.Error()
@@ -549,12 +560,14 @@ func (m *SessionManager) resolveSessionGroup(ctx context.Context, key topicKey, 
 // reads NDJSON lines via bufio.Scanner, accumulates text_delta events into
 // progressive Telegram edits, and returns the final parsed output.
 //
-// chatID, threadID, and origMsgID are the Telegram coordinates used to post
-// the initial streaming message and subsequent edits. placeholderID is the
-// message ID of the "Thinking…" placeholder to edit in-place.
+// subprocCtx controls the claude subprocess lifetime (may have a deadline).
+// sendCtx is used for all Telegram API sends and must not have a deadline tied
+// to the subprocess timeout — this ensures the final streamed update always
+// reaches Telegram even when the subprocess is killed by a deadline.
 // notificationMode controls streaming behavior: "live" (stream), "summary" (no stream), "quiet" (no stream, minimal output).
 func (m *SessionManager) invokeClaudeAPI(
-	ctx context.Context,
+	subprocCtx context.Context,
+	sendCtx context.Context,
 	session *Session,
 	group *Group,
 	prompt string,
@@ -585,7 +598,7 @@ func (m *SessionManager) invokeClaudeAPI(
 		args = append(args, "--resume", session.SessionID)
 	}
 
-	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd := exec.CommandContext(subprocCtx, "claude", args...)
 	cmd.Dir = group.CWD
 	cmd.Stdin = strings.NewReader(prompt)
 
@@ -645,13 +658,13 @@ func (m *SessionManager) invokeClaudeAPI(
 			if streamMsgID == 0 {
 				// First message - use placeholder or send new
 				if placeholderID != 0 {
-					if err := m.sender.EditMessage(ctx, chatID, placeholderID, currentChunk); err != nil {
+					if err := m.sender.EditMessage(sendCtx, chatID, placeholderID, currentChunk); err != nil {
 						log.Printf("[session_mgr] edit placeholder (%d,%d): %v", chatID, *threadID, err)
 						return false
 					}
 					streamMsgID = placeholderID
 				} else {
-					id, err := m.sender.sendInitialStream(ctx, chatID, threadID, origMsgID, currentChunk)
+					id, err := m.sender.sendInitialStream(sendCtx, chatID, threadID, origMsgID, currentChunk)
 					if err != nil {
 						log.Printf("[session_mgr] send initial stream (%d,%d): %v", chatID, *threadID, err)
 						return false
@@ -660,7 +673,7 @@ func (m *SessionManager) invokeClaudeAPI(
 				}
 			} else {
 				// Edit the current streaming message with truncated content
-				if err := m.sender.EditMessage(ctx, chatID, streamMsgID, currentChunk); err != nil {
+				if err := m.sender.EditMessage(sendCtx, chatID, streamMsgID, currentChunk); err != nil {
 					log.Printf("[session_mgr] edit stream (%d,%d): %v", chatID, *threadID, err)
 					return false
 				}
@@ -668,7 +681,7 @@ func (m *SessionManager) invokeClaudeAPI(
 
 			// Send the overflow as a new message and continue streaming into it
 			overflowText := text[splitAt:]
-			newMsgID, err := m.sender.SendStreamOverflow(ctx, chatID, threadID, overflowText)
+			newMsgID, err := m.sender.SendStreamOverflow(sendCtx, chatID, threadID, overflowText)
 			if err != nil {
 				log.Printf("[session_mgr] send overflow (%d,%d): %v", chatID, *threadID, err)
 				// Keep streaming into the old message on error
@@ -686,13 +699,13 @@ func (m *SessionManager) invokeClaudeAPI(
 		if streamMsgID == 0 {
 			// Use placeholder if available, otherwise send new message
 			if placeholderID != 0 {
-				if err := m.sender.EditMessage(ctx, chatID, placeholderID, text); err != nil {
+				if err := m.sender.EditMessage(sendCtx, chatID, placeholderID, text); err != nil {
 					log.Printf("[session_mgr] edit placeholder (%d,%d): %v", chatID, *threadID, err)
 					return false
 				}
 				streamMsgID = placeholderID
 			} else {
-				id, err := m.sender.sendInitialStream(ctx, chatID, threadID, origMsgID, text)
+				id, err := m.sender.sendInitialStream(sendCtx, chatID, threadID, origMsgID, text)
 				if err != nil {
 					log.Printf("[session_mgr] send initial stream (%d,%d): %v", chatID, *threadID, err)
 					return false
@@ -700,7 +713,7 @@ func (m *SessionManager) invokeClaudeAPI(
 				streamMsgID = id
 			}
 		} else {
-			if err := m.sender.EditMessage(ctx, chatID, streamMsgID, text); err != nil {
+			if err := m.sender.EditMessage(sendCtx, chatID, streamMsgID, text); err != nil {
 				// Telegram returns 400 "message is not modified" if text hasn't changed.
 				// Treat this as a no-op rather than an error.
 				if apiErr, ok := err.(*contract.ErrorResponse); !ok || apiErr.ErrorCode != 400 {

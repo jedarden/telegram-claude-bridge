@@ -821,6 +821,246 @@ The dashboard is optional — the bridge functions identically without it. It's 
 
 **Deliverable:** Real-time terminal dashboard for monitoring bridge activity, session state, and costs.
 
+## Phase 7: Long-Running Process Support
+
+### Purpose
+
+Transform the bridge from a single-blocking-invocation model into a multi-instance orchestrator. A topic can spawn multiple parallel headless Claude CLI instances — each completing an independent sub-task — with results routed back to the originating topic as they arrive. This unlocks complex agentic work (deep research, parallel code analysis, long builds) that exceeds the current 5-minute synchronous timeout.
+
+### Architecture
+
+```
+TopicWorker (per topic)
+    │
+    ├── [current] single blocking claude -p call → response
+    │
+    └── [Phase 7] SubtaskOrchestrator
+            │
+            ├── Sub-task goroutine 1: claude -p "analyze X"  ──┐
+            ├── Sub-task goroutine 2: claude -p "check Y"    ──┤→ fan-in → post results to topic
+            └── Sub-task goroutine 3: claude -p "search Z"  ──┘
+```
+
+Each sub-task:
+- Is its own `exec.Cmd` (`claude -p --resume <session_id>` or fresh session)
+- Runs in a separate goroutine
+- Posts its result to the originating `(chatID, threadID)` when complete
+- Is tracked in SQLite for status visibility
+
+### 7.1 — In-flight cancellation
+
+**Problem:** A stuck or long-running invocation holds the topic worker goroutine with no escape.
+
+**Solution:** Track the active `*exec.Cmd` in `topicWorker`. A `/cancel` command (general topic or in-topic) sends `SIGTERM` to the running process.
+
+```go
+type topicWorker struct {
+    ch        chan sessionMsg
+    cancel    context.CancelFunc
+    activeCmd *exec.Cmd   // guarded by activeMu
+    activeMu  sync.Mutex
+}
+```
+
+- Set `activeCmd` when `cmd.Start()` succeeds; clear it after `cmd.Wait()` returns.
+- `/cancel [thread_id]` command: acquire `activeMu`, call `activeCmd.Process.Signal(os.Interrupt)`.
+- Edit the "Thinking…" placeholder to "⚠️ Cancelled" on cancellation.
+- Topic color → red on cancel.
+
+### 7.2 — Extended timeouts + per-topic timeout override
+
+**Problem:** `defaultSessionTimeout = 300` (5 min) is too low for agentic tasks. Per-topic override is missing.
+
+**Changes:**
+- Raise `defaultSessionTimeout` from `300` → `1800` (30 min).
+- Add `timeout_sec` column to `sessions` table (mirrors `groups.timeout_sec`). Per-topic override takes precedence over group default.
+- Add `/timeout [N]` as a topic-level command (currently only group-level via `/config`).
+- `N=0` disables the timeout entirely (no `context.WithTimeout`).
+- Add `/timeout` to `/help` output.
+
+**Timeout resolution order** (first non-zero wins):
+1. `sessions.timeout_sec` — topic-level override
+2. `groups.timeout_sec` — group default
+3. `defaultSessionTimeout` — hardcoded fallback (1800s)
+
+### 7.3 — Tool-use progress notifications
+
+**Problem:** During long agentic runs the user sees only "Thinking…" with no visibility into what Claude is doing.
+
+**Solution:** Parse `tool_use` and `tool_result` events from the stream-json NDJSON and send interim status messages to the topic.
+
+Stream-json emits `stream_event` lines containing `message_delta` and tool events. Parse:
+```json
+{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","name":"Bash","input":{"command":"go test ./..."}}}}
+```
+
+Behavior:
+- On `tool_use` start: edit the placeholder → `⚙️ Running Bash: \`go test ./...\`` (truncated to 100 chars)
+- On `tool_result`: edit → `✓ Bash done (exit 0)` or `✗ Bash failed (exit 1)`
+- On final result: replace with full streamed response as now
+- Debounce tool notifications at 500ms (faster than text streaming since these are discrete events)
+- Long tool commands truncated in the notification but full output still goes to Claude
+
+### 7.4 — Sub-task orchestrator (multi-instance fan-out/fan-in)
+
+**Core feature:** Allow Claude or the user to dispatch multiple parallel `claude -p` instances from a single topic, with results funneled back to that topic.
+
+#### SQLite schema addition
+
+```sql
+CREATE TABLE subtasks (
+    id           TEXT PRIMARY KEY,          -- uuid
+    chat_id      INTEGER NOT NULL,
+    thread_id    INTEGER NOT NULL,
+    parent_msg   INTEGER,                   -- message_id that triggered the subtask
+    prompt       TEXT NOT NULL,
+    session_id   TEXT,                      -- claude session_id for this subtask
+    status       TEXT NOT NULL DEFAULT 'running',  -- running, done, failed, cancelled
+    result       TEXT,
+    error        TEXT,
+    started_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at  TEXT,
+    FOREIGN KEY (chat_id, thread_id) REFERENCES sessions(chat_id, thread_id)
+);
+```
+
+#### SubtaskOrchestrator
+
+```go
+type SubtaskOrchestrator struct {
+    db     *DB
+    sender *Sender
+}
+
+type SubtaskRequest struct {
+    ChatID   int64
+    ThreadID int64
+    MsgID    int64
+    Prompts  []string  // one per parallel instance
+    Group    *Group
+    Session  *Session  // parent session; each subtask gets its own session or inherits
+}
+
+func (o *SubtaskOrchestrator) Run(ctx context.Context, req SubtaskRequest)
+```
+
+Behavior:
+1. For each prompt, insert a `subtasks` row with `status=running`.
+2. Spawn a goroutine per prompt running `invokeClaudeAPI` (fresh session, same CWD).
+3. As each goroutine completes, update the `subtasks` row and post the result to the originating topic.
+4. Post results as they arrive (fan-in is non-blocking).
+5. A final "All N sub-tasks complete" summary is sent when all goroutines exit.
+
+#### Trigger mechanisms
+
+**User-initiated via `/parallel`:**
+```
+/parallel
+Research the three biggest failure modes in distributed SQLite replication.
+---
+List the top 5 Go libraries for distributed locking with pros/cons.
+---
+Summarize the WAL mode write amplification problem.
+```
+Delimiter `---` splits prompts. Up to 5 parallel instances (configurable per group via `/config max_subtasks N`).
+
+**Claude-initiated via tool:**
+The bridge exposes a synthetic tool `spawn_subtask` that Claude can call in its stream. When the bridge sees a `tool_use` block with `name="spawn_subtask"`, it:
+1. Extracts `{"prompt": "...", "session_inherit": true/false}` from the tool input.
+2. Inserts a `subtasks` row.
+3. Spawns the sub-task goroutine.
+4. Returns a synthetic `tool_result` to Claude's stdin: `{"subtask_id": "...", "status": "dispatched"}`.
+5. The sub-task result is posted to the topic when complete.
+
+This lets Claude self-decompose complex tasks into parallel workstreams without the user having to structure the prompt.
+
+#### Resource limits
+
+- Max concurrent subtasks per topic: 5 (configurable)
+- Sub-tasks share the group's budget cap
+- Sub-task timeout: inherits group `timeout_sec`
+- A topic worker is not blocked while sub-tasks run — the worker goroutine exits `processBatch` after dispatching, and sub-task goroutines post back to the topic via `sender` directly
+
+### 7.5 — Background shell job runner
+
+**Problem:** Sometimes the user wants to fire a long-running shell process (deploy, test suite, build) and get notified when it completes without tying up a Claude session.
+
+**`/bg <command>` command:**
+
+```go
+type BackgroundJob struct {
+    ID        string
+    ChatID    int64
+    ThreadID  int64
+    Command   string
+    Cmd       *exec.Cmd
+    Status    string // running, done, failed
+    StartedAt time.Time
+}
+```
+
+Behavior:
+- `/bg go test ./...` — launches the command in a goroutine under the group's CWD.
+- Sends a "⏳ Background job started: `go test ./...`" confirmation immediately.
+- Streams stdout/stderr line-by-line back to the topic (same debounce as streaming, 1s).
+- On completion: "✓ Job done (exit 0)" or "✗ Job failed (exit 1)" with last N lines of output.
+- `/jobs` command lists running background jobs for this topic.
+- `/kill <job_id>` sends SIGTERM to a running job.
+
+Background jobs are stored in a `background_jobs` SQLite table for persistence across bridge restarts (partially — running jobs are re-marked as `interrupted` on startup).
+
+```sql
+CREATE TABLE background_jobs (
+    id          TEXT PRIMARY KEY,
+    chat_id     INTEGER NOT NULL,
+    thread_id   INTEGER NOT NULL,
+    command     TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'running',
+    exit_code   INTEGER,
+    started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT
+);
+```
+
+### New commands summary
+
+| Command | Context | Action |
+|---|---|---|
+| `/cancel [thread_id]` | General or topic | Cancel the active Claude invocation for a topic |
+| `/timeout [N]` | Topic | View or set timeout for this topic (0 = no timeout) |
+| `/parallel` | Topic | Dispatch multi-prompt parallel sub-tasks |
+| `/bg <command>` | Topic | Run a shell command in background, stream output back |
+| `/jobs` | Topic | List running background jobs for this topic |
+| `/kill <job_id>` | Topic | Send SIGTERM to a background job |
+
+### Updated architecture diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          Bridge (EX44)                               │
+│                                                                      │
+│  ┌──────────┐  ┌──────────────┐  ┌──────────────────────────────┐   │
+│  │  Poller   │→│   Router     │→│      Session Manager          │   │
+│  └──────────┘  └──────────────┘  │                              │   │
+│                                  │  TopicWorker (per topic)     │   │
+│                                  │  ├─ Single invoke (current)  │   │
+│                                  │  └─ SubtaskOrchestrator      │   │
+│                                  │       ├─ claude -p (x1..N)   │   │
+│                                  │       └─ fan-in → sender     │   │
+│                                  └──────────────────────────────┘   │
+│                                                                      │
+│  ┌──────────────────────┐    ┌──────────────────────────────────┐   │
+│  │  BackgroundJobRunner  │    │  State (SQLite)                  │   │
+│  │  /bg <cmd>           │    │  groups, sessions, subtasks,     │   │
+│  │  stdout → topic      │    │  background_jobs, sent_messages  │   │
+│  └──────────────────────┘    └──────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Deliverable:** Bridge supports long-running agentic tasks via cancellation, higher timeouts, tool-use visibility, parallel sub-task dispatch, and background shell jobs — all routing output back to the originating topic.
+
+---
+
 ## Self-Updating
 
 Both components update themselves from the repo without manual intervention.
