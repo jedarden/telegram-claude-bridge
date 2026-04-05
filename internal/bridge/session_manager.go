@@ -20,7 +20,7 @@ const (
 	topicQueueCapacity    = 32
 	defaultSessionModel   = "claude-sonnet-4-6"
 	defaultSessionTimeout = 300
-	defaultPermissionMode = "acceptEdits"
+	defaultPermissionMode = "dangerouslySkipPermissions"
 
 	// scannerMaxBuf is the max line size for the bufio.Scanner reading stream-json
 	// output. Claude responses can exceed the 64KB default.
