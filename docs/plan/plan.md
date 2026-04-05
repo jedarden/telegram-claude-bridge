@@ -717,6 +717,110 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 
 ---
 
+## Phase 6: TUI Dashboard
+
+### Purpose
+
+A terminal UI that provides real-time visibility into the bridge's operation. Runs in a tmux session on EX44, showing messages in flight, active sessions, command processing, and system health at a glance.
+
+### Technology
+
+- **Language:** Go (same module as bridge)
+- **TUI framework:** `charmbracelet/bubbletea` + `charmbracelet/lipgloss` for layout and styling
+- **Data source:** Bridge exposes an internal event stream (Unix socket or localhost HTTP SSE) that the TUI consumes. The TUI is a read-only observer — it never modifies bridge state.
+- **Binary:** `cmd/dashboard/main.go`, separate binary from the bridge
+
+### Layout
+
+```
+┌─ Telegram-Claude Bridge Dashboard ──────────────────────────────────────┐
+│                                                                          │
+│  ┌─ Active Sessions ─────────────────────┐  ┌─ System Health ─────────┐ │
+│  │ #trading-bot   opus   ▶ processing    │  │ Proxy: ✓ 210ms          │ │
+│  │ #refactor-api  sonnet   idle 2m       │  │ Bridge: ✓ uptime 4h12m  │ │
+│  │ #fix-auth      haiku    idle 15m      │  │ DB: ✓ 6ms               │ │
+│  │ #new-feature   sonnet ▶ streaming     │  │ Claude: ✓ installed     │ │
+│  │                                       │  │ Telegram: ✓ polling     │ │
+│  └───────────────────────────────────────┘  └─────────────────────────┘ │
+│                                                                          │
+│  ┌─ Messages In Flight ─────────────────────────────────────────────────┐│
+│  │ 09:31:02 → #new-feature  @jed "refactor the error handling"         ││
+│  │ 09:31:03 ← #new-feature  claude streaming... (1.2s, 340 tokens)     ││
+│  │ 09:30:45 ← #trading-bot  claude complete (4.8s, $0.032)             ││
+│  │ 09:30:12 → #trading-bot  @jed "add stop-loss logic"                 ││
+│  └─────────────────────────────────────────────────────────────────────┘│
+│                                                                          │
+│  ┌─ Command Log ────────────────────────────────────────────────────────┐│
+│  │ 09:31:05  /model opus          #new-feature  @jed  → OK             ││
+│  │ 09:30:00  /new trading-bot     General       @jed  → created        ││
+│  │ 09:28:15  /cwd /home/coding    General       @jed  → set            ││
+│  └─────────────────────────────────────────────────────────────────────┘│
+│                                                                          │
+│  ┌─ Cost Tracker ───────────────────────────────────────────────────────┐│
+│  │ Session totals today: $0.48  │  This hour: $0.12  │  Active: 4      ││
+│  └─────────────────────────────────────────────────────────────────────┘│
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### Panels
+
+#### Active Sessions
+- Lists all sessions with status (processing/streaming/idle/error), model, topic name
+- Color-coded: green=idle, blue=processing, yellow=streaming, red=error
+- Shows idle duration for inactive sessions
+- Sorted by last activity (most recent first)
+
+#### System Health
+- Real-time health checks mirroring the bridge's internal health checker
+- Proxy latency, bridge uptime, DB response time, Claude CLI availability
+- Telegram polling status and last update ID
+
+#### Messages In Flight
+- Scrolling log of inbound (→) and outbound (←) messages
+- Shows topic name, user, message preview (truncated to terminal width)
+- For outbound: streaming progress, token count, cost, duration
+- Ring buffer of last ~100 messages
+
+#### Command Log
+- Scrolling log of `/commands` processed by the bridge
+- Shows command, topic, user, result (OK/error)
+- Ring buffer of last ~50 commands
+
+#### Cost Tracker
+- Aggregated cost from session `total_cost_usd` fields
+- Today's total, current hour, and active session count
+- Per-session breakdown available by selecting a session in the Active Sessions panel
+
+### Event Stream
+
+The bridge publishes events to a local Unix socket at `/tmp/telegram-bridge-events.sock` (or configurable path). The event protocol is NDJSON with event types:
+
+```json
+{"type":"message_in","timestamp":"...","chat_id":...,"thread_id":...,"topic":"#trading-bot","user":"@jed","preview":"add stop-loss logic"}
+{"type":"message_out","timestamp":"...","chat_id":...,"thread_id":...,"topic":"#trading-bot","status":"streaming","tokens":340,"elapsed_ms":1200}
+{"type":"message_out","timestamp":"...","chat_id":...,"thread_id":...,"topic":"#trading-bot","status":"complete","tokens":1200,"cost_usd":0.032,"elapsed_ms":4800}
+{"type":"command","timestamp":"...","command":"/model","args":"opus","topic":"#new-feature","user":"@jed","result":"ok"}
+{"type":"session_update","timestamp":"...","chat_id":...,"thread_id":...,"topic":"#new-feature","status":"active","model":"claude-opus-4-6"}
+{"type":"health","timestamp":"...","proxy_ok":true,"proxy_latency_ms":210,"db_ok":true,"db_latency_ms":6}
+```
+
+The bridge emits events regardless of whether the TUI is connected. If no listener is present, writes are silently dropped (non-blocking).
+
+### Running
+
+```bash
+# In a tmux session
+tmux new -s dashboard
+./bin/dashboard
+
+# Or with a custom socket path
+./bin/dashboard --socket /tmp/telegram-bridge-events.sock
+```
+
+The dashboard is optional — the bridge functions identically without it. It's a pure observer for operational visibility.
+
+**Deliverable:** Real-time terminal dashboard for monitoring bridge activity, session state, and costs.
+
 ## Self-Updating
 
 Both components update themselves from the repo without manual intervention.
