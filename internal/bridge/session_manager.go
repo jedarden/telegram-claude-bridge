@@ -567,7 +567,7 @@ func (m *SessionManager) invokeClaudeAPI(
 	args := []string{
 		"-p",
 		"--output-format", "stream-json",
-		"--include-partial-messages",
+		"--verbose",
 		"--permission-mode", resolvePermissionMode(group),
 		"--model", resolveSessionModel(session, group),
 	}

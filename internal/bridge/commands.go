@@ -978,6 +978,7 @@ func (h *CommandHandler) cmdNew(ctx context.Context, update contract.Update, gro
 func (h *CommandHandler) createClaudeSession(ctx context.Context, group *Group, prompt string) (string, error) {
 	args := []string{
 		"-p",
+		"--output-format", "json",
 		"--permission-mode", resolvePermissionMode(group),
 		"--model", resolveSessionModel(nil, group),
 	}
