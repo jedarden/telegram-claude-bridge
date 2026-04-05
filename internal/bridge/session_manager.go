@@ -20,7 +20,7 @@ const (
 	topicQueueCapacity    = 32
 	defaultSessionModel   = "claude-sonnet-4-6"
 	defaultSessionTimeout = 300
-	defaultPermissionMode = "dangerouslySkipPermissions"
+	defaultPermissionMode = "bypassPermissions"
 
 	// scannerMaxBuf is the max line size for the bufio.Scanner reading stream-json
 	// output. Claude responses can exceed the 64KB default.
@@ -568,7 +568,7 @@ func (m *SessionManager) invokeClaudeAPI(
 		"-p",
 		"--output-format", "stream-json",
 		"--verbose",
-		"--permission-mode", resolvePermissionMode(group),
+		"--dangerously-skip-permissions",
 		"--model", resolveSessionModel(session, group),
 	}
 

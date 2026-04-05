@@ -109,7 +109,7 @@ func (sc *SessionCloser) generateSessionSummary(ctx context.Context, session *Se
 		"-p",
 		"--output-format", "json",
 		"--model", "claude-haiku-4-5", // Always use the cheapest model for summaries
-		"--permission-mode", resolvePermissionMode(group),
+		"--dangerously-skip-permissions",
 	}
 	if session.SessionID != "" {
 		args = append(args, "--resume", session.SessionID)
