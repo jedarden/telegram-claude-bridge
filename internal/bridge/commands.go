@@ -539,13 +539,13 @@ func (h *CommandHandler) generateSessionSummary(ctx context.Context, session *Se
 		"--output-format", "json",
 		"--model", "claude-haiku-4-5", // Always use the cheapest model for summaries
 		"--permission-mode", resolvePermissionMode(group),
-		"--cwd", group.CWD,
 	}
 	if session.SessionID != "" {
 		args = append(args, "--resume", session.SessionID)
 	}
 
 	cmd := exec.CommandContext(summCtx, "claude", args...)
+	cmd.Dir = group.CWD
 	cmd.Stdin = strings.NewReader("Summarize what was accomplished in this session in 2-3 bullet points. Note any unfinished work or open questions.")
 
 	output, err := cmd.Output()
@@ -979,7 +979,6 @@ func (h *CommandHandler) createClaudeSession(ctx context.Context, group *Group, 
 	args := []string{
 		"-p",
 		"--permission-mode", resolvePermissionMode(group),
-		"--cwd", group.CWD,
 		"--model", resolveSessionModel(nil, group),
 	}
 
@@ -993,6 +992,7 @@ func (h *CommandHandler) createClaudeSession(ctx context.Context, group *Group, 
 	}
 
 	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd.Dir = group.CWD
 	cmd.Stdin = strings.NewReader(prompt)
 
 	output, err := cmd.Output()
@@ -1525,13 +1525,13 @@ func (h *CommandHandler) cmdContext(ctx context.Context, update contract.Update,
 			"--output-format", "json",
 			"--model", "claude-haiku-4-5", // Always use the cheapest model for summaries
 			"--permission-mode", resolvePermissionMode(group),
-			"--cwd", group.CWD,
 		}
 		if session.SessionID != "" {
 			args = append(args, "--resume", session.SessionID)
 		}
 
 		cmd := exec.CommandContext(summCtx, "claude", args...)
+		cmd.Dir = group.CWD
 		cmd.Stdin = strings.NewReader("Summarize what was accomplished in this session in 2-3 bullet points. Note any unfinished work or open questions.")
 
 		output, err := cmd.Output()

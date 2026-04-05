@@ -569,7 +569,6 @@ func (m *SessionManager) invokeClaudeAPI(
 		"--output-format", "stream-json",
 		"--include-partial-messages",
 		"--permission-mode", resolvePermissionMode(group),
-		"--cwd", group.CWD,
 		"--model", resolveSessionModel(session, group),
 	}
 
@@ -587,6 +586,7 @@ func (m *SessionManager) invokeClaudeAPI(
 	}
 
 	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd.Dir = group.CWD
 	cmd.Stdin = strings.NewReader(prompt)
 
 	stdoutPipe, err := cmd.StdoutPipe()
