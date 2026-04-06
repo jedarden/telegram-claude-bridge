@@ -158,6 +158,20 @@ var timeoutWithDurationPhrases = []string{
 	"wait up to",
 }
 
+// newSessionPhrases is a table of known new session/topic phrases.
+// Checked case-insensitively; first match wins.
+var newSessionPhrases = []string{
+	"start a new session",
+	"new session",
+	"new topic",
+	"start fresh",
+	"start over",
+	"create a new topic",
+	"open a new topic",
+	"start a new conversation",
+	"new conversation",
+}
+
 // modelChangePhrases is a table of known model-change phrases.
 // Phrases are checked in order, first match wins.
 var modelChangePhrases = []modelChangePhrase{
@@ -845,6 +859,28 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		// Budget exceeded - send error and don't proceed
 		_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, err.Error())
 		return
+	}
+
+	// Check for new session intent
+	if last.update.Content != nil && last.update.Content.Text != nil {
+		intent := detectNewSessionIntent(*last.update.Content.Text)
+		if intent.detected {
+			// Create the new topic and session
+			threadID, err := m.createNewSession(ctx, key.chatID, group, intent.topicName, intent.remainder)
+			if err != nil {
+				log.Printf("[session_mgr] create new session: %v", err)
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, fmt.Sprintf("Error creating new session: %v", err))
+				return
+			}
+
+			// Send confirmation message to the original topic
+			confirmMsg := fmt.Sprintf("✅ Created new topic: %s (thread_id: %d)", intent.topicName, threadID)
+			_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, confirmMsg)
+
+			// If there's a remainder (first message), we've already sent it to the new session
+			// Nothing more to do here
+			return
+		}
 	}
 
 	// Get the notification mode from the session (default to "live")
@@ -1935,6 +1971,96 @@ func removeDuration(text string) string {
 	return text
 }
 
+// newSessionIntent holds the result of new session intent detection.
+type newSessionIntent struct {
+	detected  bool   // true if a new session intent was found
+	topicName string // extracted topic name
+	remainder string // text with the phrase removed
+}
+
+// detectNewSessionIntent checks text for new session/topic phrases.
+// Returns a newSessionIntent struct with the detected topic name and cleaned text.
+func detectNewSessionIntent(text string) newSessionIntent {
+	lower := strings.ToLower(strings.TrimSpace(text))
+
+	for _, phrase := range newSessionPhrases {
+		if !strings.HasPrefix(lower, phrase) {
+			continue
+		}
+
+		// Extract the remainder (case-preserving)
+		phraseIdx := strings.Index(strings.ToLower(text), phrase)
+		remainder := strings.TrimSpace(text[phraseIdx+len(phrase):])
+
+		// Extract topic name from remainder
+		topicName := extractTopicName(remainder)
+
+		return newSessionIntent{
+			detected:  true,
+			topicName: topicName,
+			remainder: remainder,
+		}
+	}
+
+	return newSessionIntent{detected: false}
+}
+
+// extractTopicName extracts a topic name from text.
+// Order of precedence:
+// 1. Text after "called", "for", "named", or ":" up to 50 chars or end of message
+// 2. First 4 words of the text
+// 3. "Session <timestamp>" if text is empty
+func extractTopicName(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fmt.Sprintf("Session %d", time.Now().Unix())
+	}
+
+	lower := strings.ToLower(text)
+
+	// Check for name indicators: "called", "for", "named", ":"
+	indicators := []string{" called ", " for ", " named ", ":"}
+	for _, indicator := range indicators {
+		idx := strings.Index(lower, indicator)
+		if idx != -1 {
+			// Extract the name after the indicator
+			nameStart := idx + len(indicator)
+			name := strings.TrimSpace(text[nameStart:])
+
+			// Truncate at 50 chars or at sentence boundaries
+			if len(name) > 50 {
+				// Try to truncate at a word boundary
+				cut := 50
+				for ; cut > 0 && cut > 40; cut-- {
+					if name[cut] == ' ' || name[cut] == '.' || name[cut] == ',' {
+						break
+					}
+				}
+				if cut > 0 {
+					name = strings.TrimSpace(name[:cut])
+				} else {
+					name = name[:50]
+				}
+			}
+			if name != "" {
+				return name
+			}
+		}
+	}
+
+	// Use first 4 words of the remainder
+	words := strings.Fields(text)
+	if len(words) > 4 {
+		return strings.Join(words[:4], " ")
+	}
+	if len(words) > 0 {
+		return text
+	}
+
+	// Fallback to timestamp
+	return fmt.Sprintf("Session %d", time.Now().Unix())
+}
+
 // updateTopicColor updates both the database and the Telegram topic icon color.
 // Only sends the update if the color is different from the current color.
 func (m *SessionManager) updateTopicColor(ctx context.Context, chatID, threadID int64, newColor int) error {
@@ -2187,4 +2313,113 @@ func (m *SessionManager) CancelTopic(ctx context.Context, chatID, threadID int64
 	}
 
 	return false
+}
+
+// createNewSession creates a new forum topic, starts a Claude session,
+// and returns the thread ID and any error. The first message text is
+// sent to the new session as the initial prompt.
+func (m *SessionManager) createNewSession(ctx context.Context, chatID int64, group *Group, topicName, firstMessage string) (int64, error) {
+	if len(topicName) > 128 {
+		return 0, fmt.Errorf("topic name too long (max 128 characters)")
+	}
+
+	// Step 1: Create the forum topic
+	iconColor := contract.IconColorLightBlue
+	threadID, err := m.sender.CreateTopic(ctx, chatID, topicName, iconColor)
+	if err != nil {
+		return 0, fmt.Errorf("create topic: %w", err)
+	}
+
+	// Step 2: Run claude -p to create a session and get session_id
+	var prompt string
+	if firstMessage != "" {
+		prompt = fmt.Sprintf("New task: %s\n\nFirst message: %s\n\nHow can I help?", topicName, firstMessage)
+	} else {
+		prompt = fmt.Sprintf("New task: %s. How can I help?", topicName)
+	}
+	sessionID, err := m.createClaudeSession(ctx, group, prompt)
+	if err != nil {
+		// Best-effort: try to close the topic we just created
+		_ = m.sender.CloseTopic(ctx, chatID, threadID)
+		return 0, fmt.Errorf("create Claude session: %w", err)
+	}
+
+	// Step 3: Create the session record in the database
+	session := &Session{
+		ChatID:    chatID,
+		ThreadID:  threadID,
+		SessionID: sessionID,
+		CWD:       group.CWD,
+		Model:     resolveSessionModel(nil, group),
+		Status:    "active",
+	}
+	if err := m.db.CreateSession(ctx, session); err != nil {
+		return 0, fmt.Errorf("create session record: %w", err)
+	}
+
+	// Step 4: Send the metadata message to the new topic
+	startTime := time.Now().Format("2006-01-02 15:04:05")
+	metadata := fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: 0\nCost: $0.00",
+		sessionID, group.CWD, session.Model, startTime)
+
+	pinnedMsgID, err := m.sender.SendAndPinMetadata(ctx, chatID, threadID, metadata)
+	if err != nil {
+		log.Printf("[session_mgr] send and pin metadata: %v", err)
+		// Non-fatal: continue anyway
+	}
+
+	// Step 5: Store the pinned message ID in the session
+	if pinnedMsgID != 0 {
+		session.PinnedMessageID = pinnedMsgID
+		if err := m.db.UpdateSession(ctx, session); err != nil {
+			log.Printf("[session_mgr] update session with pinned message id: %v", err)
+			// Non-fatal: continue anyway
+		}
+	}
+
+	log.Printf("[session_mgr] new topic created: chat_id=%d thread_id=%d name=%s",
+		chatID, threadID, topicName)
+
+	return threadID, nil
+}
+
+// createClaudeSession runs claude -p with the given prompt and returns the session_id.
+func (m *SessionManager) createClaudeSession(ctx context.Context, group *Group, prompt string) (string, error) {
+	args := []string{
+		"-p",
+		"--output-format", "json",
+		"--dangerously-skip-permissions",
+		"--model", resolveSessionModel(nil, group),
+	}
+
+	// Add tool restrictions if configured
+	allowed, disallowed := resolveToolRestrictions(group)
+	if allowed != "" {
+		args = append(args, "--allowed-tools", allowed)
+	}
+	if disallowed != "" {
+		args = append(args, "--disallowed-tools", disallowed)
+	}
+
+	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd.Dir = group.CWD
+	cmd.Stdin = strings.NewReader(prompt)
+
+	output, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("claude exited %d: %s", exitErr.ExitCode(), string(exitErr.Stderr))
+		}
+		return "", fmt.Errorf("run claude: %w", err)
+	}
+
+	// Parse JSON output to get session_id
+	var out claudeOutput
+	if err := json.Unmarshal(output, &out); err != nil {
+		return "", fmt.Errorf("parse claude output: %w", err)
+	}
+	if out.SessionID == "" {
+		return "", fmt.Errorf("claude returned empty session_id")
+	}
+	return out.SessionID, nil
 }
