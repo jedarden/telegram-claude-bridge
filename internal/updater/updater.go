@@ -244,7 +244,12 @@ func (u *Updater) buildNewBinary(ctx context.Context) error {
 	// Build to temp file (binary path with .new suffix)
 	oldPath := filepath.Join(u.repoPath, u.binaryPath)
 	newPath := oldPath + newBinarySuffix
-	buildCmd := exec.CommandContext(ctx, "go", "build",
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		// Fallback to known install location when go is not in PATH
+		goBin = filepath.Join(os.Getenv("HOME"), "go", "bin", "go")
+	}
+	buildCmd := exec.CommandContext(ctx, goBin, "build",
 		"-ldflags", ldflags,
 		"-o", newPath,
 		"./cmd/bridge/")
