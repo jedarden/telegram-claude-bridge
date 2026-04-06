@@ -117,6 +117,23 @@ var statusPhrases = []string{
 	"show info",
 }
 
+// closePhrases is a table of known session close phrases.
+// Checked case-insensitively; first match wins.
+// "finished" is treated specially - only triggers if remainder is very short.
+var closePhrases = []string{
+	"close this session",
+	"close session",
+	"end session",
+	"we are done",
+	"were done",
+	"all done",
+	"done here",
+	"close this topic",
+	"shut this down",
+	"wrap up",
+	"finished",
+}
+
 // modelChangePhrases is a table of known model-change phrases.
 // Phrases are checked in order, first match wins.
 var modelChangePhrases = []modelChangePhrase{
@@ -705,6 +722,42 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, reply)
 			}
 			return // Pure query intent - don't forward to Claude
+		}
+	}
+
+	// Check for session close intent
+	if last.update.Content != nil && last.update.Content.Text != nil {
+		detected, isPureClose := detectCloseIntent(*last.update.Content.Text)
+		if detected {
+			if session == nil {
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "No active session to close.")
+				return
+			}
+			if session.Status == "closed" {
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Session already closed.")
+				return
+			}
+
+			// Mark session as closed
+			if err := m.db.CloseSession(ctx, key.chatID, key.threadID); err != nil {
+				log.Printf("[session_mgr] close session (%d,%d): %v", key.chatID, key.threadID, err)
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Error closing session.")
+				return
+			}
+
+			// Update topic color to green (complete)
+			_ = m.updateTopicColor(ctx, key.chatID, key.threadID, ColorComplete)
+
+			// Send confirmation
+			_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Session closed.")
+
+			// Optionally close the Telegram topic (same as /close)
+			if err := m.sender.CloseTopic(ctx, key.chatID, key.threadID); err != nil {
+				log.Printf("[session_mgr] close topic (%d,%d): %v", key.chatID, key.threadID, err)
+				// Non-fatal: session is already closed
+			}
+
+			return // Pure intent - don't forward to Claude
 		}
 	}
 
@@ -1660,6 +1713,38 @@ func detectStatusIntent(text string) bool {
 		}
 	}
 	return false
+}
+
+// detectCloseIntent checks text for session close phrases and returns whether
+// a close intent was detected. For "finished", only triggers if remainder is
+// very short (< 20 chars) since it's ambiguous. Clear phrases like "close this
+// session" always trigger regardless of remainder.
+func detectCloseIntent(text string) (detected bool, isPureClose bool) {
+	lower := strings.ToLower(strings.TrimSpace(text))
+
+	for _, phrase := range closePhrases {
+		if !strings.HasPrefix(lower, phrase) {
+			continue
+		}
+
+		// Extract the remainder (case-preserving)
+		phraseIdx := strings.Index(strings.ToLower(text), phrase)
+		remainder := strings.TrimSpace(text[phraseIdx+len(phrase):])
+
+		// "finished" is ambiguous - only trigger if remainder is very short
+		if phrase == "finished" {
+			if len(remainder) < 20 {
+				return true, remainder == ""
+			}
+			// Continue checking other phrases
+			continue
+		}
+
+		// Clear intent phrases always trigger
+		return true, remainder == ""
+	}
+
+	return false, false
 }
 
 // updateTopicColor updates both the database and the Telegram topic icon color.
