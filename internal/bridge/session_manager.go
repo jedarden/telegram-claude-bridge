@@ -1138,8 +1138,6 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		return // no content to process
 	}
 
-	m.sender.SendTyping(ctx, key.chatID, tidPtr)
-
 	// Check budget enforcement before invoking Claude API
 	if err := m.checkBudgetEnforcement(ctx, key.chatID, group); err != nil {
 		// Budget exceeded - send error and don't proceed
