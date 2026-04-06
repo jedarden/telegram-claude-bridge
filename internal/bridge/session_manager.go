@@ -134,6 +134,30 @@ var closePhrases = []string{
 	"finished",
 }
 
+// timeoutNoLimitPhrases is a table of known "no timeout" phrases.
+// Checked case-insensitively; first match wins.
+var timeoutNoLimitPhrases = []string{
+	"no timeout",
+	"let it run",
+	"run as long as needed",
+	"no time limit",
+	"run indefinitely",
+	"dont time out",
+	"don't time out",
+	"take as long as you need",
+}
+
+// timeoutWithDurationPhrases is a table of known timeout-setting phrases
+// that include a duration. Checked case-insensitively; first match wins.
+// The duration value is extracted from the remainder text.
+var timeoutWithDurationPhrases = []string{
+	"set timeout to",
+	"timeout",
+	"give it",
+	"let it run for",
+	"wait up to",
+}
+
 // modelChangePhrases is a table of known model-change phrases.
 // Phrases are checked in order, first match wins.
 var modelChangePhrases = []modelChangePhrase{
@@ -163,10 +187,10 @@ type SessionManager struct {
 	sender   *Sender
 	proxyURL string
 
-	mu                  sync.Mutex
-	topics              map[topicKey]*topicWorker
-	pinnedUpdateLastSeen map[topicKey]time.Time // debounce: track last pinned msg update time
-	pendingContext       map[topicKey]string    // pending context to inject into next prompt
+	mu                   sync.Mutex
+	topics               map[topicKey]*topicWorker
+	pinnedUpdateLastSeen map[topicKey]time.Time         // debounce: track last pinned msg update time
+	pendingContext       map[topicKey]string            // pending context to inject into next prompt
 	activeInvocations    map[topicKey]*activeInvocation // tracks running commands for cancellation
 }
 
@@ -263,9 +287,9 @@ type contentBlockStart struct {
 
 // contentBlock represents the content block within a content_block_start event.
 type contentBlock struct {
-	Type  string       `json:"type"` // "tool_use", "text", etc.
-	Name  string       `json:"name,omitempty"`  // Tool name for tool_use blocks
-	Input toolInput    `json:"input,omitempty"` // Tool input for tool_use blocks
+	Type  string    `json:"type"`            // "tool_use", "text", etc.
+	Name  string    `json:"name,omitempty"`  // Tool name for tool_use blocks
+	Input toolInput `json:"input,omitempty"` // Tool input for tool_use blocks
 }
 
 // toolInput represents the input field of a tool_use content block.
@@ -303,12 +327,12 @@ type contentBlockStop struct {
 // toolResultDelta is a tool_result_delta event nested inside a stream_event
 // line's "event" field. It contains partial tool result data.
 type toolResultDelta struct {
-	Type     string `json:"type"` // "tool_result_delta"
+	Type      string `json:"type"` // "tool_result_delta"
 	ToolUseID string `json:"tool_use_id"`
-	Delta    struct {
-		Type     string `json:"type"` // "json", "image", etc.
-		JSON     string `json:"json,omitempty"` // Partial JSON for result type "json"
-		Image    string `json:"image,omitempty"` // Image data for result type "image"
+	Delta     struct {
+		Type  string `json:"type"`            // "json", "image", etc.
+		JSON  string `json:"json,omitempty"`  // Partial JSON for result type "json"
+		Image string `json:"image,omitempty"` // Image data for result type "image"
 	} `json:"delta"`
 }
 
@@ -316,10 +340,10 @@ type toolResultDelta struct {
 // proxyURL is the base URL of the proxy, used to download photo attachments.
 func NewSessionManager(db *DB, sender *Sender, proxyURL string) *SessionManager {
 	return &SessionManager{
-		db:                  db,
-		sender:              sender,
-		proxyURL:            proxyURL,
-		topics:              make(map[topicKey]*topicWorker),
+		db:                   db,
+		sender:               sender,
+		proxyURL:             proxyURL,
+		topics:               make(map[topicKey]*topicWorker),
 		pinnedUpdateLastSeen: make(map[topicKey]time.Time),
 		pendingContext:       make(map[topicKey]string),
 		activeInvocations:    make(map[topicKey]*activeInvocation),
@@ -383,7 +407,7 @@ func (m *SessionManager) runWorker(ctx context.Context, key topicKey, worker *to
 
 	var (
 		activeDone <-chan struct{} // closed when the active invocation goroutine exits
-		pending    []sessionMsg   // messages buffered while an invocation is running
+		pending    []sessionMsg    // messages buffered while an invocation is running
 	)
 
 	for {
@@ -727,7 +751,7 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 
 	// Check for session close intent
 	if last.update.Content != nil && last.update.Content.Text != nil {
-		detected, isPureClose := detectCloseIntent(*last.update.Content.Text)
+		detected, _ := detectCloseIntent(*last.update.Content.Text)
 		if detected {
 			if session == nil {
 				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "No active session to close.")
@@ -758,6 +782,54 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 			}
 
 			return // Pure intent - don't forward to Claude
+		}
+	}
+
+	// Check for timeout adjustment intent
+	if last.update.Content != nil && last.update.Content.Text != nil {
+		intent := detectTimeoutIntent(*last.update.Content.Text)
+		if intent.detected {
+			// Create or update session if needed
+			if session == nil {
+				session = &Session{
+					ChatID:    key.chatID,
+					ThreadID:  key.threadID,
+					CreatedAt: time.Now().UTC(),
+				}
+			}
+
+			// Update the timeout
+			session.TimeoutSec = intent.timeoutSec
+			if err := m.db.UpdateSession(ctx, session); err != nil {
+				log.Printf("[session_mgr] update session timeout: %v", err)
+			} else {
+				// Update the pinned metadata message
+				if err := m.updatePinnedMetadata(ctx, session, group); err != nil {
+					log.Printf("[session_mgr] update pinned metadata: %v", err)
+				}
+			}
+
+			// Send confirmation
+			var confirmMsg string
+			if intent.timeoutSec == 0 {
+				confirmMsg = "Timeout disabled — session will run indefinitely"
+			} else {
+				minutes := intent.timeoutSec / 60
+				if minutes > 0 && intent.timeoutSec%60 == 0 {
+					confirmMsg = fmt.Sprintf("Timeout set to %d minutes", minutes)
+				} else {
+					confirmMsg = fmt.Sprintf("Timeout set to %d seconds", intent.timeoutSec)
+				}
+			}
+			_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, confirmMsg)
+
+			// Update the text in the update for prompt building
+			if intent.remainder != "" {
+				*last.update.Content.Text = intent.remainder
+			} else {
+				// Message was only a timeout adjustment - no Claude invocation needed
+				return
+			}
 		}
 	}
 
@@ -976,9 +1048,9 @@ func (m *SessionManager) invokeClaudeAPI(
 		lastToolEdit  time.Time // separate timer for tool status updates
 		streamMsgID   int64
 		out           claudeOutput
-		activeTool    string     // name of the currently running tool
-		toolInput     string     // input for the currently running tool (truncated)
-		toolCompleted bool       // true when the current tool has completed
+		activeTool    string // name of the currently running tool
+		toolInput     string // input for the currently running tool (truncated)
+		toolCompleted bool   // true when the current tool has completed
 	)
 
 	// Determine streaming behavior based on notification mode
@@ -1259,11 +1331,11 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 
 		// Record detailed cost event for the first invocation
 		costEvent := &CostEvent{
-			ChatID:      key.chatID,
-			ThreadID:    key.threadID,
-			CostUSD:     out.TotalCostUSD,
-			Model:       resolveSessionModel(nil, group),
-			CreatedAt:   time.Now().UTC(),
+			ChatID:    key.chatID,
+			ThreadID:  key.threadID,
+			CostUSD:   out.TotalCostUSD,
+			Model:     resolveSessionModel(nil, group),
+			CreatedAt: time.Now().UTC(),
 		}
 		if out.Usage != nil {
 			costEvent.InputTokens = out.Usage.InputTokens
@@ -1300,11 +1372,11 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 
 	// Record detailed cost event
 	costEvent := &CostEvent{
-		ChatID:      key.chatID,
-		ThreadID:    key.threadID,
-		CostUSD:     out.TotalCostUSD,
-		Model:       resolveSessionModel(existing, group),
-		CreatedAt:   time.Now().UTC(),
+		ChatID:    key.chatID,
+		ThreadID:  key.threadID,
+		CostUSD:   out.TotalCostUSD,
+		Model:     resolveSessionModel(existing, group),
+		CreatedAt: time.Now().UTC(),
 	}
 	if out.Usage != nil {
 		costEvent.InputTokens = out.Usage.InputTokens
@@ -1351,8 +1423,6 @@ func (m *SessionManager) formatMetadata(session *Session, group *Group) string {
 		notifyMode)
 }
 
-
-
 // updatePinnedMetadata updates the pinned metadata message for a session.
 // Debounced to at most once per minute per session.
 func (m *SessionManager) updatePinnedMetadata(ctx context.Context, session *Session, group *Group) error {
@@ -1380,6 +1450,7 @@ func (m *SessionManager) updatePinnedMetadata(ctx context.Context, session *Sess
 	// Edit the pinned message
 	return m.sender.EditMessage(ctx, session.ChatID, session.PinnedMessageID, metadata)
 }
+
 // buildSessionPrompt constructs the prompt from a batch of messages.
 // extras maps each batch index to resolved attachment data (image path or transcription).
 // Single message: used as-is.
@@ -1745,6 +1816,123 @@ func detectCloseIntent(text string) (detected bool, isPureClose bool) {
 	}
 
 	return false, false
+}
+
+// timeoutIntent holds the result of timeout intent detection.
+type timeoutIntent struct {
+	timeoutSec int    // 0 for no timeout, positive value for specific timeout
+	remainder  string // text with the timeout phrase removed
+	detected   bool   // true if a timeout intent was found
+}
+
+// detectTimeoutIntent checks text for timeout preference phrases.
+// Returns a timeoutIntent struct with the detected timeout value and cleaned text.
+func detectTimeoutIntent(text string) timeoutIntent {
+	lower := strings.ToLower(strings.TrimSpace(text))
+
+	// Check for "no timeout" patterns first
+	for _, phrase := range timeoutNoLimitPhrases {
+		if strings.HasPrefix(lower, phrase) {
+			// Extract the remainder (case-preserving)
+			phraseIdx := strings.Index(strings.ToLower(text), phrase)
+			remainder := strings.TrimSpace(text[phraseIdx+len(phrase):])
+			return timeoutIntent{timeoutSec: 0, remainder: remainder, detected: true}
+		}
+	}
+
+	// Check for patterns with durations
+	for _, phrase := range timeoutWithDurationPhrases {
+		if !strings.HasPrefix(lower, phrase) {
+			continue
+		}
+
+		// Extract the remainder (case-preserving)
+		phraseIdx := strings.Index(strings.ToLower(text), phrase)
+		remainder := strings.TrimSpace(text[phraseIdx+len(phrase):])
+
+		// Parse the duration from the remainder
+		timeoutSec := parseDuration(remainder)
+		if timeoutSec > 0 {
+			// Remove the duration text from the remainder
+			cleaned := removeDuration(remainder)
+			return timeoutIntent{timeoutSec: timeoutSec, remainder: cleaned, detected: true}
+		}
+
+		// If duration parsing failed, this isn't a valid timeout intent
+		// Continue checking other phrases
+	}
+
+	return timeoutIntent{timeoutSec: -1, remainder: text, detected: false}
+}
+
+// parseDuration extracts a duration in seconds from text.
+// Supports patterns like "30 minutes", "1 hour", "2 hours", "90 seconds".
+// Returns the duration in seconds, or -1 if no valid duration found.
+func parseDuration(text string) int {
+	lower := strings.ToLower(strings.TrimSpace(text))
+
+	// Match: number + unit (minutes/minute/hours/hour/seconds/second)
+	// Look for the first occurrence of a number followed by a time unit
+	words := strings.Fields(lower)
+	for i := 0; i < len(words)-1; i++ {
+		// Try to parse the current word as a number
+		var amount int
+		if _, err := fmt.Sscanf(words[i], "%d", &amount); err != nil {
+			continue
+		}
+
+		// Check the next word for a time unit
+		unit := words[i+1]
+		switch {
+		case strings.HasPrefix(unit, "minute"):
+			return amount * 60
+		case strings.HasPrefix(unit, "hour"):
+			return amount * 3600
+		case strings.HasPrefix(unit, "second"):
+			return amount
+		}
+	}
+
+	return -1
+}
+
+// removeDuration removes a duration phrase from text.
+// Returns the text with the duration removed and whitespace cleaned up.
+func removeDuration(text string) string {
+	lower := strings.ToLower(strings.TrimSpace(text))
+
+	// Match: number + unit (minutes/minute/hours/hour/seconds/second)
+	words := strings.Fields(lower)
+	if len(words) < 2 {
+		return text
+	}
+
+	for i := 0; i < len(words)-1; i++ {
+		// Try to parse the current word as a number
+		var amount int
+		if _, err := fmt.Sscanf(words[i], "%d", &amount); err != nil {
+			continue
+		}
+
+		// Check the next word for a time unit
+		unit := words[i+1]
+		if strings.HasPrefix(unit, "minute") || strings.HasPrefix(unit, "hour") || strings.HasPrefix(unit, "second") {
+			// Found a duration - remove it from the original text
+			// Find the position of this duration in the original text
+			originalWords := strings.Fields(text)
+			if i < len(originalWords)-1 {
+				// Reconstruct text without the duration words
+				var result []string
+				result = append(result, originalWords[:i]...)
+				if i+2 < len(originalWords) {
+					result = append(result, originalWords[i+2:]...)
+				}
+				return strings.TrimSpace(strings.Join(result, " "))
+			}
+		}
+	}
+
+	return text
 }
 
 // updateTopicColor updates both the database and the Telegram topic icon color.
