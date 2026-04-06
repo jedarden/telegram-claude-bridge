@@ -2,10 +2,21 @@
 
 ## Overview
 
-A two-component system that bridges Telegram group conversations to headless Claude Code CLI sessions. A lightweight proxy on ardenone-cluster isolates the Telegram bot token. A bridge script on Hetzner EX44 handles all routing, session management, media processing, and Claude Code orchestration. Telegram forum topics provide per-conversation granularity.
+A two-component system where the bridge acts as a **dispatcher** — routing Telegram conversations to headless Claude Code CLI instances and coordinating their results back to the thread. The bridge is not a pipe; it is an orchestrator of Claude processes.
+
+Each Telegram forum topic maps to an **orchestrator** Claude session: a persistent, resumed `claude -p` process that understands the user's intent, delegates parallelisable sub-tasks to **worker** instances, and synthesises responses. Workers are short-lived, fresh-session Claude processes spawned by the orchestrator and managed by the bridge. The bridge routes worker results back to both the Telegram thread and the orchestrator's context.
+
+A lightweight proxy on ardenone-cluster isolates the Telegram bot token. The bridge on Hetzner EX44 handles all dispatch logic, session management, worker lifecycle, media processing, and state persistence.
 
 ```
-Telegram API  <--token-->  Proxy Pod (ardenone-cluster)  <--Tailscale-->  Bridge (EX44)  -->  Claude Code CLI
+Telegram API  <--token-->  Proxy (ardenone-cluster)  <--Tailscale-->  Bridge (EX44) [dispatcher]
+                                                                              │
+                                                             ┌────────────────┴────────────────┐
+                                                             │                                 │
+                                                      Orchestrator Claude              Worker Claude(s)
+                                                      (resumed session)                (fresh sessions)
+                                                      understands + delegates          execute sub-tasks
+                                                      synthesises + responds           report results back
 ```
 
 ---
@@ -157,7 +168,7 @@ Fallback: Kubernetes Secret object referenced via `secretKeyRef` in the Deployme
 
 ### Purpose
 
-All intelligence lives here: routing, session management, media processing, Claude Code orchestration, state persistence, and response formatting.
+The bridge is the dispatcher and message bus. It routes Telegram messages to the correct orchestrator session, intercepts synthetic tool calls from the orchestrator stream (`spawn_worker`, `update_progress`) to manage worker lifecycles, routes worker results back to the thread and to the orchestrator's context, and handles all state, media, and formatting. No Claude logic runs in the bridge itself — it only manages processes and routes data.
 
 ### Technology
 
@@ -171,37 +182,41 @@ All intelligence lives here: routing, session management, media processing, Clau
 ### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Bridge (EX44)                          │
-│                                                             │
-│  ┌──────────┐  ┌──────────────┐  ┌───────────────────────┐ │
-│  │  Poller   │→│   Router     │→│   Session Manager      │ │
-│  │          │  │              │  │                        │ │
-│  │ GET      │  │ (chat_id,   │  │ claude -p (headless)   │ │
-│  │ /updates │  │  thread_id) │  │ --resume session_id    │ │
-│  │          │  │  → handler  │  │ --cwd project_dir      │ │
-│  └──────────┘  └──────────────┘  └───────────────────────┘ │
-│                       │                      │              │
-│                       ▼                      ▼              │
-│              ┌──────────────┐      ┌──────────────────┐     │
-│              │  Command     │      │  Response         │     │
-│              │  Handler     │      │  Formatter        │     │
-│              │              │      │                   │     │
-│              │  /status     │      │  Markdown → HTML  │     │
-│              │  /cwd        │      │  Chunk splitting  │     │
-│              │  /new        │      │  Stream editing   │     │
-│              │  /close      │      │  Media responses  │     │
-│              └──────────────┘      └──────────────────┘     │
-│                                            │                │
-│  ┌──────────────┐  ┌──────────────┐        ▼                │
-│  │  Media       │  │  State       │  ┌──────────────┐       │
-│  │  Processor   │  │  (SQLite)    │  │  Sender      │       │
-│  │              │  │              │  │              │       │
-│  │  Whisper     │  │  sessions    │  │ POST /send   │       │
-│  │  ffmpeg      │  │  groups      │  │ POST /edit   │       │
-│  │  image resize│  │  users       │  │ POST /send_* │       │
-│  └──────────────┘  └──────────────┘  └──────────────┘       │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                          Bridge (EX44) — Dispatcher                  │
+│                                                                      │
+│  ┌──────────┐  ┌──────────────┐  ┌─────────────────────────────────┐ │
+│  │  Poller   │→│   Router     │→│         Session Manager          │ │
+│  │ /updates  │  │ chat/thread  │  │                                 │ │
+│  └──────────┘  └──────────────┘  │  TopicWorker (per topic)        │ │
+│                                  │  ├─ startInvocation() goroutine  │ │
+│                                  │  │    Orchestrator claude -p     │ │
+│                                  │  │    --resume session_id        │ │
+│                                  │  │    --append-system-prompt     │ │
+│                                  │  │    streams NDJSON             │ │
+│                                  │  │                               │ │
+│                                  │  │  Intercepts synthetic tools:  │ │
+│                                  │  │  ├─ spawn_worker → WorkerPool │ │
+│                                  │  │  └─ update_progress → Sender  │ │
+│                                  │  │                               │ │
+│                                  │  └─ WorkerPool                   │ │
+│                                  │       Worker goroutine(s)        │ │
+│                                  │       claude -p (fresh session)  │ │
+│                                  │       result → thread + context  │ │
+│                                  └─────────────────────────────────┘ │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────────────────────────────────────┐  │
+│  │  Command     │  │  State (SQLite)                              │  │
+│  │  Handler     │  │  groups · sessions · workers · cost_events   │  │
+│  │  /new /close │  └──────────────────────────────────────────────┘  │
+│  │  /model etc  │                                                    │
+│  └──────────────┘  ┌──────────────┐  ┌──────────────┐               │
+│                    │  Media       │  │  Sender       │               │
+│                    │  Processor   │  │  POST /send   │               │
+│                    │  Whisper     │  │  POST /edit   │               │
+│                    │  ffmpeg      │  │  POST /send_* │               │
+│                    └──────────────┘  └──────────────┘               │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Module Breakdown
@@ -240,78 +255,95 @@ Looks up `(chat_id, thread_id)` in the SQLite routing table:
 
 #### 3. Session Manager
 
-Manages Claude Code sessions via the headless CLI (`claude -p`).
+The Session Manager implements the dispatcher pattern. It manages two categories of Claude CLI process per topic:
 
-Each prompt is a subprocess invocation:
+**Orchestrator** — the long-lived, resumed session for a topic. Understands user intent, decides what to delegate, posts progress updates, and synthesises the final response. One active orchestrator per topic at a time.
+
+**Worker** — a short-lived, fresh-session process dispatched by the orchestrator via the `spawn_worker` synthetic tool. Executes one concrete sub-task (research, code generation, analysis, etc.). Multiple workers can run in parallel. Results are posted to the thread immediately and injected back into the orchestrator's context on the next invocation.
+
+**Orchestrator invocation:**
 
 ```
-claude -p "<prompt>" \
+claude -p \
   --output-format stream-json \
+  --verbose \
+  --dangerously-skip-permissions \
   --resume <session_id> \
+  --model <topic_model> \
   --cwd <project_dir> \
-  --permission-mode plan \
-  --max-budget-usd 5.0
+  --append-system-prompt "<dispatcher context>" \
+  [--allowed-tools ...] [--disallowed-tools ...]
 ```
 
-Key CLI flags:
-- `-p` — print mode, single request, exits after response
-- `--output-format stream-json` — NDJSON streaming for progressive Telegram updates
-- `--output-format json` — single JSON response with `result`, `session_id`, `is_error`, `duration_ms`, `total_cost_usd`
-- `--resume <session_id>` — continue an existing conversation
-- `--cwd <dir>` — working directory (project root)
-- `--permission-mode plan` — Claude proposes changes before executing
-- `--max-budget-usd` — spending cap per invocation
-- `--max-turns` — limit autonomous tool loops
-- `--model` — override model per session
-- `--append-system-prompt` — inject session context (topic name, group info)
-- `--allowedTools` / `--disallowedTools` — restrict tool access per group
-
-**Stream-json output** is NDJSON (one JSON object per line). Key event types:
-- `{"type": "system", ...}` — init, session info
-- `{"type": "assistant", ...}` — complete assistant messages with TextBlock/ToolUseBlock content
-- `{"type": "result", ...}` — final metadata: `result`, `session_id`, `is_error`, `duration_ms`, `total_cost_usd`, `usage`
-
-For streaming text deltas, add `--include-partial-messages`. This emits `stream_event` objects containing `content_block_delta` with `text_delta` — used for progressive Telegram message editing.
-
-**Capturing session_id on first invocation:**
+**Worker invocation (spawned by bridge on spawn_worker tool call):**
 
 ```
-claude -p "prompt" --output-format json --cwd /project | jq -r '.session_id'
+claude -p \
+  --output-format stream-json \
+  --verbose \
+  --dangerously-skip-permissions \
+  --model <worker_model_or_default> \
+  --cwd <project_dir> \
+  --disallowed-tools spawn_worker
 ```
 
-The bridge stores this in SQLite and passes `--resume <session_id>` on all subsequent invocations for that topic.
+Workers do not get `--resume` (fresh session each time) and cannot call `spawn_worker` (depth limit = 1).
 
-**Prompt input via stdin** (preferred — avoids shell injection from user text):
+**Key CLI flags:**
+- `-p` — print mode, exits after one response
+- `--output-format stream-json` — NDJSON streaming for live Telegram edits
+- `--resume <session_id>` — orchestrator only; restores full conversation context
+- `--append-system-prompt` — injects dispatcher context into orchestrator (see Phase 9)
+- `--disallowed-tools spawn_worker` — workers cannot recursively spawn
+- `--model` — per-session or per-worker model override
+- `--allowed-tools` / `--disallowed-tools` — tool restrictions per group
 
-```go
-cmd := exec.CommandContext(ctx, "claude", "-p",
-    "--output-format", "stream-json",
-    "--resume", sessionID,
-    "--cwd", projectDir,
-    "--permission-mode", "plan",
-)
-cmd.Stdin = strings.NewReader(prompt)
+**Synthetic tools intercepted by the bridge** (not real Anthropic tools — described via system prompt):
 
-stdout, _ := cmd.StdoutPipe()
-cmd.Start()
+| Tool | Bridge action |
+|---|---|
+| `spawn_worker(prompt, model?)` | Insert workers row, spawn goroutine, return `{worker_id, status: "dispatched"}` immediately |
+| `update_progress(message)` | POST message to thread, return `{ok: true}` immediately |
 
-scanner := bufio.NewScanner(stdout)
-for scanner.Scan() {
-    var event StreamEvent
-    json.Unmarshal(scanner.Bytes(), &event)
-    // stream to Telegram via edit-in-place
-}
-cmd.Wait()
+The scanner loop in `invokeClaudeAPI` intercepts `tool_use` blocks with these names before they reach the `result` event, handles them synchronously (DB write + goroutine spawn), and writes the `tool_result` back to the subprocess stdin so the orchestrator continues without stalling.
+
+**Stream-json NDJSON event types handled:**
+- `system` — capture `session_id` early
+- `stream_event` → `content_block_delta` → `text_delta` — progressive text streaming to Telegram
+- `stream_event` → `content_block_start` → `tool_use` — intercept synthetic tools; display tool name as progress notification for real tools
+- `result` — final metadata: `session_id`, `result`, `is_error`, `total_cost_usd`, `usage`
+
+**Worker goroutine on completion:**
+1. Update `workers` row: `status=done`, `result=...`, `finished_at=now`
+2. Post to thread: `⚙️ Worker [N] done: <truncated result>`
+3. Append to `SessionManager.pendingWorkerResults[(chatID,threadID)]`
+
+**Next orchestrator prompt construction:**
+```
+[Worker results available]
+Worker 1 (<model>): <result>
+Worker 2 (<model>): error — <error>
+
+[User message]
+<user text>
 ```
 
-**Session lifecycle:**
-- **Create:** On first message to a new topic. Invoke `claude -p` without `--resume`. Parse `session_id` from the JSON/stream-json output. Store in SQLite.
-- **Resume:** On subsequent messages. Invoke `claude -p --resume <session_id>`. Claude Code restores full conversation context.
-- **Destroy:** On topic close/delete or `/close` command. Remove from SQLite routing table. The Claude Code session files persist on disk (~/.claude/) but are no longer routed to.
+The `pendingWorkerResults` map is drained atomically at the start of each `processBatch`.
 
-**Concurrency:** One active subprocess per topic. Messages arriving while Claude is processing are queued per-topic and batched into the next prompt. This prevents race conditions and preserves message ordering.
+**Orchestrator session lifecycle:**
+- **Create:** First message to a new topic — `claude -p` without `--resume`, capture `session_id`, store in SQLite
+- **Resume:** All subsequent messages — `claude -p --resume <session_id>`
+- **Close:** `/close`, topic deletion, or natural language close intent — mark `status=closed` in SQLite
 
-**Timeouts:** 5-minute default per prompt. The subprocess is killed after the timeout. Configurable via `/timeout` command. On timeout, send error message to the topic and leave the session intact for retry.
+**Concurrency model:**
+- One orchestrator goroutine per topic (non-blocking worker, messages buffer in `pending` slice)
+- N worker goroutines per topic (parallel, bounded by `groups.max_workers`)
+- Workers post to thread and inject context independently of the orchestrator
+
+**Timeout:**
+- Orchestrator: `groups.timeout_sec` (default 1800s), `0` = no deadline
+- Workers: inherit group default; can be overridden per `spawn_worker` call
+- Bridge-side progress ticker fires every `groups.progress_interval_sec` (default 120s) if no output sent
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -821,31 +853,13 @@ The dashboard is optional — the bridge functions identically without it. It's 
 
 **Deliverable:** Real-time terminal dashboard for monitoring bridge activity, session state, and costs.
 
-## Phase 7: Long-Running Process Support
+## Phase 7: Foundational Infrastructure for Dispatcher
 
 ### Purpose
 
-Transform the bridge from a single-blocking-invocation model into a multi-instance orchestrator. A topic can spawn multiple parallel headless Claude CLI instances — each completing an independent sub-task — with results routed back to the originating topic as they arrive. This unlocks complex agentic work (deep research, parallel code analysis, long builds) that exceeds the current 5-minute synchronous timeout.
+Prerequisite pieces that the Phase 9 dispatcher architecture depends on. The bridge must support long-running invocations, cancellation, and non-blocking operation before the orchestrator/worker model can work reliably. Phases 7 and 9 are designed together — Phase 7 is the infrastructure layer, Phase 9 is the dispatch layer built on top of it.
 
-### Architecture
-
-```
-TopicWorker (per topic)
-    │
-    ├── [current] single blocking claude -p call → response
-    │
-    └── [Phase 7] SubtaskOrchestrator
-            │
-            ├── Sub-task goroutine 1: claude -p "analyze X"  ──┐
-            ├── Sub-task goroutine 2: claude -p "check Y"    ──┤→ fan-in → post results to topic
-            └── Sub-task goroutine 3: claude -p "search Z"  ──┘
-```
-
-Each sub-task:
-- Is its own `exec.Cmd` (`claude -p --resume <session_id>` or fresh session)
-- Runs in a separate goroutine
-- Posts its result to the originating `(chatID, threadID)` when complete
-- Is tracked in SQLite for status visibility
+**Status of 7.1–7.2:** Implemented. Non-blocking worker (background goroutine per invocation), timeout raised to 1800s, `timeout_sec=0` for no deadline, subprocess context decoupled from Telegram send context.
 
 ### 7.1 — In-flight cancellation
 
@@ -1058,6 +1072,163 @@ CREATE TABLE background_jobs (
 ```
 
 **Deliverable:** Bridge supports long-running agentic tasks via cancellation, higher timeouts, tool-use visibility, parallel sub-task dispatch, and background shell jobs — all routing output back to the originating topic.
+
+---
+
+## Phase 9: Dispatcher Architecture
+
+### Purpose
+
+The bridge is primarily a **dispatcher**, not a pipe. Each topic's Claude session is an **orchestrator** — it understands the user's request, delegates parallelisable sub-tasks to **worker** Claude instances, and responds to the user with progress updates and final synthesis. The bridge is the message bus that routes user messages to the orchestrator, worker spawn requests from the orchestrator to new subprocesses, and worker results back to both the orchestrator context and the Telegram thread.
+
+### Target architecture
+
+```
+User message
+    │
+    ▼
+Bridge (dispatcher)
+    │  ──── dispatches to ────►  Orchestrator Claude (-p --resume session_id)
+    │                                │  understands request
+    │                                │  posts "Starting X workers..." to thread
+    │                                │  calls spawn_worker tool N times
+    │                                ▼
+    │         ┌──────────────────────────────────────┐
+    │         │  Worker pool (bridge-managed)         │
+    │         │  Worker 1: claude -p (fresh session)  │
+    │         │  Worker 2: claude -p (fresh session)  │
+    │         │  Worker N: claude -p (fresh session)  │
+    │         └──────────────────────────────────────┘
+    │                                │
+    │         worker completes       │
+    │         ├─── post result to Telegram thread
+    │         └─── inject result as tool_result into orchestrator stdin
+    │                                │
+    │                         Orchestrator synthesises
+    │                         posts final response to thread
+    ▼
+Thread receives: progress updates + individual worker results + final synthesis
+```
+
+### Orchestrator vs worker
+
+| | Orchestrator | Worker |
+|---|---|---|
+| Session | Persisted (`--resume session_id`) | Fresh per invocation (no `--resume`) |
+| Purpose | Understand, delegate, synthesise, respond to user | Execute one concrete sub-task |
+| Model | Configured per topic (default sonnet) | Inherits from orchestrator, or overridden per spawn |
+| Result routing | Posts synthesis to thread | Result posted to thread + injected back to orchestrator |
+| Spawning | Calls `spawn_worker` tool | Cannot spawn further workers (depth limit 1) |
+
+### 9.1 — Orchestrator system prompt injection
+
+The bridge appends a system prompt to every orchestrator invocation (`--append-system-prompt`) that makes the dispatcher pattern explicit to Claude:
+
+```
+You are running as an orchestrator in a Telegram Claude Bridge.
+You have access to two bridge-provided tools:
+
+spawn_worker(prompt, model?)
+  Dispatches a new headless Claude instance to execute `prompt` independently.
+  Returns {worker_id}. The worker result will be delivered to you as a tool_result
+  and also posted directly to the Telegram thread.
+
+update_progress(message)
+  Posts a status message to the Telegram thread immediately.
+  Use this to keep the user informed during long-running work.
+  Returns {ok: true}.
+
+Guidelines:
+- Use spawn_worker to parallelise independent sub-tasks (research, analysis, code review, etc.)
+- Use update_progress when more than ~30 seconds have passed without user-visible output.
+- Synthesise worker results into a final response rather than forwarding raw outputs.
+- You do not need to spawn workers for simple, fast requests.
+```
+
+This is injected via `--append-system-prompt` when `groups.dispatcher_mode = true` (default on, opt-out per group).
+
+### 9.2 — `spawn_worker` synthetic tool
+
+The bridge intercepts `tool_use` blocks with `name="spawn_worker"` from the orchestrator's stream before forwarding them to Claude as `tool_result`. No actual Anthropic tool definition needed — the system prompt description is sufficient for Claude to call it.
+
+**Bridge handling:**
+1. Parse `tool_use` block: `{name: "spawn_worker", input: {prompt, model?}}`
+2. Insert row into `workers` table (`status=running`)
+3. Spawn goroutine: fresh `claude -p` subprocess with the given prompt, inherit CWD, use specified model or orchestrator default
+4. Return `tool_result` immediately: `{worker_id: "uuid", status: "dispatched"}` — orchestrator continues without waiting
+5. Worker goroutine on completion:
+   - Updates `workers` row to `status=done`
+   - Posts worker result to Telegram thread: `⚙️ Worker [N] complete: <truncated result>`
+   - Writes worker result into a pending-injection buffer for the orchestrator
+6. Next time the orchestrator's `claude -p` subprocess exits and a new invocation begins (user sends follow-up, or orchestrator posts an update_progress that triggers re-entry), the worker results are injected as additional context into the new prompt
+
+**Schema:**
+```sql
+CREATE TABLE workers (
+    id            TEXT PRIMARY KEY,
+    chat_id       INTEGER NOT NULL,
+    thread_id     INTEGER NOT NULL,
+    parent_msg    INTEGER,
+    prompt        TEXT NOT NULL,
+    session_id    TEXT,
+    model         TEXT,
+    status        TEXT NOT NULL DEFAULT 'running',
+    result        TEXT,
+    error         TEXT,
+    started_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at   TEXT
+);
+
+ALTER TABLE groups ADD COLUMN dispatcher_mode INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE groups ADD COLUMN max_workers INTEGER NOT NULL DEFAULT 5;
+```
+
+### 9.3 — `update_progress` synthetic tool
+
+The bridge intercepts `tool_use` blocks with `name="update_progress"` and posts the message immediately to the Telegram thread without invoking any subprocess.
+
+**Bridge handling:**
+1. Parse: `{name: "update_progress", input: {message}}`
+2. Send `message` to the Telegram thread (new message, not an edit of the placeholder)
+3. Return `tool_result`: `{ok: true}` — orchestrator continues immediately
+
+This costs ~0ms and lets the orchestrator drive its own update cadence rather than relying on bridge-side timers.
+
+### 9.4 — Bridge-side progress ticker
+
+Independent of `update_progress` calls, the bridge posts a heartbeat to the thread when a long invocation is running with no output:
+
+- If no Telegram message has been sent for `progress_interval` seconds (default 120s), post: `⏳ Still working… (Xm elapsed)`
+- Reset timer on every `flushEdit` or `update_progress` call
+- Configurable per group via `groups.progress_interval_sec` (0 = disabled)
+
+This is a safety net for invocations where Claude never calls `update_progress`.
+
+**Schema:**
+```sql
+ALTER TABLE groups ADD COLUMN progress_interval_sec INTEGER NOT NULL DEFAULT 120;
+```
+
+### 9.5 — Worker result injection on next prompt
+
+When the user sends a follow-up message while workers are still running (or just completed), the bridge prepends the worker results to the new prompt before sending to the orchestrator:
+
+```
+[Worker results from previous invocation]
+Worker 1 (analyze X): <result>
+Worker 2 (check Y): <result>
+
+[User message]
+<user message text>
+```
+
+Workers complete asynchronously — results accumulate in `pendingWorkerResults` map keyed by `(chatID, threadID)`. The next `processBatch` drains and prepends them. This closes the loop: the orchestrator always has access to worker outputs without needing to poll.
+
+### 9.6 — Per-topic dispatcher opt-out
+
+Some topics should remain in direct mode (no system prompt injection, no worker spawning). Add `/dispatch [on|off]` command to toggle `sessions.dispatcher_mode` per topic, overriding the group default.
+
+**Deliverable:** Bridge is a true dispatcher. Orchestrator Claude instances coordinate worker instances. User sees real-time progress updates and individual worker results as they complete, followed by a synthesised final response.
 
 ---
 
