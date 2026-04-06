@@ -33,6 +33,7 @@ User commands:
 /sessions — list all sessions across all groups
 /close <thread_id> — close a session by topic thread_id
 /cancel [thread_id] — cancel the running request in this topic or another topic
+	/timeout [N] — set per-topic timeout in seconds (0 = no limit)
 /cost — show cost information for this group or topic
 /ping — check proxy latency
 /version — show version information
@@ -167,6 +168,8 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply, err = h.cmdContext(ctx, update, group, args)
 	case "/cancel":
 		reply, err = h.cmdCancel(ctx, update, group, args)
+	case "/timeout":
+			reply, err = h.cmdTimeout(ctx, update, group, args)
 	default:
 		reply = fmt.Sprintf("Unknown command: %s\n\nUse /help for available commands.", cmd)
 	}
@@ -1554,6 +1557,55 @@ func (h *CommandHandler) cmdCancel(ctx context.Context, update contract.Update, 
 	}
 
 	return fmt.Sprintf("Request cancelled for thread %d.", threadID), nil
+}
+
+// cmdTimeout handles /timeout [N] — sets the per-topic timeout in seconds.
+// 0 means no timeout (run indefinitely). Without args, shows current timeout.
+func (h *CommandHandler) cmdTimeout(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	if update.ThreadID == nil {
+		return "Timeout commands only work within a topic session. Use /new to create a topic first.", nil
+	}
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+
+	// Get the current session
+	session, err := h.db.GetSession(ctx, update.ChatID, *update.ThreadID)
+	if err != nil {
+		return "", fmt.Errorf("get session: %w", err)
+	}
+	if session == nil {
+		return "No session found for this topic.", nil
+	}
+
+	// If no args, show current timeout
+	if args == "" {
+		currentTimeout := session.TimeoutSec
+		if currentTimeout == 0 {
+			return fmt.Sprintf("Topic timeout: no limit (using group default of %d seconds)", group.TimeoutSec), nil
+		}
+		return fmt.Sprintf("Topic timeout: %d seconds", currentTimeout), nil
+	}
+
+	// Parse and validate the new timeout
+	args = strings.TrimSpace(args)
+	newTimeout, err := strconv.Atoi(args)
+	if err != nil {
+		return fmt.Sprintf("Invalid timeout %q. Use a number of seconds, or 0 for no limit.", args), nil
+	}
+	if newTimeout < 0 {
+		return "Timeout cannot be negative.", nil
+	}
+
+	session.TimeoutSec = newTimeout
+	if err := h.db.UpdateSession(ctx, session); err != nil {
+		return "", fmt.Errorf("update session timeout: %w", err)
+	}
+
+	if newTimeout == 0 {
+		return "Topic timeout disabled (using group default)", nil
+	}
+	return fmt.Sprintf("Topic timeout set to: %d seconds", newTimeout), nil
 }
 
 	// GenerateSessionSummary generates a summary for a session using Haiku.

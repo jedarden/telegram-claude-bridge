@@ -512,9 +512,12 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		}
 	}
 
-	timeoutSec := group.TimeoutSec
-	if timeoutSec < noTimeout {
-		timeoutSec = defaultSessionTimeout
+	// Resolve timeout: session override -> group timeout -> default
+	timeoutSec := defaultSessionTimeout
+	if session != nil && session.TimeoutSec > noTimeout {
+		timeoutSec = session.TimeoutSec
+	} else if group.TimeoutSec > noTimeout {
+		timeoutSec = group.TimeoutSec
 	}
 
 	// callCtx governs the claude subprocess lifetime.
