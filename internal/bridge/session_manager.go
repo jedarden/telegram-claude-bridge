@@ -183,13 +183,44 @@ var modelChangePhrases = []modelChangePhrase{
 	{"use haiku", "claude-haiku-4-5", 0},
 	{"switch to haiku", "claude-haiku-4-5", 0},
 
+	// Direct to best model (opus)
+	{"use the best model", "claude-opus-4-6", 0},
+	{"use your best", "claude-opus-4-6", 0},
+	{"maximum intelligence", "claude-opus-4-6", 0},
+
+	// Direct to fastest model (haiku)
+	{"use the fastest model", "claude-haiku-4-5", 0},
+	{"use the cheapest", "claude-haiku-4-5", 0},
+	{"speed mode", "claude-haiku-4-5", 0},
+
+	// Reset to default (special marker)
+	{"back to default", "__reset__", 0},
+	{"reset model", "__reset__", 0},
+	{"use default model", "__reset__", 0},
+
 	// Tier escalation
 	{"think harder", "", 1},
 	{"this needs more power", "", 1},
+	{"more powerful model", "", 1},
+	{"stronger model", "", 1},
+	{"smarter model", "", 1},
 
 	// Tier de-escalation
 	{"quick answer", "", -1},
 	{"keep it simple", "", -1},
+	{"faster model", "", -1},
+	{"lighter model", "", -1},
+	{"cheaper model", "", -1},
+	{"simpler model", "", -1},
+}
+
+// modelQueryPhrases is a table of known model query phrases.
+// These trigger a response with the current model without invoking Claude.
+// Checked case-insensitively; first match wins.
+var modelQueryPhrases = []string{
+	"what model are you using",
+	"which model",
+	"current model",
 }
 
 // SessionManager manages per-topic Claude Code subprocess sessions.
@@ -638,15 +669,100 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	// Check for natural language model change requests in the latest message.
 	currentModel := resolveSessionModel(session, group)
 	if last.update.Content != nil && last.update.Content.Text != nil {
+		// Check for model query intent first (pure query, no Claude invocation)
+		if detectModelQueryIntent(*last.update.Content.Text) {
+			// Determine if it's a topic override or group default
+			var modelType string
+			if session != nil && session.Model != "" {
+				modelType = fmt.Sprintf("%s (topic override)", currentModel)
+			} else {
+				modelType = fmt.Sprintf("%s (group default)", currentModel)
+			}
+			reply := fmt.Sprintf("Currently using: %s", modelType)
+			_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, reply)
+			return // Pure query intent - don't forward to Claude
+		}
+
 		newModel, cleanedText, tierDelta := detectModelChange(*last.update.Content.Text)
 		if newModel != "" || tierDelta != 0 {
 			var targetModel string
 			var changeMsg string
 
-			if newModel != "" {
+			if newModel == "__reset__" {
+				// Reset to group default - clear session model
+				targetModel = "" // Empty means use group default
+
+				// Update the session model (set to NULL/empty)
+				if session == nil {
+					// Create a placeholder session for the model update
+					session = &Session{
+						ChatID:    key.chatID,
+						ThreadID:  key.threadID,
+						Model:     "", // Empty to use group default
+						CreatedAt: time.Now().UTC(),
+					}
+				} else {
+					session.Model = ""
+				}
+				if err := m.db.UpdateSession(ctx, session); err != nil {
+					log.Printf("[session_mgr] update session model: %v", err)
+				} else {
+					// Update the pinned metadata message
+					if err := m.updatePinnedMetadata(ctx, session, group); err != nil {
+						log.Printf("[session_mgr] update pinned metadata: %v", err)
+					}
+				}
+
+				// Send confirmation with the group default model
+				defaultModel := resolveSessionModel(nil, group)
+				changeMsg = fmt.Sprintf("Model reset to group default: %s", defaultModel)
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, changeMsg)
+
+				// Update the text in the update for prompt building
+				if cleanedText != "" {
+					*last.update.Content.Text = cleanedText
+				} else {
+					// Message was only a model reset request - no Claude invocation needed
+					return
+				}
+			} else if newModel != "" {
 				// Direct model switch
 				targetModel = newModel
 				changeMsg = fmt.Sprintf("Model switched to: %s", targetModel)
+
+				if targetModel != currentModel {
+					// Update the session model
+					if session == nil {
+						// Create a placeholder session for the model update
+						session = &Session{
+							ChatID:    key.chatID,
+							ThreadID:  key.threadID,
+							Model:     targetModel,
+							CreatedAt: time.Now().UTC(),
+						}
+					} else {
+						session.Model = targetModel
+					}
+					if err := m.db.UpdateSession(ctx, session); err != nil {
+						log.Printf("[session_mgr] update session model: %v", err)
+					} else {
+						// Update the pinned metadata message
+						if err := m.updatePinnedMetadata(ctx, session, group); err != nil {
+							log.Printf("[session_mgr] update pinned metadata: %v", err)
+						}
+					}
+
+					// Send confirmation
+					_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, changeMsg)
+				}
+
+				// Update the text in the update for prompt building
+				if cleanedText != "" {
+					*last.update.Content.Text = cleanedText
+				} else {
+					// Message was only a model change request - no Claude invocation needed
+					return
+				}
 			} else {
 				// Tier escalation/de-escalation
 				var changed bool
@@ -658,41 +774,39 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 					// Continue with original text
 				} else {
 					changeMsg = fmt.Sprintf("Model switched to: %s", targetModel)
-				}
-			}
 
-			if targetModel != currentModel {
-				// Update the session model
-				if session == nil {
-					// Create a placeholder session for the model update
-					session = &Session{
-						ChatID:    key.chatID,
-						ThreadID:  key.threadID,
-						Model:     targetModel,
-						CreatedAt: time.Now().UTC(),
+					// Update the session model
+					if session == nil {
+						// Create a placeholder session for the model update
+						session = &Session{
+							ChatID:    key.chatID,
+							ThreadID:  key.threadID,
+							Model:     targetModel,
+							CreatedAt: time.Now().UTC(),
+						}
+					} else {
+						session.Model = targetModel
 					}
-				} else {
-					session.Model = targetModel
-				}
-				if err := m.db.UpdateSession(ctx, session); err != nil {
-					log.Printf("[session_mgr] update session model: %v", err)
-				} else {
-					// Update the pinned metadata message
-					if err := m.updatePinnedMetadata(ctx, session, group); err != nil {
-						log.Printf("[session_mgr] update pinned metadata: %v", err)
+					if err := m.db.UpdateSession(ctx, session); err != nil {
+						log.Printf("[session_mgr] update session model: %v", err)
+					} else {
+						// Update the pinned metadata message
+						if err := m.updatePinnedMetadata(ctx, session, group); err != nil {
+							log.Printf("[session_mgr] update pinned metadata: %v", err)
+						}
 					}
+
+					// Send confirmation
+					_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, changeMsg)
 				}
 
-				// Send confirmation
-				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, changeMsg)
-			}
-
-			// Update the text in the update for prompt building
-			if cleanedText != "" {
-				*last.update.Content.Text = cleanedText
-			} else {
-				// Message was only a model change request - no Claude invocation needed
-				return
+				// Update the text in the update for prompt building
+				if cleanedText != "" {
+					*last.update.Content.Text = cleanedText
+				} else {
+					// Message was only a model change request - no Claude invocation needed
+					return
+				}
 			}
 		}
 	}
@@ -1713,6 +1827,25 @@ func detectCancelIntent(text string) (isCancelOnly bool, remainder string) {
 		}
 	}
 	return false, ""
+}
+
+// detectModelQueryIntent checks text for model query phrases.
+// Returns true if a model query intent is detected.
+func detectModelQueryIntent(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	for _, phrase := range modelQueryPhrases {
+		if strings.HasPrefix(lower, phrase) {
+			// Check if there's substantial text beyond the phrase
+			remainder := strings.TrimSpace(lower[len(phrase):])
+			// If remainder is empty or just punctuation/very short, treat as pure query
+			if len(remainder) <= 10 {
+				return true
+			}
+			// Otherwise, let Claude answer the question
+			return false
+		}
+	}
+	return false
 }
 
 // detectModelChange checks text for model-change phrases and returns the new model
