@@ -50,11 +50,43 @@ type modelChangePhrase struct {
 	tierDelta   int // positive for escalation, negative for de-escalation
 }
 
+// notifyIntent maps natural language phrases to notification modes.
+type notifyIntent struct {
+	phrase string
+	mode   string
+}
+
 // cancelPhrases is a table of known cancel/abort phrases.
 // Checked case-insensitively; first match wins.
 var cancelPhrases = []string{
 	"cancel", "stop", "abort", "never mind", "nevermind", "forget it",
 	"stop that", "kill it", "stop what you are doing", "stop what youre doing",
+}
+
+// notifyPhrases is a table of known notification mode phrases.
+// Checked case-insensitively; first match wins.
+var notifyPhrases = []notifyIntent{
+	// Phrases that map to "summary" mode
+	{"quiet", "summary"},
+	{"silent", "summary"},
+	{"just tell me when done", "summary"},
+	{"notify me when complete", "summary"},
+	{"let me know when finished", "summary"},
+	{"ill check back", "summary"},
+	{"i'll check back", "summary"},
+
+	// Phrases that map to "quiet" mode
+	{"be quiet", "quiet"},
+	{"no updates", "quiet"},
+	{"dont show progress", "quiet"},
+	{"don't show progress", "quiet"},
+
+	// Phrases that map to "live" mode
+	{"show everything", "live"},
+	{"stream everything", "live"},
+	{"show me as you go", "live"},
+	{"live updates", "live"},
+	{"keep me posted", "live"},
 }
 
 // modelChangePhrases is a table of known model-change phrases.
@@ -577,6 +609,44 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 				*last.update.Content.Text = cleanedText
 			} else {
 				// Message was only a model change request - no Claude invocation needed
+				return
+			}
+		}
+	}
+
+	// Check for natural language notification mode requests in the latest message.
+	if last.update.Content != nil && last.update.Content.Text != nil {
+		newMode, cleanedText := detectNotifyIntent(*last.update.Content.Text)
+		if newMode != "" {
+			// Create or update session if needed
+			if session == nil {
+				session = &Session{
+					ChatID:    key.chatID,
+					ThreadID:  key.threadID,
+					CreatedAt: time.Now().UTC(),
+				}
+			}
+
+			// Update the notification mode
+			session.NotificationMode = newMode
+			if err := m.db.UpdateSession(ctx, session); err != nil {
+				log.Printf("[session_mgr] update session notification mode: %v", err)
+			} else {
+				// Update the pinned metadata message
+				if err := m.updatePinnedMetadata(ctx, session, group); err != nil {
+					log.Printf("[session_mgr] update pinned metadata: %v", err)
+				}
+			}
+
+			// Send confirmation
+			confirmMsg := fmt.Sprintf("Notification mode → %s", newMode)
+			_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, confirmMsg)
+
+			// Update the text in the update for prompt building
+			if cleanedText != "" {
+				*last.update.Content.Text = cleanedText
+			} else {
+				// Message was only a notify mode change request - no Claude invocation needed
 				return
 			}
 		}
@@ -1442,6 +1512,20 @@ func detectModelChange(text string) (newModel string, cleanedText string, tierDe
 		}
 	}
 	return "", text, 0
+}
+
+// detectNotifyIntent checks text for notification mode phrases and returns the
+// target mode and the text with the phrase removed. If no phrase is detected,
+// returns ("", text).
+func detectNotifyIntent(text string) (mode string, remainder string) {
+	lower := strings.ToLower(text)
+	for _, nip := range notifyPhrases {
+		// Check if the text contains the phrase
+		if strings.Contains(lower, nip.phrase) {
+			return nip.mode, removePhrase(text, nip.phrase)
+		}
+	}
+	return "", text
 }
 
 // removePhrase removes a phrase from text, handling case-insensitivity and cleaning up whitespace.
