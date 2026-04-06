@@ -659,6 +659,15 @@ func (m *SessionManager) startInvocation(ctx context.Context, key topicKey, batc
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+
+		// Start a continuous typing indicator for the full invocation duration.
+		// The indicator fires immediately and then every 4 seconds (Telegram's
+		// typing action expires after ~5 seconds).
+		tid := key.threadID
+		tidPtr := &tid
+		stopTyping := m.startTyping(ctx, key.chatID, tidPtr)
+		defer stopTyping()
+
 		m.processBatch(ctx, key, batch)
 	}()
 	return done
