@@ -50,6 +50,13 @@ type modelChangePhrase struct {
 	tierDelta   int // positive for escalation, negative for de-escalation
 }
 
+// cancelPhrases is a table of known cancel/abort phrases.
+// Checked case-insensitively; first match wins.
+var cancelPhrases = []string{
+	"cancel", "stop", "abort", "never mind", "nevermind", "forget it",
+	"stop that", "kill it", "stop what you are doing", "stop what youre doing",
+}
+
 // modelChangePhrases is a table of known model-change phrases.
 // Phrases are checked in order, first match wins.
 var modelChangePhrases = []modelChangePhrase{
@@ -465,6 +472,40 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	// Transcription complete — stop the audio typing loop.
 	if stopTyping != nil {
 		stopTyping()
+	}
+
+	// Check for cancel intent before processing further.
+	// This is checked early so we can abort the current batch quickly.
+	if last.update.Content != nil && last.update.Content.Text != nil {
+		isCancelOnly, remainder := detectCancelIntent(*last.update.Content.Text)
+		if isCancelOnly || remainder != "" {
+			// Cancel intent detected
+			if m.CancelTopic(ctx, key.chatID, key.threadID, 0) {
+				// Successfully cancelled an active invocation
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "⚠️ Cancelled")
+
+				// If there's remaining text after the cancel phrase, restart processing with just the remainder
+				if remainder != "" {
+					// Update the text in the update for continued processing
+					*last.update.Content.Text = remainder
+					// Continue processing with the remainder - fall through to model change check and prompt building
+				} else {
+					// Pure cancel command, no remainder to process
+					return
+				}
+			} else {
+				// No active invocation to cancel
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Nothing is currently running")
+
+				// If there's remaining text, continue processing it
+				if remainder != "" {
+					*last.update.Content.Text = remainder
+				} else {
+					// Pure cancel with no remainder - nothing to do
+					return
+				}
+			}
+		}
 	}
 
 	defer func() {
@@ -1368,6 +1409,24 @@ func tierModel(tier int) string {
 	default:
 		return defaultSessionModel
 	}
+}
+
+// detectCancelIntent checks text for cancel/abort phrases and returns whether
+// the text is purely a cancel command (no remaining text to process) and the
+// remainder text after stripping the cancel phrase.
+func detectCancelIntent(text string) (isCancelOnly bool, remainder string) {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	for _, phrase := range cancelPhrases {
+		// Check if the text starts with the cancel phrase
+		if strings.HasPrefix(lower, phrase) {
+			// Extract the remainder (case-preserving)
+			phraseIdx := strings.Index(strings.ToLower(text), phrase)
+			remainder := strings.TrimSpace(text[phraseIdx+len(phrase):])
+			isCancelOnly = (remainder == "")
+			return isCancelOnly, remainder
+		}
+	}
+	return false, ""
 }
 
 // detectModelChange checks text for model-change phrases and returns the new model
