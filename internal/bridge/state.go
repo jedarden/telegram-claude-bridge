@@ -38,6 +38,7 @@ type Group struct {
 	PermissionMode   string
 	AllowedTools     string // JSON array of tool names, or empty for all tools
 	DisallowedTools  string // JSON array of tool names, or empty for no restrictions
+	MaxSubtasks      int    // Maximum concurrent subtasks per topic (default 5)
 	CreatedAt        time.Time
 }
 
@@ -90,7 +91,22 @@ type CostEvent struct {
 	CreatedAt            time.Time
 }
 
-const schemaVersion = 12
+// Subtask represents a parallel sub-task spawned by the SubtaskOrchestrator.
+type Subtask struct {
+	ID           string    // Unique subtask ID
+	ChatID       int64     // Parent chat ID
+	ThreadID     int64     // Parent thread ID
+	ParentMsgID  int64     // Message ID of the parent message that spawned this subtask
+	Prompt       string    // The prompt for this subtask
+	SessionID    string    // Optional session ID to resume
+	Status       string    // "running", "complete", "error"
+	Result       string    // Result text if complete
+	Error        string    // Error message if failed
+	StartedAt    time.Time // When the subtask started
+	FinishedAt   *time.Time // When the subtask finished (nil if running)
+}
+
+const schemaVersion = 13
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -182,6 +198,27 @@ var migrations = []string{
 		// Version 11 — add timeout_sec to sessions for per-topic timeout override.
 		// Default 0 means "use group timeout" (group-level fallback).
 		`ALTER TABLE sessions ADD COLUMN timeout_sec INTEGER NOT NULL DEFAULT 0;`,
+
+		// Version 12 — add max_subtasks to groups for parallel subtask limiting.
+		`ALTER TABLE groups ADD COLUMN max_subtasks INTEGER NOT NULL DEFAULT 5;`,
+
+		// Version 13 — add subtasks table for parallel task orchestration.
+		`CREATE TABLE IF NOT EXISTS subtasks (
+			id           TEXT PRIMARY KEY,
+			chat_id      INTEGER NOT NULL,
+			thread_id    INTEGER NOT NULL,
+			parent_msg   INTEGER NOT NULL,
+			prompt       TEXT NOT NULL,
+			session_id   TEXT,
+			status       TEXT NOT NULL DEFAULT 'running',
+			result       TEXT,
+			error        TEXT,
+			started_at   TEXT NOT NULL DEFAULT (datetime('now')),
+			finished_at  TEXT
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_subtasks_chat_thread ON subtasks(chat_id, thread_id);
+		CREATE INDEX IF NOT EXISTS idx_subtasks_status ON subtasks(status);`,
 }
 
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
@@ -273,7 +310,8 @@ func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 	row := d.db.QueryRowContext(ctx,
 		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec,
 		        COALESCE(permission_mode,'acceptEdits'),
-		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''), created_at
+		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''),
+		        COALESCE(max_subtasks,5), created_at
 		 FROM groups WHERE chat_id = ?`, chatID)
 	return scanGroup(row)
 }
@@ -281,8 +319,8 @@ func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 // UpsertGroup inserts or replaces a group record.
 func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, allowed_tools, disallowed_tools, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, allowed_tools, disallowed_tools, max_subtasks, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(chat_id) DO UPDATE SET
 		   name            = excluded.name,
 		   cwd              = excluded.cwd,
@@ -291,9 +329,11 @@ func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 		   timeout_sec     = excluded.timeout_sec,
 		   permission_mode  = excluded.permission_mode,
 		   allowed_tools    = excluded.allowed_tools,
-		   disallowed_tools = excluded.disallowed_tools`,
+		   disallowed_tools = excluded.disallowed_tools,
+		   max_subtasks     = excluded.max_subtasks`,
 		g.ChatID, g.Name, g.CWD, g.DefaultModel, g.MaxBudget, g.TimeoutSec, g.PermissionMode,
 		nullableString(g.AllowedTools), nullableString(g.DisallowedTools),
+		g.MaxSubtasks,
 		g.CreatedAt.UTC().Format(time.RFC3339),
 	)
 	return err
@@ -304,7 +344,8 @@ func (d *DB) ListGroups(ctx context.Context) ([]*Group, error) {
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec,
 		        COALESCE(permission_mode,'acceptEdits'),
-		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''), created_at
+		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''),
+		        COALESCE(max_subtasks,5), created_at
 		 FROM groups ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -349,7 +390,7 @@ type groupScanner interface {
 func scanGroup(s groupScanner) (*Group, error) {
 	var g Group
 	var createdAt string
-	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &g.PermissionMode, &g.AllowedTools, &g.DisallowedTools, &createdAt)
+	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &g.PermissionMode, &g.AllowedTools, &g.DisallowedTools, &g.MaxSubtasks, &createdAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -926,4 +967,142 @@ func nullableString(s string) any {
 		return nil
 	}
 	return s
+}
+
+// ── subtasks ───────────────────────────────────────────────────────────────────
+
+// CreateSubtask inserts a new subtask record.
+func (d *DB) CreateSubtask(ctx context.Context, s *Subtask) error {
+	if s.StartedAt.IsZero() {
+		s.StartedAt = time.Now().UTC()
+	}
+	if s.Status == "" {
+		s.Status = "running"
+	}
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO subtasks (id, chat_id, thread_id, parent_msg, prompt, session_id, status, result, error, started_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		s.ID, s.ChatID, s.ThreadID, s.ParentMsgID, s.Prompt,
+		nullableString(s.SessionID), s.Status,
+		nullableString(s.Result), nullableString(s.Error),
+		s.StartedAt.UTC().Format(time.RFC3339),
+	)
+	return err
+}
+
+// UpdateSubtask updates status, result, and error for a subtask.
+// Also sets finished_at to the current time.
+func (d *DB) UpdateSubtask(ctx context.Context, id string, status, result, errorMsg string) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE subtasks
+		 SET status = ?, result = ?, error = ?, finished_at = datetime('now')
+		 WHERE id = ?`,
+		status, nullableString(result), nullableString(errorMsg), id,
+	)
+	return err
+}
+
+// GetSubtask retrieves a subtask by ID.
+func (d *DB) GetSubtask(ctx context.Context, id string) (*Subtask, error) {
+	row := d.db.QueryRowContext(ctx,
+		`SELECT id, chat_id, thread_id, parent_msg, prompt, session_id,
+		        status, result, error, started_at, finished_at
+		 FROM subtasks WHERE id = ?`, id)
+
+	return scanSubtask(row)
+}
+
+// ListSubtasksByStatus returns all subtasks for a topic with the given status.
+func (d *DB) ListSubtasksByStatus(ctx context.Context, chatID, threadID int64, status string) ([]*Subtask, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT id, chat_id, thread_id, parent_msg, prompt, session_id,
+		        status, result, error, started_at, finished_at
+		 FROM subtasks
+		 WHERE chat_id = ? AND thread_id = ? AND status = ?
+		 ORDER BY started_at ASC`,
+		chatID, threadID, status,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var subtasks []*Subtask
+	for rows.Next() {
+		s, err := scanSubtask(rows)
+		if err != nil {
+			return nil, err
+		}
+		subtasks = append(subtasks, s)
+	}
+	return subtasks, rows.Err()
+}
+
+// ListSubtasks returns all subtasks for a topic, ordered by started_at.
+func (d *DB) ListSubtasks(ctx context.Context, chatID, threadID int64) ([]*Subtask, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT id, chat_id, thread_id, parent_msg, prompt, session_id,
+		        status, result, error, started_at, finished_at
+		 FROM subtasks
+		 WHERE chat_id = ? AND thread_id = ?
+		 ORDER BY started_at ASC`,
+		chatID, threadID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var subtasks []*Subtask
+	for rows.Next() {
+		s, err := scanSubtask(rows)
+		if err != nil {
+			return nil, err
+		}
+		subtasks = append(subtasks, s)
+	}
+	return subtasks, rows.Err()
+}
+
+// DeleteSubtask removes a subtask by ID.
+func (d *DB) DeleteSubtask(ctx context.Context, id string) error {
+	_, err := d.db.ExecContext(ctx,
+		`DELETE FROM subtasks WHERE id = ?`, id)
+	return err
+}
+
+// DeleteSubtasksForTopic removes all subtasks for a topic.
+func (d *DB) DeleteSubtasksForTopic(ctx context.Context, chatID, threadID int64) error {
+	_, err := d.db.ExecContext(ctx,
+		`DELETE FROM subtasks WHERE chat_id = ? AND thread_id = ?`, chatID, threadID)
+	return err
+}
+
+type subtaskScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanSubtask(s subtaskScanner) (*Subtask, error) {
+	var subtask Subtask
+	var startedAt, finishedAt string
+	err := s.Scan(
+		&subtask.ID, &subtask.ChatID, &subtask.ThreadID, &subtask.ParentMsgID,
+		&subtask.Prompt, &subtask.SessionID, &subtask.Status,
+		&subtask.Result, &subtask.Error, &startedAt, &finishedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	subtask.StartedAt, _ = time.Parse(time.RFC3339, startedAt)
+	if finishedAt != "" {
+		t, _ := time.Parse(time.RFC3339, finishedAt)
+		subtask.FinishedAt = &t
+	}
+	if subtask.Status == "" {
+		subtask.Status = "running"
+	}
+	return &subtask, nil
 }

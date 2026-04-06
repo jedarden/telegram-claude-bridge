@@ -35,6 +35,7 @@ User commands:
 /cancel [thread_id] — cancel the running request in this topic or another topic
 	/timeout [N] — set per-topic timeout in seconds (0 = no limit)
 /cost — show cost information for this group or topic
+/parallel — run up to 5 prompts in parallel (separate prompts with ---)
 /ping — check proxy latency
 /version — show version information
 /help — show this message
@@ -59,15 +60,16 @@ var validPermissionModes = map[string]bool{
 
 // CommandHandler dispatches bot commands sent in the General topic.
 type CommandHandler struct {
-	db        *DB
-	sender    *Sender
-	proxyURL  string
-	client    *http.Client
-	updater   UpdaterInterface
-	sessionMgr *SessionManager // optional, for context commands
-	bridgeVer string
-	bridgeSHA string
-	buildDate string
+	db                 *DB
+	sender             *Sender
+	proxyURL           string
+	client             *http.Client
+	updater            UpdaterInterface
+	sessionMgr         *SessionManager // optional, for context commands
+	subtaskOrchestrator *SubtaskOrchestrator // optional, for parallel commands
+	bridgeVer          string
+	bridgeSHA          string
+	buildDate          string
 }
 
 // UpdaterInterface defines the interface for update commands.
@@ -103,6 +105,11 @@ func NewCommandHandler(db *DB, sender *Sender, proxyURL string, updater UpdaterI
 // SetSessionManager sets the session manager for context commands.
 func (h *CommandHandler) SetSessionManager(sessionMgr *SessionManager) {
 	h.sessionMgr = sessionMgr
+}
+
+// SetSubtaskOrchestrator sets the subtask orchestrator for parallel commands.
+func (h *CommandHandler) SetSubtaskOrchestrator(orch *SubtaskOrchestrator) {
+	h.subtaskOrchestrator = orch
 }
 
 // Handle implements CommandHandlerFunc. It dispatches the update to the
@@ -170,6 +177,8 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply, err = h.cmdCancel(ctx, update, group, args)
 	case "/timeout":
 			reply, err = h.cmdTimeout(ctx, update, group, args)
+	case "/parallel":
+		reply, err = h.cmdParallel(ctx, update, group, args)
 	default:
 		reply = fmt.Sprintf("Unknown command: %s\n\nUse /help for available commands.", cmd)
 	}
@@ -1649,3 +1658,69 @@ func (h *CommandHandler) cmdTimeout(ctx context.Context, update contract.Update,
 
 		return out.Result, nil
 	}
+
+// cmdParallel handles /parallel — runs up to 5 prompts in parallel.
+// Prompts are delimited by --- on its own line.
+// Each prompt runs in its own goroutine with a fresh session, and results
+// are posted back to the topic as they complete.
+func (h *CommandHandler) cmdParallel(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	if args == "" {
+		return "Usage: /parallel <prompt1>\n---\n<prompt2>\n---\n...\n\nUp to 5 prompts can be run in parallel. Separate each prompt with --- on its own line.\n\nExample:\n/parallel What is 2+2?\n---\nWhat is 3+3?\n---\nWhat is 4+4?", nil
+	}
+	if update.ThreadID == nil {
+		return "Parallel commands only work within a topic session. Use /new to create a topic first.", nil
+	}
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+	if h.subtaskOrchestrator == nil {
+		return "Subtask orchestrator not available.", nil
+	}
+
+	// Split prompts by --- delimiter
+	prompts := splitParallelPrompts(args)
+	if len(prompts) == 0 {
+		return "No prompts found. Use --- to separate prompts.", nil
+	}
+	if len(prompts) > 5 {
+		return "Maximum 5 prompts allowed.", nil
+	}
+
+	// Get the current session for the topic
+	session, err := h.db.GetSession(ctx, update.ChatID, *update.ThreadID)
+	if err != nil {
+		return "", fmt.Errorf("get session: %w", err)
+	}
+
+	// Create subtask request
+	req := SubtaskRequest{
+		ChatID:   update.ChatID,
+		ThreadID: *update.ThreadID,
+		MsgID:    update.MessageID,
+		Prompts:  prompts,
+		Group:    group,
+		Session:  session,
+	}
+
+	// Run subtasks (non-blocking)
+	if err := h.subtaskOrchestrator.Run(ctx, req); err != nil {
+		return "", fmt.Errorf("start parallel tasks: %w", err)
+	}
+
+	return fmt.Sprintf("Started %d parallel subtask(s)...", len(prompts)), nil
+}
+
+// splitParallelPrompts splits text by --- delimiter (surrounded by optional whitespace).
+// Empty prompts are filtered out.
+func splitParallelPrompts(text string) []string {
+	// Split by --- on its own line (with optional surrounding whitespace)
+	parts := strings.Split(text, "\n---\n")
+	var prompts []string
+	for _, p := range parts {
+		prompt := strings.TrimSpace(p)
+		if prompt != "" {
+			prompts = append(prompts, prompt)
+		}
+	}
+	return prompts
+}

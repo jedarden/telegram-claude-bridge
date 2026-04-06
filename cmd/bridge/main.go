@@ -75,6 +75,11 @@ func main() {
 	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL, upd, Version, CommitSHA, BuildDate)
 	sessionMgr := bridge.NewSessionManager(db, sender, cfg.ProxyURL)
 	defer sessionMgr.Shutdown()
+	cmdHandler.SetSessionManager(sessionMgr)
+
+	// Create subtask orchestrator and wire it to command handler
+	subtaskOrchestrator := bridge.NewSubtaskOrchestrator(db, sender)
+	cmdHandler.SetSubtaskOrchestrator(subtaskOrchestrator)
 
 	// Create session cleanup (disabled if interval is 0)
 	cleanup := bridge.NewSessionCleanup(db, sender, cfg.SessionCleanupInterval, cfg.SessionTTL, cfg.CloseInactiveTopics)
