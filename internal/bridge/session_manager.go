@@ -31,6 +31,9 @@ const (
 
 	// streamDebounce is the minimum interval between progressive Telegram edits.
 	streamDebounce = 1 * time.Second
+
+	// toolDebounce is the minimum interval between tool status updates.
+	toolDebounce = 500 * time.Millisecond
 )
 
 // Model tier constants for escalation/de-escalation.
@@ -163,6 +166,65 @@ type contentBlockDelta struct {
 	Delta struct {
 		Type string `json:"type"` // "text_delta"
 		Text string `json:"text"`
+	} `json:"delta"`
+}
+
+// contentBlockStart is a content_block_start event nested inside a stream_event
+// line's "event" field. It marks the start of a content block such as tool_use.
+type contentBlockStart struct {
+	Type         string       `json:"type"` // "content_block_start"
+	Index        int          `json:"index"`
+	ContentBlock contentBlock `json:"content_block"`
+}
+
+// contentBlock represents the content block within a content_block_start event.
+type contentBlock struct {
+	Type  string       `json:"type"` // "tool_use", "text", etc.
+	Name  string       `json:"name,omitempty"`  // Tool name for tool_use blocks
+	Input toolInput    `json:"input,omitempty"` // Tool input for tool_use blocks
+}
+
+// toolInput represents the input field of a tool_use content block.
+// The input is arbitrary JSON, so we use RawMessage to preserve it.
+type toolInput struct {
+	Raw json.RawMessage `json:"-"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler for toolInput.
+func (t *toolInput) UnmarshalJSON(data []byte) error {
+	t.Raw = data
+	return nil
+}
+
+// String returns a truncated string representation of the tool input.
+func (t *toolInput) String() string {
+	if len(t.Raw) == 0 {
+		return ""
+	}
+	// Truncate to 100 chars for display
+	str := string(t.Raw)
+	if len(str) > 100 {
+		return str[:100] + "..."
+	}
+	return str
+}
+
+// contentBlockStop is a content_block_stop event nested inside a stream_event
+// line's "event" field. It marks the end of a content block.
+type contentBlockStop struct {
+	Type  string `json:"type"` // "content_block_stop"
+	Index int    `json:"index"`
+}
+
+// toolResultDelta is a tool_result_delta event nested inside a stream_event
+// line's "event" field. It contains partial tool result data.
+type toolResultDelta struct {
+	Type     string `json:"type"` // "tool_result_delta"
+	ToolUseID string `json:"tool_use_id"`
+	Delta    struct {
+		Type     string `json:"type"` // "json", "image", etc.
+		JSON     string `json:"json,omitempty"` // Partial JSON for result type "json"
+		Image    string `json:"image,omitempty"` // Image data for result type "image"
 	} `json:"delta"`
 }
 
@@ -689,10 +751,14 @@ func (m *SessionManager) invokeClaudeAPI(
 	scanner.Buffer(make([]byte, scannerMaxBuf), scannerMaxBuf)
 
 	var (
-		textBuf     strings.Builder
-		lastEdit    time.Time
-		streamMsgID int64
-		out         claudeOutput
+		textBuf       strings.Builder
+		lastEdit      time.Time
+		lastToolEdit  time.Time // separate timer for tool status updates
+		streamMsgID   int64
+		out           claudeOutput
+		activeTool    string     // name of the currently running tool
+		toolInput     string     // input for the currently running tool (truncated)
+		toolCompleted bool       // true when the current tool has completed
 	)
 
 	// Determine streaming behavior based on notification mode
@@ -797,6 +863,33 @@ func (m *SessionManager) invokeClaudeAPI(
 		return true
 	}
 
+	// flushToolEdit sends a tool status update. Skipped in quiet mode or if
+	// the debounce interval hasn't elapsed (unless force=true).
+	flushToolEdit := func(force bool, status string) {
+		// Skip in quiet mode
+		if notificationMode == "quiet" {
+			return
+		}
+		// Skip if not enough time has elapsed (unless forced)
+		if !force && time.Since(lastToolEdit) < toolDebounce {
+			return
+		}
+
+		// Use placeholder for tool status updates
+		msgID := placeholderID
+		if msgID == 0 && streamMsgID != 0 {
+			msgID = streamMsgID
+		}
+		if msgID == 0 {
+			return
+		}
+
+		if err := m.sender.EditMessage(sendCtx, chatID, msgID, status); err != nil {
+			log.Printf("[session_mgr] edit tool status (%d,%d): %v", chatID, *threadID, err)
+		}
+		lastToolEdit = time.Now()
+	}
+
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -816,13 +909,61 @@ func (m *SessionManager) invokeClaudeAPI(
 		case "assistant":
 			// Complete assistant message block; text is accumulated via stream_events.
 		case "stream_event":
+			// Try to parse as content_block_delta first (for text streaming)
 			var delta contentBlockDelta
-			if err := json.Unmarshal(env.Event, &delta); err != nil {
+			if err := json.Unmarshal(env.Event, &delta); err == nil {
+				if delta.Type == "content_block_delta" && delta.Delta.Type == "text_delta" {
+					textBuf.WriteString(delta.Delta.Text)
+					flushEdit(false)
+					// Text delta after a tool_use block means the tool succeeded
+					if activeTool != "" && toolCompleted {
+						activeTool = ""
+						toolInput = ""
+					}
+				}
 				continue
 			}
-			if delta.Type == "content_block_delta" && delta.Delta.Type == "text_delta" {
-				textBuf.WriteString(delta.Delta.Text)
-				flushEdit(false)
+
+			// Try to parse as content_block_start (for tool_use start)
+			var start contentBlockStart
+			if err := json.Unmarshal(env.Event, &start); err == nil {
+				if start.Type == "content_block_start" && start.ContentBlock.Type == "tool_use" {
+					// Tool is starting - send status update
+					activeTool = start.ContentBlock.Name
+					toolInput = start.ContentBlock.Input.String()
+					toolCompleted = false
+					status := fmt.Sprintf("⚙️ Running %s: `%s`", activeTool, toolInput)
+					flushToolEdit(true, status) // force immediate update
+				}
+				continue
+			}
+
+			// Try to parse as content_block_stop (for tool_use completion)
+			var stop contentBlockStop
+			if err := json.Unmarshal(env.Event, &stop); err == nil {
+				if stop.Type == "content_block_stop" {
+					// Tool is completing - send status update
+					if activeTool != "" && !toolCompleted {
+						status := fmt.Sprintf("✓ %s done", activeTool)
+						flushToolEdit(false, status) // debounce
+						toolCompleted = true
+					}
+				}
+				continue
+			}
+
+			// Try to parse as tool_result_delta (actual tool result streaming)
+			var trDelta toolResultDelta
+			if err := json.Unmarshal(env.Event, &trDelta); err == nil {
+				if trDelta.Type == "tool_result_delta" {
+					// Tool result is streaming - tool has executed
+					if activeTool != "" && !toolCompleted {
+						status := fmt.Sprintf("✓ %s done", activeTool)
+						flushToolEdit(false, status) // debounce
+						toolCompleted = true
+					}
+				}
+				continue
 			}
 		case "result":
 			// Canonical final event — overwrite session_id with the authoritative value.
@@ -1443,7 +1584,6 @@ func (m *SessionManager) CancelTopic(ctx context.Context, chatID, threadID int64
 			msgID = active.placeholderID
 		}
 		if msgID != 0 {
-			tidPtr := &threadID
 			_ = m.sender.EditMessage(ctx, chatID, msgID, "⚠️ Cancelled")
 		}
 
