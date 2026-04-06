@@ -32,6 +32,7 @@ User commands:
 /status — list active sessions in this group
 /sessions — list all sessions across all groups
 /close <thread_id> — close a session by topic thread_id
+/cancel [thread_id] — cancel the running request in this topic or another topic
 /cost — show cost information for this group or topic
 /ping — check proxy latency
 /version — show version information
@@ -164,6 +165,8 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply, err = h.cmdVersion(ctx)
 	case "/context":
 		reply, err = h.cmdContext(ctx, update, group, args)
+	case "/cancel":
+		reply, err = h.cmdCancel(ctx, update, group, args)
 	default:
 		reply = fmt.Sprintf("Unknown command: %s\n\nUse /help for available commands.", cmd)
 	}
@@ -1511,6 +1514,46 @@ func (h *CommandHandler) cmdContext(ctx context.Context, update contract.Update,
 	h.sessionMgr.SetPendingContext(update.ChatID, targetThreadID, contextStr)
 
 	return fmt.Sprintf("Context from thread %d will be included in your next prompt.", threadID), nil
+}
+
+// cmdCancel handles /cancel [thread_id] — cancels the running request in this topic.
+// In a named topic: cancels the current topic's request (no arg needed).
+// In general topic: requires thread_id argument to specify which topic to cancel.
+func (h *CommandHandler) cmdCancel(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+	if h.sessionMgr == nil {
+		return "Session manager not available.", nil
+	}
+
+	var threadID int64
+	var placeholderID int64
+
+	if update.ThreadID != nil {
+		// In a named topic: cancel the current topic
+		threadID = *update.ThreadID
+		placeholderID = 0 // SessionManager will find the active placeholder
+	} else {
+		// In general topic: parse thread_id from args
+		if args == "" {
+			return "Usage: /cancel <thread_id>\n\nCancels the running request in the specified topic.\n\nIn a named topic, you can use /cancel without arguments.", nil
+		}
+		parsedID, err := strconv.ParseInt(strings.TrimSpace(args), 10, 64)
+		if err != nil {
+			return fmt.Sprintf("Invalid thread_id %q — must be a number.", args), nil
+		}
+		threadID = parsedID
+		placeholderID = 0
+	}
+
+	// Attempt to cancel the active invocation for this topic
+	cancelled := h.sessionMgr.CancelTopic(ctx, update.ChatID, threadID, placeholderID)
+	if !cancelled {
+		return fmt.Sprintf("No active request found for thread %d.", threadID), nil
+	}
+
+	return fmt.Sprintf("Request cancelled for thread %d.", threadID), nil
 }
 
 	// GenerateSessionSummary generates a summary for a session using Haiku.

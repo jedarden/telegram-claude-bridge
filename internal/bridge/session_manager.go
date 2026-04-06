@@ -80,11 +80,19 @@ type SessionManager struct {
 	topics              map[topicKey]*topicWorker
 	pinnedUpdateLastSeen map[topicKey]time.Time // debounce: track last pinned msg update time
 	pendingContext       map[topicKey]string    // pending context to inject into next prompt
+	activeInvocations    map[topicKey]*activeInvocation // tracks running commands for cancellation
 }
 
 type topicKey struct {
 	chatID   int64
 	threadID int64
+}
+
+// activeInvocation tracks a running Claude subprocess for cancellation.
+type activeInvocation struct {
+	cmd           *exec.Cmd
+	placeholderID int64
+	mu            sync.Mutex // guards cmd
 }
 
 // topicWorker owns the channel and goroutine for a single forum topic.
@@ -168,6 +176,7 @@ func NewSessionManager(db *DB, sender *Sender, proxyURL string) *SessionManager 
 		topics:              make(map[topicKey]*topicWorker),
 		pinnedUpdateLastSeen: make(map[topicKey]time.Time),
 		pendingContext:       make(map[topicKey]string),
+		activeInvocations:    make(map[topicKey]*activeInvocation),
 	}
 }
 
@@ -518,7 +527,7 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		defer cancelCall()
 	}
 
-	out, err := m.invokeClaudeAPI(callCtx, ctx, session, group, prompt, key.chatID, tidPtr, origMsgID, placeholderID, notificationMode)
+	out, err := m.invokeClaudeAPI(callCtx, ctx, key, session, group, prompt, key.chatID, tidPtr, origMsgID, placeholderID, notificationMode)
 	if err != nil {
 		// Determine if this is a "blocked" state (waiting for permission) vs actual error
 		errMsg := err.Error()
@@ -611,6 +620,7 @@ func (m *SessionManager) resolveSessionGroup(ctx context.Context, key topicKey, 
 func (m *SessionManager) invokeClaudeAPI(
 	subprocCtx context.Context,
 	sendCtx context.Context,
+	key topicKey,
 	session *Session,
 	group *Group,
 	prompt string,
@@ -651,6 +661,22 @@ func (m *SessionManager) invokeClaudeAPI(
 	}
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
+
+	// Register the active command for cancellation before starting
+	active := &activeInvocation{
+		cmd:           cmd,
+		placeholderID: placeholderID,
+	}
+	m.mu.Lock()
+	m.activeInvocations[key] = active
+	m.mu.Unlock()
+
+	// Ensure cleanup on all exit paths
+	defer func() {
+		m.mu.Lock()
+		delete(m.activeInvocations, key)
+		m.mu.Unlock()
+	}()
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start claude: %w", err)
@@ -1384,4 +1410,46 @@ func (m *SessionManager) GetSessionContext(ctx context.Context, chatID, threadID
 	}
 
 	return contextStr, nil
+}
+
+// CancelTopic sends SIGINT to the active Claude subprocess for a topic.
+// Returns true if a command was cancelled, false if no active invocation found.
+func (m *SessionManager) CancelTopic(ctx context.Context, chatID, threadID int64, placeholderID int64) bool {
+	key := topicKey{chatID: chatID, threadID: threadID}
+
+	m.mu.Lock()
+	active, ok := m.activeInvocations[key]
+	m.mu.Unlock()
+
+	if !ok {
+		return false
+	}
+
+	// Send SIGINT to gracefully terminate the subprocess
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	if active.cmd != nil && active.cmd.Process != nil {
+		if err := active.cmd.Process.Signal(os.Interrupt); err != nil {
+			log.Printf("[session_mgr] cancel (%d,%d): signal failed: %v", chatID, threadID, err)
+			return false
+		}
+
+		// Edit the placeholder to show cancellation
+		msgID := placeholderID
+		if msgID == 0 {
+			msgID = active.placeholderID
+		}
+		if msgID != 0 {
+			tidPtr := &threadID
+			_ = m.sender.EditMessage(ctx, chatID, msgID, "⚠️ Cancelled")
+		}
+
+		// Update topic color to red
+		_ = m.updateTopicColor(ctx, chatID, threadID, ColorError)
+
+		log.Printf("[session_mgr] cancelled (%d,%d)", chatID, threadID)
+		return true
+	}
+
+	return false
 }
