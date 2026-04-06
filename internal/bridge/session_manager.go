@@ -1638,7 +1638,37 @@ func (m *SessionManager) invokeClaudeAPI(
 			var start contentBlockStart
 			if err := json.Unmarshal(env.Event, &start); err == nil {
 				if start.Type == "content_block_start" && start.ContentBlock.Type == "tool_use" {
-					// Tool is starting - send status update
+					// Check for update_progress synthetic tool
+					if start.ContentBlock.Name == "update_progress" {
+						syntheticToolID := fmt.Sprintf("toolu_%d", time.Now().UnixNano())
+
+						// Parse the input to get the message
+						var input updateProgressInput
+						if err := json.Unmarshal(start.ContentBlock.Input.Raw, &input); err == nil && input.Message != "" {
+							// Send a new message to the Telegram thread (not an edit)
+							if err := m.sender.SendResponse(sendCtx, chatID, threadID, 0, input.Message); err != nil {
+								log.Printf("[session_mgr] send update_progress message: %v", err)
+							} else {
+								// Reset the progress ticker timer
+								lastSent = time.Now()
+							}
+						}
+
+						// Write tool_result back to stdin so the orchestrator can continue
+						toolResult := map[string]any{
+							"tool_use_id": syntheticToolID,
+							"content":     map[string]any{"ok": true},
+							"is_error":    false,
+						}
+						resultJSON, _ := json.Marshal(toolResult)
+						if _, err := fmt.Fprintf(stdinW, "%s\n", resultJSON); err != nil {
+							log.Printf("[session_mgr] write tool_result for update_progress: %v", err)
+						}
+
+						continue
+					}
+
+					// Regular tool handling - send status update
 					activeTool = start.ContentBlock.Name
 					toolInput = start.ContentBlock.Input.String()
 					toolCompleted = false
