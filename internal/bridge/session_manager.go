@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -61,6 +62,8 @@ type notifyIntent struct {
 var cancelPhrases = []string{
 	"cancel", "stop", "abort", "never mind", "nevermind", "forget it",
 	"stop that", "kill it", "stop what you are doing", "stop what youre doing",
+	"nevermind that", "never mind that", "cancel that", "stop it",
+	"scratch that", "ignore that", "disregard that",
 }
 
 // notifyPhrases is a table of known notification mode phrases.
@@ -74,12 +77,17 @@ var notifyPhrases = []notifyIntent{
 	{"let me know when finished", "summary"},
 	{"ill check back", "summary"},
 	{"i'll check back", "summary"},
+	{"notify when done", "summary"},
+	{"summary mode", "summary"},
+	{"final result only", "summary"},
 
 	// Phrases that map to "quiet" mode
 	{"be quiet", "quiet"},
 	{"no updates", "quiet"},
 	{"dont show progress", "quiet"},
 	{"don't show progress", "quiet"},
+	{"minimal updates", "quiet"},
+	{"quiet mode", "quiet"},
 
 	// Phrases that map to "live" mode
 	{"show everything", "live"},
@@ -87,6 +95,8 @@ var notifyPhrases = []notifyIntent{
 	{"show me as you go", "live"},
 	{"live updates", "live"},
 	{"keep me posted", "live"},
+	{"stream mode", "live"},
+	{"show progress", "live"},
 }
 
 // costPhrases is a table of known cost query phrases.
@@ -102,6 +112,13 @@ var costPhrases = []string{
 	"how much money",
 	"whats the bill",
 	"what's the bill",
+	"how much have i spent",
+	"whats the total",
+	"what's the total",
+	"show me the cost",
+	"display cost",
+	"check the cost",
+	"what have i spent",
 }
 
 // statusPhrases is a table of known status query phrases.
@@ -115,6 +132,12 @@ var statusPhrases = []string{
 	"what's running",
 	"session info",
 	"show info",
+	"current status",
+	"how are things going",
+	"whats the status",
+	"what's the status",
+	"check status",
+	"display status",
 }
 
 // closePhrases is a table of known session close phrases.
@@ -132,6 +155,12 @@ var closePhrases = []string{
 	"shut this down",
 	"wrap up",
 	"finished",
+	"let's wrap this up",
+	"lets wrap this up",
+	"thats all for now",
+	"that's all for now",
+	"were finished",
+	"we're finished",
 }
 
 // timeoutNoLimitPhrases is a table of known "no timeout" phrases.
@@ -145,6 +174,9 @@ var timeoutNoLimitPhrases = []string{
 	"dont time out",
 	"don't time out",
 	"take as long as you need",
+	"take your time",
+	"no rush",
+	"unlimited time",
 }
 
 // timeoutWithDurationPhrases is a table of known timeout-setting phrases
@@ -156,6 +188,9 @@ var timeoutWithDurationPhrases = []string{
 	"give it",
 	"let it run for",
 	"wait up to",
+	"give it at most",
+	"run for",
+	"max time",
 }
 
 // newSessionPhrases is a table of known new session/topic phrases.
@@ -170,33 +205,137 @@ var newSessionPhrases = []string{
 	"open a new topic",
 	"start a new conversation",
 	"new conversation",
+	"let's start a new topic",
+	"lets start a new topic",
+	"create a new session",
+	"i want a new topic",
+	"open a new session",
+}
+
+// helpPhrases is a table of known help query phrases.
+// Checked case-insensitively; first match wins.
+var helpPhrases = []string{
+	"help",
+	"what can you do",
+	"what commands",
+	"show commands",
+	"list commands",
+	"how do i use",
+	"available commands",
+	"what can i do",
+	"show help",
+}
+
+// colorPhrases is a table of known color-setting phrases with their target colors.
+// Checked case-insensitively; first match wins.
+type colorPhrase struct {
+	phrase     string
+	targetColor int
+}
+
+var colorPhrases = []colorPhrase{
+	// Active (light blue)
+	{"mark as active", ColorActive},
+	{"set color to active", ColorActive},
+	{"set to active", ColorActive},
+	{"color blue", ColorActive},
+	{"color light blue", ColorActive},
+
+	// Complete (green)
+	{"mark as complete", ColorComplete},
+	{"mark as done", ColorComplete},
+	{"set color to complete", ColorComplete},
+	{"set to complete", ColorComplete},
+	{"color green", ColorComplete},
+	{"mark as closed", ColorComplete},
+
+	// Blocked (yellow)
+	{"mark as blocked", ColorBlocked},
+	{"set color to blocked", ColorBlocked},
+	{"set to blocked", ColorBlocked},
+	{"color yellow", ColorBlocked},
+	{"mark as waiting", ColorBlocked},
+
+	// Error (red/orange)
+	{"mark as error", ColorError},
+	{"set color to error", ColorError},
+	{"set to error", ColorError},
+	{"color red", ColorError},
+	{"color orange", ColorError},
+	{"mark as failed", ColorError},
+
+	// Review (pink)
+	{"mark as review", ColorReview},
+	{"set color to review", ColorReview},
+	{"set to review", ColorReview},
+	{"color pink", ColorReview},
+	{"mark for review", ColorReview},
+
+	// Research (purple)
+	{"mark as research", ColorResearch},
+	{"set color to research", ColorResearch},
+	{"set to research", ColorResearch},
+	{"color purple", ColorResearch},
+	{"mark for research", ColorResearch},
 }
 
 // modelChangePhrases is a table of known model-change phrases.
 // Phrases are checked in order, first match wins.
 var modelChangePhrases = []modelChangePhrase{
-	// Direct model switches
+	// Direct model switches - Opus
 	{"use opus", "claude-opus-4-6", 0},
 	{"switch to opus", "claude-opus-4-6", 0},
+	{"let's use opus", "claude-opus-4-6", 0},
+	{"lets use opus", "claude-opus-4-6", 0},
+	{"can we use opus", "claude-opus-4-6", 0},
+	{"i need opus", "claude-opus-4-6", 0},
+	{"need opus for this", "claude-opus-4-6", 0},
+	{"go with opus", "claude-opus-4-6", 0},
+	{"use opus for this", "claude-opus-4-6", 0},
+
+	// Direct model switches - Sonnet
 	{"use sonnet", "claude-sonnet-4-6", 0},
 	{"switch to sonnet", "claude-sonnet-4-6", 0},
+	{"let's use sonnet", "claude-sonnet-4-6", 0},
+	{"lets use sonnet", "claude-sonnet-4-6", 0},
+	{"can we use sonnet", "claude-sonnet-4-6", 0},
+	{"go back to sonnet", "claude-sonnet-4-6", 0},
+	{"back to sonnet", "claude-sonnet-4-6", 0},
+	{"use sonnet for this", "claude-sonnet-4-6", 0},
+
+	// Direct model switches - Haiku
 	{"use haiku", "claude-haiku-4-5", 0},
 	{"switch to haiku", "claude-haiku-4-5", 0},
+	{"let's use haiku", "claude-haiku-4-5", 0},
+	{"lets use haiku", "claude-haiku-4-5", 0},
+	{"can we use haiku", "claude-haiku-4-5", 0},
+	{"switch me to haiku", "claude-haiku-4-5", 0},
+	{"try haiku", "claude-haiku-4-5", 0},
+	{"use haiku for this", "claude-haiku-4-5", 0},
 
 	// Direct to best model (opus)
 	{"use the best model", "claude-opus-4-6", 0},
 	{"use your best", "claude-opus-4-6", 0},
 	{"maximum intelligence", "claude-opus-4-6", 0},
+	{"use the smartest model", "claude-opus-4-6", 0},
+	{"use your smartest", "claude-opus-4-6", 0},
+	{"i need the best model", "claude-opus-4-6", 0},
+	{"give me your best", "claude-opus-4-6", 0},
 
 	// Direct to fastest model (haiku)
 	{"use the fastest model", "claude-haiku-4-5", 0},
 	{"use the cheapest", "claude-haiku-4-5", 0},
 	{"speed mode", "claude-haiku-4-5", 0},
+	{"fast mode", "claude-haiku-4-5", 0},
+	{"quick mode", "claude-haiku-4-5", 0},
+	{"use the quick model", "claude-haiku-4-5", 0},
 
 	// Reset to default (special marker)
 	{"back to default", "__reset__", 0},
 	{"reset model", "__reset__", 0},
 	{"use default model", "__reset__", 0},
+	{"go back to default", "__reset__", 0},
+	{"use the default model", "__reset__", 0},
 
 	// Tier escalation
 	{"think harder", "", 1},
@@ -204,6 +343,11 @@ var modelChangePhrases = []modelChangePhrase{
 	{"more powerful model", "", 1},
 	{"stronger model", "", 1},
 	{"smarter model", "", 1},
+	{"step up the model", "", 1},
+	{"escalate to better model", "", 1},
+	{"this is too complex", "", 1},
+	{"need more intelligence", "", 1},
+	{"use a more capable model", "", 1},
 
 	// Tier de-escalation
 	{"quick answer", "", -1},
@@ -212,6 +356,10 @@ var modelChangePhrases = []modelChangePhrase{
 	{"lighter model", "", -1},
 	{"cheaper model", "", -1},
 	{"simpler model", "", -1},
+	{"step down the model", "", -1},
+	{"use a lighter model", "", -1},
+	{"this is overkill", "", -1},
+	{"use a faster model", "", -1},
 }
 
 // modelQueryPhrases is a table of known model query phrases.
@@ -223,6 +371,14 @@ var modelQueryPhrases = []string{
 	"current model",
 }
 
+// WorkerResult represents a completed worker's output for injection into the next prompt.
+type WorkerResult struct {
+	Index  int    // Worker index (1-based for display)
+	Model  string // Model used by the worker
+	Result string // Worker's output
+	Error  string // Worker's error message (empty if successful)
+}
+
 // SessionManager manages per-topic Claude Code subprocess sessions.
 // Each forum topic gets exactly one worker goroutine that serialises
 // subprocess invocations. Messages that arrive during processing are
@@ -232,11 +388,12 @@ type SessionManager struct {
 	sender   *Sender
 	proxyURL string
 
-	mu                   sync.Mutex
-	topics               map[topicKey]*topicWorker
-	pinnedUpdateLastSeen map[topicKey]time.Time         // debounce: track last pinned msg update time
-	pendingContext       map[topicKey]string            // pending context to inject into next prompt
-	activeInvocations    map[topicKey]*activeInvocation // tracks running commands for cancellation
+	mu                    sync.Mutex
+	topics                map[topicKey]*topicWorker
+	pinnedUpdateLastSeen  map[topicKey]time.Time         // debounce: track last pinned msg update time
+	pendingContext        map[topicKey]string            // pending context to inject into next prompt
+	pendingWorkerResults  map[topicKey][]WorkerResult    // completed worker results to inject into next prompt
+	activeInvocations     map[topicKey]*activeInvocation // tracks running commands for cancellation
 }
 
 type topicKey struct {
@@ -362,6 +519,11 @@ func (t *toolInput) String() string {
 	return str
 }
 
+// updateProgressInput represents the input for the update_progress synthetic tool.
+type updateProgressInput struct {
+	Message string `json:"message"`
+}
+
 // contentBlockStop is a content_block_stop event nested inside a stream_event
 // line's "event" field. It marks the end of a content block.
 type contentBlockStop struct {
@@ -391,6 +553,7 @@ func NewSessionManager(db *DB, sender *Sender, proxyURL string) *SessionManager 
 		topics:               make(map[topicKey]*topicWorker),
 		pinnedUpdateLastSeen: make(map[topicKey]time.Time),
 		pendingContext:       make(map[topicKey]string),
+		pendingWorkerResults: make(map[topicKey][]WorkerResult),
 		activeInvocations:    make(map[topicKey]*activeInvocation),
 	}
 }
@@ -997,6 +1160,45 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		}
 	}
 
+	// Check for help intent
+	if last.update.Content != nil && last.update.Content.Text != nil {
+		if detectHelpIntent(*last.update.Content.Text) {
+			// Send the help text
+			_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, HelpText)
+			return // Pure help intent - don't forward to Claude
+		}
+	}
+
+	// Check for color intent
+	if last.update.Content != nil && last.update.Content.Text != nil {
+		if session == nil {
+			// Color intents only work within a session
+			// Continue to other checks
+		} else {
+			detected, targetColor := detectColorIntent(*last.update.Content.Text)
+			if detected {
+				// Update the session icon color
+				if err := m.db.SetSessionIconColor(ctx, key.chatID, key.threadID, targetColor); err != nil {
+					log.Printf("[session_mgr] set icon color: %v", err)
+					_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Error setting icon color.")
+					return
+				}
+
+				// Update the Telegram topic
+				if err := m.updateTopicColor(ctx, key.chatID, key.threadID, targetColor); err != nil {
+					log.Printf("[session_mgr] update topic color: %v", err)
+					_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Error updating Telegram topic color.")
+					return
+				}
+
+				// Send confirmation
+				colorName := colorToName(targetColor)
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, fmt.Sprintf("Topic color set to: %s", colorName))
+				return // Pure color intent - don't forward to Claude
+			}
+		}
+	}
+
 	// Get the notification mode from the session (default to "live")
 	notificationMode := "live"
 	if session != nil && session.NotificationMode != "" {
@@ -1160,7 +1362,21 @@ func (m *SessionManager) invokeClaudeAPI(
 
 	cmd := exec.CommandContext(subprocCtx, "claude", args...)
 	cmd.Dir = group.CWD
-	cmd.Stdin = strings.NewReader(prompt)
+
+	// Use io.Pipe for stdin so we can write tool results back for synthetic tools
+	stdinR, stdinW := io.Pipe()
+	cmd.Stdin = stdinR
+	defer stdinW.Close()
+
+	// Write the initial prompt in a goroutine to avoid blocking
+	promptWritten := make(chan struct{}, 1)
+	go func() {
+		defer stdinW.Close()
+		if _, err := io.WriteString(stdinW, prompt); err != nil {
+			log.Printf("[session_mgr] write prompt to stdin: %v", err)
+		}
+		close(promptWritten)
+	}()
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1193,15 +1409,60 @@ func (m *SessionManager) invokeClaudeAPI(
 	scanner.Buffer(make([]byte, scannerMaxBuf), scannerMaxBuf)
 
 	var (
-		textBuf       strings.Builder
-		lastEdit      time.Time
-		lastToolEdit  time.Time // separate timer for tool status updates
-		streamMsgID   int64
-		out           claudeOutput
-		activeTool    string // name of the currently running tool
-		toolInput     string // input for the currently running tool (truncated)
-		toolCompleted bool   // true when the current tool has completed
+		textBuf           strings.Builder
+		lastEdit          time.Time
+		lastToolEdit      time.Time // separate timer for tool status updates
+		streamMsgID       int64
+		out               claudeOutput
+		activeTool        string // name of the currently running tool
+		toolInput         string // input for the currently running tool (truncated)
+		toolCompleted     bool   // true when the current tool has completed
+		isSyntheticTool   bool   // true if current tool is synthetic (update_progress, spawn_worker)
+		syntheticToolID   string // tool_use_id for the current synthetic tool
 	)
+
+	// Progress ticker: if no Telegram message has been sent for progress_interval_sec
+	// (default 120s), the bridge posts 'Still working... (Xm elapsed)' to the thread.
+	progressInterval := time.Duration(group.ProgressIntervalSec) * time.Second
+	lastSent := time.Now() // Track last time a message was sent to Telegram
+	done := make(chan struct{})
+	if progressInterval > 0 && enableStreaming {
+		// Start ticker goroutine for progress heartbeat
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			startTime := time.Now()
+			for {
+				select {
+				case <-ticker.C:
+					if time.Since(lastSent) >= progressInterval {
+						elapsed := time.Since(startTime)
+						var elapsedStr string
+						if elapsed < time.Minute {
+							elapsedStr = fmt.Sprintf("%ds", int(elapsed.Seconds()))
+						} else {
+							elapsedStr = fmt.Sprintf("%dm", int(elapsed.Minutes()))
+						}
+						msg := fmt.Sprintf("Still working... (%s elapsed)", elapsedStr)
+
+						// Use placeholder if available
+						msgID := placeholderID
+						if msgID == 0 && streamMsgID != 0 {
+							msgID = streamMsgID
+						}
+						if msgID != 0 {
+							if err := m.sender.EditMessage(sendCtx, chatID, msgID, msg); err != nil {
+								log.Printf("[session_mgr] progress ticker (%d,%d): %v", chatID, *threadID, err)
+							}
+						}
+						lastSent = time.Now() // Reset after sending heartbeat
+					}
+				case <-done:
+					return
+				}
+			}
+		}()
+	}
 
 	// Determine streaming behavior based on notification mode
 	// live: stream every update (default)
@@ -1605,6 +1866,7 @@ func (m *SessionManager) updatePinnedMetadata(ctx context.Context, session *Sess
 // extras maps each batch index to resolved attachment data (image path or transcription).
 // Single message: used as-is.
 // Multiple messages: previous ones listed under a header, last one highlighted.
+// If pending worker results exist, they are prepended before the user message.
 // If pending context exists for the topic, it's prepended to the prompt.
 func (m *SessionManager) buildSessionPrompt(key topicKey, batch []sessionMsg, extras []msgExtra) string {
 	texts := make([]string, 0, len(batch))
@@ -1633,7 +1895,29 @@ func (m *SessionManager) buildSessionPrompt(key topicKey, batch []sessionMsg, ex
 		)
 	}
 
-	// Check for pending context and prepend it
+	// Check for pending worker results and prepend them
+	m.mu.Lock()
+	workerResults, hasWorkerResults := m.pendingWorkerResults[key]
+	if hasWorkerResults {
+		delete(m.pendingWorkerResults, key) // Clear after use
+	}
+	m.mu.Unlock()
+
+	prompt := basePrompt
+	if hasWorkerResults && len(workerResults) > 0 {
+		var resultParts []string
+		for _, wr := range workerResults {
+			if wr.Result == "" && wr.Error != "" {
+				resultParts = append(resultParts, fmt.Sprintf("Worker %d (model: %s) FAILED: %s", wr.Index, wr.Model, wr.Error))
+			} else {
+				resultParts = append(resultParts, fmt.Sprintf("Worker %d (model: %s): %s", wr.Index, wr.Model, wr.Result))
+			}
+		}
+		workerResultsText := fmt.Sprintf("[Worker results from previous invocation]\n%s", strings.Join(resultParts, "\n"))
+		prompt = fmt.Sprintf("%s\n\n[User message]\n%s", workerResultsText, prompt)
+	}
+
+	// Check for pending context and prepend it (after worker results)
 	m.mu.Lock()
 	pendingCtx, hasPending := m.pendingContext[key]
 	if hasPending {
@@ -1642,10 +1926,10 @@ func (m *SessionManager) buildSessionPrompt(key topicKey, batch []sessionMsg, ex
 	m.mu.Unlock()
 
 	if hasPending && pendingCtx != "" {
-		return fmt.Sprintf("Context from another topic:\n\n%s\n\n---\n\n%s", pendingCtx, basePrompt)
+		return fmt.Sprintf("Context from another topic:\n\n%s\n\n---\n\n%s", pendingCtx, prompt)
 	}
 
-	return basePrompt
+	return prompt
 }
 
 // sessionMsgText extracts the prompt text from an update.
@@ -2194,6 +2478,120 @@ func extractTopicName(text string) string {
 	return fmt.Sprintf("Session %d", time.Now().Unix())
 }
 
+// detectHelpIntent checks text for help query phrases and returns whether
+// the text is purely a help request (no substantial remaining text).
+func detectHelpIntent(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	for _, phrase := range helpPhrases {
+		if strings.HasPrefix(lower, phrase) {
+			// Check if there's substantial text beyond the phrase
+			remainder := strings.TrimSpace(lower[len(phrase):])
+			// If remainder is empty or just punctuation/very short, treat as pure help request
+			if len(remainder) <= 10 {
+				return true
+			}
+			// Otherwise, let Claude answer the question
+			return false
+		}
+	}
+	return false
+}
+
+// detectColorIntent checks text for color-setting phrases and returns the target
+// color and whether a color intent was detected. Only triggers if the text is
+// primarily a color request (not too much additional content).
+func detectColorIntent(text string) (detected bool, targetColor int) {
+	lower := strings.ToLower(strings.TrimSpace(text))
+
+	for _, cp := range colorPhrases {
+		if !strings.HasPrefix(lower, cp.phrase) {
+			continue
+		}
+
+		// Check remainder length - if too much additional text, this might not be
+		// a pure color-setting intent
+		remainder := strings.TrimSpace(lower[len(cp.phrase):])
+		if len(remainder) > 15 {
+			// Too much additional text - might be a conversation about colors
+			// rather than a command to set color
+			continue
+		}
+
+		return true, cp.targetColor
+	}
+
+	return false, 0
+}
+
+// colorToName converts an icon color integer to a human-readable name.
+func colorToName(color int) string {
+	switch color {
+	case ColorActive:
+		return "active"
+	case ColorComplete:
+		return "complete"
+	case ColorBlocked:
+		return "blocked"
+	case ColorError:
+		return "error"
+	case ColorReview:
+		return "review"
+	case ColorResearch:
+		return "research"
+	default:
+		return fmt.Sprintf("unknown (%d)", color)
+	}
+}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fmt.Sprintf("Session %d", time.Now().Unix())
+	}
+
+	lower := strings.ToLower(text)
+
+	// Check for name indicators: "called", "for", "named", ":"
+	indicators := []string{" called ", " for ", " named ", ":"}
+	for _, indicator := range indicators {
+		idx := strings.Index(lower, indicator)
+		if idx != -1 {
+			// Extract the name after the indicator
+			nameStart := idx + len(indicator)
+			name := strings.TrimSpace(text[nameStart:])
+
+			// Truncate at 50 chars or at sentence boundaries
+			if len(name) > 50 {
+				// Try to truncate at a word boundary
+				cut := 50
+				for ; cut > 0 && cut > 40; cut-- {
+					if name[cut] == ' ' || name[cut] == '.' || name[cut] == ',' {
+						break
+					}
+				}
+				if cut > 0 {
+					name = strings.TrimSpace(name[:cut])
+				} else {
+					name = name[:50]
+				}
+			}
+			if name != "" {
+				return name
+			}
+		}
+	}
+
+	// Use first 4 words of the remainder
+	words := strings.Fields(text)
+	if len(words) > 4 {
+		return strings.Join(words[:4], " ")
+	}
+	if len(words) > 0 {
+		return text
+	}
+
+	// Fallback to timestamp
+	return fmt.Sprintf("Session %d", time.Now().Unix())
+}
+
 // updateTopicColor updates both the database and the Telegram topic icon color.
 // Only sends the update if the color is different from the current color.
 func (m *SessionManager) updateTopicColor(ctx context.Context, chatID, threadID int64, newColor int) error {
@@ -2276,6 +2674,15 @@ func (m *SessionManager) SetPendingContext(chatID, threadID int64, context strin
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pendingContext[key] = context
+}
+
+// AddPendingWorkerResult stores a completed worker result for injection into the next prompt.
+// Multiple results for the same topic are accumulated and prepended together.
+func (m *SessionManager) AddPendingWorkerResult(chatID, threadID int64, result WorkerResult) {
+	key := topicKey{chatID: chatID, threadID: threadID}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pendingWorkerResults[key] = append(m.pendingWorkerResults[key], result)
 }
 
 // GetSessionContext retrieves context from another session for use with /context.

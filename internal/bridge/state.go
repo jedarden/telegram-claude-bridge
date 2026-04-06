@@ -29,17 +29,18 @@ type DB struct {
 
 // Group represents a configured Telegram group/supergroup.
 type Group struct {
-	ChatID           int64
-	Name             string
-	CWD              string
-	DefaultModel     string
-	MaxBudget        float64
-	TimeoutSec       int
-	PermissionMode   string
-	AllowedTools     string // JSON array of tool names, or empty for all tools
-	DisallowedTools  string // JSON array of tool names, or empty for no restrictions
-	MaxSubtasks      int    // Maximum concurrent subtasks per topic (default 5)
-	CreatedAt        time.Time
+	ChatID             int64
+	Name               string
+	CWD                string
+	DefaultModel       string
+	MaxBudget          float64
+	TimeoutSec         int
+	PermissionMode     string
+	AllowedTools       string // JSON array of tool names, or empty for all tools
+	DisallowedTools    string // JSON array of tool names, or empty for no restrictions
+	MaxSubtasks        int    // Maximum concurrent subtasks per topic (default 5)
+	ProgressIntervalSec int    // Progress ticker interval in seconds (0 = disabled, default 120)
+	CreatedAt          time.Time
 }
 
 // Session represents an active Claude Code session mapped to a (chat_id, thread_id) pair.
@@ -118,7 +119,7 @@ type BackgroundJob struct {
 	StartedAt time.Time // When the job was started
 }
 
-const schemaVersion = 14
+const schemaVersion = 15
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -246,6 +247,9 @@ var migrations = []string{
 
 			CREATE INDEX IF NOT EXISTS idx_background_jobs_chat_thread ON background_jobs(chat_id, thread_id);
 			CREATE INDEX IF NOT EXISTS idx_background_jobs_status ON background_jobs(status);`,
+
+			// Version 15 — add progress_interval_sec to groups for progress ticker.
+			`ALTER TABLE groups ADD COLUMN progress_interval_sec INTEGER NOT NULL DEFAULT 120;`,
 	}
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
 // and applies any pending migrations.
@@ -337,7 +341,7 @@ func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec,
 		        COALESCE(permission_mode,'acceptEdits'),
 		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''),
-		        COALESCE(max_subtasks,5), created_at
+		        COALESCE(max_subtasks,5), COALESCE(progress_interval_sec,120), created_at
 		 FROM groups WHERE chat_id = ?`, chatID)
 	return scanGroup(row)
 }
@@ -345,21 +349,22 @@ func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 // UpsertGroup inserts or replaces a group record.
 func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, allowed_tools, disallowed_tools, max_subtasks, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, allowed_tools, disallowed_tools, max_subtasks, progress_interval_sec, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(chat_id) DO UPDATE SET
-		   name            = excluded.name,
-		   cwd              = excluded.cwd,
-		   default_model   = excluded.default_model,
-		   max_budget      = excluded.max_budget,
-		   timeout_sec     = excluded.timeout_sec,
-		   permission_mode  = excluded.permission_mode,
-		   allowed_tools    = excluded.allowed_tools,
-		   disallowed_tools = excluded.disallowed_tools,
-		   max_subtasks     = excluded.max_subtasks`,
+		   name                = excluded.name,
+		   cwd                  = excluded.cwd,
+		   default_model       = excluded.default_model,
+		   max_budget          = excluded.max_budget,
+		   timeout_sec         = excluded.timeout_sec,
+		   permission_mode      = excluded.permission_mode,
+		   allowed_tools        = excluded.allowed_tools,
+		   disallowed_tools     = excluded.disallowed_tools,
+		   max_subtasks         = excluded.max_subtasks,
+		   progress_interval_sec = excluded.progress_interval_sec`,
 		g.ChatID, g.Name, g.CWD, g.DefaultModel, g.MaxBudget, g.TimeoutSec, g.PermissionMode,
 		nullableString(g.AllowedTools), nullableString(g.DisallowedTools),
-		g.MaxSubtasks,
+		g.MaxSubtasks, g.ProgressIntervalSec,
 		g.CreatedAt.UTC().Format(time.RFC3339),
 	)
 	return err
@@ -371,7 +376,7 @@ func (d *DB) ListGroups(ctx context.Context) ([]*Group, error) {
 		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec,
 		        COALESCE(permission_mode,'acceptEdits'),
 		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''),
-		        COALESCE(max_subtasks,5), created_at
+		        COALESCE(max_subtasks,5), COALESCE(progress_interval_sec,120), created_at
 		 FROM groups ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -416,7 +421,7 @@ type groupScanner interface {
 func scanGroup(s groupScanner) (*Group, error) {
 	var g Group
 	var createdAt string
-	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &g.PermissionMode, &g.AllowedTools, &g.DisallowedTools, &g.MaxSubtasks, &createdAt)
+	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &g.PermissionMode, &g.AllowedTools, &g.DisallowedTools, &g.MaxSubtasks, &g.ProgressIntervalSec, &createdAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

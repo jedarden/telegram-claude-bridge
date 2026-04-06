@@ -16,7 +16,7 @@ import (
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
 )
 
-const helpText = `Available commands:
+const HelpText = `Available commands:
 
 User commands:
 /new <name> — create a new topic and start a Claude session
@@ -165,7 +165,7 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 	case "/update":
 		reply, err = h.cmdUpdate(ctx, update, args)
 	case "/help":
-		reply = helpText
+		reply = HelpText
 	case "/ping":
 		reply, err = h.cmdPing(ctx)
 	case "/cost":

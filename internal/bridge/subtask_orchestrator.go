@@ -28,15 +28,17 @@ type SubtaskRequest struct {
 // Each subtask runs in its own goroutine with a fresh session, and results
 // are posted back to the originating topic as they complete (non-blocking fan-in).
 type SubtaskOrchestrator struct {
-	db     *DB
-	sender *Sender
+	db         *DB
+	sender     *Sender
+	sessionMgr *SessionManager // For injecting worker results into next prompt
 }
 
 // NewSubtaskOrchestrator creates a new SubtaskOrchestrator.
-func NewSubtaskOrchestrator(db *DB, sender *Sender) *SubtaskOrchestrator {
+func NewSubtaskOrchestrator(db *DB, sender *Sender, sessionMgr *SessionManager) *SubtaskOrchestrator {
 	return &SubtaskOrchestrator{
-		db:     db,
-		sender: sender,
+		db:         db,
+		sender:     sender,
+		sessionMgr: sessionMgr,
 	}
 }
 
@@ -198,9 +200,26 @@ func (o *SubtaskOrchestrator) executeSubtask(ctx context.Context, req SubtaskReq
 	}
 }
 
-// postResult sends a single subtask result to the topic.
+// postResult sends a single subtask result to the topic and stores it for injection.
 func (o *SubtaskOrchestrator) postResult(ctx context.Context, req SubtaskRequest, result *subtaskResult, completed, total int) {
 	tidPtr := &req.ThreadID
+
+	// Store the result for injection into the next orchestrator prompt
+	model := resolveSessionModel(req.Session, req.Group)
+	if result.Error != nil {
+		o.sessionMgr.AddPendingWorkerResult(req.ChatID, req.ThreadID, WorkerResult{
+			Index:  completed,
+			Model:  model,
+			Result: "",
+			Error:  result.Error.Error(),
+		})
+	} else {
+		o.sessionMgr.AddPendingWorkerResult(req.ChatID, req.ThreadID, WorkerResult{
+			Index:  completed,
+			Model:  model,
+			Result: result.Output,
+		})
+	}
 
 	if result.Error != nil {
 		// Post error result
