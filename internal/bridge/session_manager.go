@@ -89,6 +89,34 @@ var notifyPhrases = []notifyIntent{
 	{"keep me posted", "live"},
 }
 
+// costPhrases is a table of known cost query phrases.
+// Checked case-insensitively; first match wins.
+var costPhrases = []string{
+	"how much",
+	"what is the cost",
+	"whats the cost",
+	"what's the cost",
+	"show cost",
+	"how much has this cost",
+	"total cost",
+	"how much money",
+	"whats the bill",
+	"what's the bill",
+}
+
+// statusPhrases is a table of known status query phrases.
+// Checked case-insensitively; first match wins.
+var statusPhrases = []string{
+	"what are you doing",
+	"what are you working on",
+	"show status",
+	"are you busy",
+	"whats running",
+	"what's running",
+	"session info",
+	"show info",
+}
+
 // modelChangePhrases is a table of known model-change phrases.
 // Phrases are checked in order, first match wins.
 var modelChangePhrases = []modelChangePhrase{
@@ -649,6 +677,34 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 				// Message was only a notify mode change request - no Claude invocation needed
 				return
 			}
+		}
+	}
+
+	// Check for cost query intent
+	if last.update.Content != nil && last.update.Content.Text != nil {
+		if detectCostIntent(*last.update.Content.Text) {
+			reply, err := m.FormatCostResponse(ctx, key.chatID, key.threadID)
+			if err != nil {
+				log.Printf("[session_mgr] format cost response: %v", err)
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Error retrieving cost information.")
+			} else {
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, reply)
+			}
+			return // Pure query intent - don't forward to Claude
+		}
+	}
+
+	// Check for status query intent
+	if last.update.Content != nil && last.update.Content.Text != nil {
+		if detectStatusIntent(*last.update.Content.Text) {
+			reply, err := m.FormatStatusResponse(ctx, key.chatID, key.threadID)
+			if err != nil {
+				log.Printf("[session_mgr] format status response: %v", err)
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Error retrieving status information.")
+			} else {
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, reply)
+			}
+			return // Pure query intent - don't forward to Claude
 		}
 	}
 
@@ -1568,6 +1624,44 @@ func applyTierChange(currentModel string, delta int) (newModel string, changed b
 	}
 }
 
+// detectCostIntent checks text for cost query phrases and returns whether
+// the text is purely a cost query (no substantial remaining text).
+func detectCostIntent(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	for _, phrase := range costPhrases {
+		if strings.HasPrefix(lower, phrase) {
+			// Check if there's substantial text beyond the phrase
+			remainder := strings.TrimSpace(lower[len(phrase):])
+			// If remainder is empty or just punctuation/very short, treat as pure query
+			if len(remainder) <= 10 {
+				return true
+			}
+			// Otherwise, let Claude answer the question
+			return false
+		}
+	}
+	return false
+}
+
+// detectStatusIntent checks text for status query phrases and returns whether
+// the text is purely a status query (no substantial remaining text).
+func detectStatusIntent(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	for _, phrase := range statusPhrases {
+		if strings.HasPrefix(lower, phrase) {
+			// Check if there's substantial text beyond the phrase
+			remainder := strings.TrimSpace(lower[len(phrase):])
+			// If remainder is empty or just punctuation/very short, treat as pure query
+			if len(remainder) <= 10 {
+				return true
+			}
+			// Otherwise, let Claude answer the question
+			return false
+		}
+	}
+	return false
+}
+
 // updateTopicColor updates both the database and the Telegram topic icon color.
 // Only sends the update if the color is different from the current color.
 func (m *SessionManager) updateTopicColor(ctx context.Context, chatID, threadID int64, newColor int) error {
@@ -1697,6 +1791,88 @@ func (m *SessionManager) GetSessionContext(ctx context.Context, chatID, threadID
 	}
 
 	return contextStr, nil
+}
+
+// FormatCostResponse returns a formatted cost response for a topic.
+// Includes both the topic's session cost and the group total cost.
+func (m *SessionManager) FormatCostResponse(ctx context.Context, chatID, threadID int64) (string, error) {
+	// Get the topic cost
+	topicCost, err := m.db.GetTopicTotalCost(ctx, chatID, threadID)
+	if err != nil {
+		return "", fmt.Errorf("get topic cost: %w", err)
+	}
+
+	// Get the group total cost
+	groupTotal, err := m.db.GetGroupTotalCost(ctx, chatID)
+	if err != nil {
+		return "", fmt.Errorf("get group total cost: %w", err)
+	}
+
+	// Get session details for more context
+	session, err := m.db.GetSession(ctx, chatID, threadID)
+	if err != nil {
+		return "", fmt.Errorf("get session: %w", err)
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "💰 Topic Cost: $%.4f\n\n", topicCost)
+
+	if session != nil {
+		fmt.Fprintf(&sb, "Session: %s\nMessages: %d\n", session.SessionID, session.MessageCount)
+	}
+
+	fmt.Fprintf(&sb, "\nGroup Total: $%.4f", groupTotal)
+
+	// Add budget info if configured
+	group, err := m.db.GetGroup(ctx, chatID)
+	if err == nil && group != nil && group.MaxBudget > 0 {
+		budgetPercent := (groupTotal / group.MaxBudget) * 100
+		fmt.Fprintf(&sb, " / $%.2f budget (%.1f%% used)", group.MaxBudget, budgetPercent)
+	}
+
+	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// FormatStatusResponse returns a formatted status response for a topic.
+// Shows session information similar to /info command.
+func (m *SessionManager) FormatStatusResponse(ctx context.Context, chatID, threadID int64) (string, error) {
+	session, err := m.db.GetSession(ctx, chatID, threadID)
+	if err != nil {
+		return "", fmt.Errorf("get session: %w", err)
+	}
+	if session == nil {
+		return "No session found for this topic.", nil
+	}
+
+	group, err := m.db.GetGroup(ctx, chatID)
+	if err != nil {
+		return "", fmt.Errorf("get group: %w", err)
+	}
+
+	model := session.Model
+	if model == "" && group != nil {
+		model = group.DefaultModel
+	}
+	if model == "" {
+		model = defaultSessionModel
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Session ID: %s\n", session.SessionID)
+	fmt.Fprintf(&sb, "Model: %s\n", model)
+	fmt.Fprintf(&sb, "CWD: %s\n", session.CWD)
+	fmt.Fprintf(&sb, "Messages: %d\n", session.MessageCount)
+	fmt.Fprintf(&sb, "Cost: $%.4f\n", session.TotalCostUSD)
+	fmt.Fprintf(&sb, "Status: %s\n", session.Status)
+	notifyMode := session.NotificationMode
+	if notifyMode == "" {
+		notifyMode = "live"
+	}
+	fmt.Fprintf(&sb, "Notification mode: %s\n", notifyMode)
+	fmt.Fprintf(&sb, "Thread ID: %d\n", session.ThreadID)
+	fmt.Fprintf(&sb, "Started: %s", session.CreatedAt.Format("2006-01-02 15:04:05"))
+
+	return strings.TrimRight(sb.String(), "\n"), nil
 }
 
 // CancelTopic sends SIGINT to the active Claude subprocess for a topic.
