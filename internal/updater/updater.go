@@ -172,7 +172,9 @@ func (u *Updater) checkAndUpdate() {
 	u.replaceAndRestart(newCommit)
 }
 
-// hasUncommittedChanges checks if there are uncommitted changes in the repo.
+// hasUncommittedChanges checks if there are modified or staged changes in the
+// repo. Untracked files (??) are intentionally ignored — they do not affect
+// build reproducibility and are present at runtime (bin/, *.db, etc.).
 func (u *Updater) hasUncommittedChanges(ctx context.Context) bool {
 	cmd := exec.CommandContext(ctx, "git", "-C", u.repoPath, "status", "--porcelain")
 	output, err := cmd.Output()
@@ -180,7 +182,17 @@ func (u *Updater) hasUncommittedChanges(ctx context.Context) bool {
 		log.Printf("[updater] git status failed: %v", err)
 		return true // Skip update on error
 	}
-	return len(strings.TrimSpace(string(output))) > 0
+	for _, line := range strings.Split(string(output), "\n") {
+		if len(line) < 2 {
+			continue
+		}
+		// Porcelain format: XY filename. Skip untracked (??) and ignored (!!) lines.
+		if line[:2] == "??" || line[:2] == "!!" {
+			continue
+		}
+		return true // Any other status means modified/staged/conflicted
+	}
+	return false
 }
 
 // fetchAndCompare fetches origin/main and compares with local HEAD.

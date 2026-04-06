@@ -1,0 +1,13 @@
+# Built binaries
+bin/
+bridge
+proxy
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+*.db.sender
+
+# Temp files
+/tmp/
