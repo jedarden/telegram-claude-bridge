@@ -35,7 +35,11 @@ User commands:
 /cancel [thread_id] — cancel the running request in this topic or another topic
 	/timeout [N] — set per-topic timeout in seconds (0 = no limit)
 /cost — show cost information for this group or topic
+/budget [amount] — set group budget
 /parallel — run up to 5 prompts in parallel (separate prompts with ---)
+/bg <command> — run a shell command in the background
+/jobs — list running background jobs for this topic
+/kill <job_id> — kill a running background job
 /ping — check proxy latency
 /version — show version information
 /help — show this message
@@ -44,7 +48,6 @@ Admin commands:
 /cwd [path] — set this group's working directory
 /permission [mode] — set Claude's permission mode
 /config — view or set group configuration
-/budget [amount] — set group budget
 /update [do] — check for updates or apply update now
 /adduser <telegram_user_id> [role] — add a user (role: admin|user)
 /removeuser <telegram_user_id> — remove a user
@@ -60,16 +63,17 @@ var validPermissionModes = map[string]bool{
 
 // CommandHandler dispatches bot commands sent in the General topic.
 type CommandHandler struct {
-	db                 *DB
-	sender             *Sender
-	proxyURL           string
-	client             *http.Client
-	updater            UpdaterInterface
-	sessionMgr         *SessionManager // optional, for context commands
+	db                  *DB
+	sender              *Sender
+	proxyURL            string
+	client              *http.Client
+	updater             UpdaterInterface
+	sessionMgr          *SessionManager // optional, for context commands
 	subtaskOrchestrator *SubtaskOrchestrator // optional, for parallel commands
-	bridgeVer          string
-	bridgeSHA          string
-	buildDate          string
+	bgJobMgr            *BackgroundJobManager // optional, for background job commands
+	bridgeVer           string
+	bridgeSHA           string
+	buildDate           string
 }
 
 // UpdaterInterface defines the interface for update commands.
@@ -110,6 +114,11 @@ func (h *CommandHandler) SetSessionManager(sessionMgr *SessionManager) {
 // SetSubtaskOrchestrator sets the subtask orchestrator for parallel commands.
 func (h *CommandHandler) SetSubtaskOrchestrator(orch *SubtaskOrchestrator) {
 	h.subtaskOrchestrator = orch
+}
+
+// SetBackgroundJobManager sets the background job manager for /bg, /jobs, /kill commands.
+func (h *CommandHandler) SetBackgroundJobManager(mgr *BackgroundJobManager) {
+	h.bgJobMgr = mgr
 }
 
 // Handle implements CommandHandlerFunc. It dispatches the update to the
@@ -179,6 +188,12 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 			reply, err = h.cmdTimeout(ctx, update, group, args)
 	case "/parallel":
 		reply, err = h.cmdParallel(ctx, update, group, args)
+	case "/bg":
+		reply, err = h.cmdBG(ctx, update, group, args)
+	case "/jobs":
+		reply, err = h.cmdJobs(ctx, update, group)
+	case "/kill":
+		reply, err = h.cmdKill(ctx, update, args)
 	default:
 		reply = fmt.Sprintf("Unknown command: %s\n\nUse /help for available commands.", cmd)
 	}
@@ -1723,4 +1738,90 @@ func splitParallelPrompts(text string) []string {
 		}
 	}
 	return prompts
+}
+
+// cmdBG handles /bg <command> — launches a background shell job.
+func (h *CommandHandler) cmdBG(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	if args == "" {
+		return "Usage: /bg <command>\n\nRuns a shell command in the background. Output is streamed back to the topic.\n\nExample: /bg sleep 30 && echo done", nil
+	}
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+	if h.bgJobMgr == nil {
+		return "Background job manager not available.", nil
+	}
+
+	// Determine thread ID (general topic if none specified)
+	threadID := int64(1) // general topic
+	if update.ThreadID != nil {
+		threadID = *update.ThreadID
+	}
+
+	// Start the background job
+	jobID, err := h.bgJobMgr.Start(ctx, update.ChatID, threadID, args, group.CWD)
+	if err != nil {
+		return "", fmt.Errorf("start background job: %w", err)
+	}
+
+	return fmt.Sprintf("Background job started: `%s`\nJob ID: `%s`", args, jobID), nil
+}
+
+// cmdJobs handles /jobs — lists running background jobs for this topic.
+func (h *CommandHandler) cmdJobs(ctx context.Context, update contract.Update, group *Group) (string, error) {
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+	if h.bgJobMgr == nil {
+		return "Background job manager not available.", nil
+	}
+
+	// Determine thread ID (general topic if none specified)
+	threadID := int64(1) // general topic
+	if update.ThreadID != nil {
+		threadID = *update.ThreadID
+	}
+
+	jobs, err := h.bgJobMgr.List(ctx, update.ChatID, threadID)
+	if err != nil {
+		return "", fmt.Errorf("list background jobs: %w", err)
+	}
+
+	if len(jobs) == 0 {
+		return "No background jobs for this topic.", nil
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Background jobs (%d):\n", len(jobs))
+	for _, job := range jobs {
+		elapsed := time.Since(job.StartedAt).Round(time.Second)
+		statusIcon := "▶"
+		if job.Status != "running" {
+			statusIcon = "■"
+		}
+		exitInfo := ""
+		if job.ExitCode != nil {
+			exitInfo = fmt.Sprintf(" (exit %d)", *job.ExitCode)
+		}
+		fmt.Fprintf(&sb, "  • %s [`%s`] %s%s — elapsed %s\n", statusIcon, job.ID, job.Command, exitInfo, elapsed)
+	}
+
+	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// cmdKill handles /kill <job_id> — kills a running background job.
+func (h *CommandHandler) cmdKill(ctx context.Context, update contract.Update, args string) (string, error) {
+	if args == "" {
+		return "Usage: /kill <job_id>\n\nKills a running background job.\n\nUse /jobs to list running jobs and their IDs.", nil
+	}
+	if h.bgJobMgr == nil {
+		return "Background job manager not available.", nil
+	}
+
+	jobID := strings.TrimSpace(args)
+	if err := h.bgJobMgr.Kill(ctx, jobID); err != nil {
+		return fmt.Sprintf("Failed to kill job: %v", err), nil
+	}
+
+	return fmt.Sprintf("Job `%s` killed.", jobID), nil
 }

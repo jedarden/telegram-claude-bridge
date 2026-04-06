@@ -81,6 +81,10 @@ func main() {
 	subtaskOrchestrator := bridge.NewSubtaskOrchestrator(db, sender)
 	cmdHandler.SetSubtaskOrchestrator(subtaskOrchestrator)
 
+	// Create background job manager and wire it to command handler
+	bgJobMgr := bridge.NewBackgroundJobManager(db, sender)
+	cmdHandler.SetBackgroundJobManager(bgJobMgr)
+
 	// Create session cleanup (disabled if interval is 0)
 	cleanup := bridge.NewSessionCleanup(db, sender, cfg.SessionCleanupInterval, cfg.SessionTTL, cfg.CloseInactiveTopics)
 	cleanup.Start()

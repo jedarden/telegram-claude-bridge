@@ -1,7 +1,7 @@
 # Built binaries
 bin/
-bridge
-proxy
+/bridge
+/proxy
 
 # Database files
 *.db

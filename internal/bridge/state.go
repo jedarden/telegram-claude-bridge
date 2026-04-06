@@ -106,7 +106,19 @@ type Subtask struct {
 	FinishedAt   *time.Time // When the subtask finished (nil if running)
 }
 
-const schemaVersion = 13
+// BackgroundJob represents a running background shell process.
+// This is the database version - the background_jobs.go file has the in-memory version with Cmd.
+type BackgroundJob struct {
+	ID        string    // Unique job identifier (8-character hex)
+	ChatID    int64     // Telegram chat ID
+	ThreadID  int64     // Telegram thread ID
+	Command   string    // The full command being executed
+	Status    string    // "running", "complete", "error", "interrupted"
+	ExitCode  *int      // Exit code (nil if still running or interrupted)
+	StartedAt time.Time // When the job was started
+}
+
+const schemaVersion = 14
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -219,8 +231,22 @@ var migrations = []string{
 
 		CREATE INDEX IF NOT EXISTS idx_subtasks_chat_thread ON subtasks(chat_id, thread_id);
 		CREATE INDEX IF NOT EXISTS idx_subtasks_status ON subtasks(status);`,
-}
 
+			// Version 14 — add background_jobs table for background shell job runner.
+			`CREATE TABLE IF NOT EXISTS background_jobs (
+				id          TEXT PRIMARY KEY,
+				chat_id     INTEGER NOT NULL,
+				thread_id   INTEGER NOT NULL,
+				command     TEXT NOT NULL,
+				status      TEXT NOT NULL DEFAULT 'running',
+				exit_code   INTEGER,
+				started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+				finished_at TEXT
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_background_jobs_chat_thread ON background_jobs(chat_id, thread_id);
+			CREATE INDEX IF NOT EXISTS idx_background_jobs_status ON background_jobs(status);`,
+	}
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
 // and applies any pending migrations.
 func OpenDB(path string) (*DB, error) {
@@ -1105,4 +1131,136 @@ func scanSubtask(s subtaskScanner) (*Subtask, error) {
 		subtask.Status = "running"
 	}
 	return &subtask, nil
+}
+
+// ── background_jobs ───────────────────────────────────────────────────────────
+
+// CreateBackgroundJob inserts a new background job record.
+func (d *DB) CreateBackgroundJob(ctx context.Context, job *BackgroundJob) error {
+	if job.StartedAt.IsZero() {
+		job.StartedAt = time.Now().UTC()
+	}
+	if job.Status == "" {
+		job.Status = "running"
+	}
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO background_jobs (id, chat_id, thread_id, command, status, started_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		job.ID, job.ChatID, job.ThreadID, job.Command, job.Status,
+		job.StartedAt.UTC().Format(time.RFC3339),
+	)
+	return err
+}
+
+// UpdateBackgroundJob updates status, exit_code, and finished_at for a background job.
+func (d *DB) UpdateBackgroundJob(ctx context.Context, job *BackgroundJob) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE background_jobs
+		 SET status = ?, exit_code = ?, finished_at = datetime('now')
+		 WHERE id = ?`,
+		job.Status, job.ExitCode, job.ID,
+	)
+	return err
+}
+
+// GetBackgroundJob retrieves a background job by ID.
+func (d *DB) GetBackgroundJob(ctx context.Context, id string) (*BackgroundJob, error) {
+	row := d.db.QueryRowContext(ctx,
+		`SELECT id, chat_id, thread_id, command, status, exit_code, started_at, finished_at
+		 FROM background_jobs WHERE id = ?`, id)
+
+	return scanBackgroundJob(row)
+}
+
+// ListBackgroundJobsForTopic returns all background jobs for a topic, ordered by started_at descending.
+func (d *DB) ListBackgroundJobsForTopic(ctx context.Context, chatID, threadID int64) ([]*BackgroundJob, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT id, chat_id, thread_id, command, status, exit_code, started_at, finished_at
+		 FROM background_jobs
+		 WHERE chat_id = ? AND thread_id = ?
+		 ORDER BY started_at DESC`,
+		chatID, threadID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []*BackgroundJob
+	for rows.Next() {
+		job, err := scanBackgroundJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+// ListBackgroundJobsByStatus returns all background jobs with a given status.
+func (d *DB) ListBackgroundJobsByStatus(ctx context.Context, status string) ([]*BackgroundJob, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT id, chat_id, thread_id, command, status, exit_code, started_at, finished_at
+		 FROM background_jobs
+		 WHERE status = ?
+		 ORDER BY started_at ASC`,
+		status,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []*BackgroundJob
+	for rows.Next() {
+		job, err := scanBackgroundJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+// DeleteBackgroundJob removes a background job by ID.
+func (d *DB) DeleteBackgroundJob(ctx context.Context, id string) error {
+	_, err := d.db.ExecContext(ctx,
+		`DELETE FROM background_jobs WHERE id = ?`, id)
+	return err
+}
+
+// DeleteBackgroundJobsForTopic removes all background jobs for a topic.
+func (d *DB) DeleteBackgroundJobsForTopic(ctx context.Context, chatID, threadID int64) error {
+	_, err := d.db.ExecContext(ctx,
+		`DELETE FROM background_jobs WHERE chat_id = ? AND thread_id = ?`, chatID, threadID)
+	return err
+}
+
+type backgroundJobScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanBackgroundJob(s backgroundJobScanner) (*BackgroundJob, error) {
+	var job BackgroundJob
+	var startedAt, finishedAt string
+	var exitCode sql.NullInt32
+	err := s.Scan(
+		&job.ID, &job.ChatID, &job.ThreadID, &job.Command, &job.Status,
+		&exitCode, &startedAt, &finishedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	job.StartedAt, _ = time.Parse(time.RFC3339, startedAt)
+	if exitCode.Valid {
+		code := int(exitCode.Int32)
+		job.ExitCode = &code
+	}
+	if job.Status == "" {
+		job.Status = "running"
+	}
+	return &job, nil
 }
