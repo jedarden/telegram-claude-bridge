@@ -1424,9 +1424,13 @@ func (m *SessionManager) invokeClaudeAPI(
 		activeTool        string // name of the currently running tool
 		toolInput         string // input for the currently running tool (truncated)
 		toolCompleted     bool   // true when the current tool has completed
-		isSyntheticTool   bool   // true if current tool is synthetic (update_progress, spawn_worker)
-		syntheticToolID   string // tool_use_id for the current synthetic tool
 	)
+
+	// Determine streaming behavior based on notification mode
+	// live: stream every update (default)
+	// summary: collect all text, send final result only
+	// quiet: collect all text, send minimal output only
+	enableStreaming := (notificationMode == "live")
 
 	// Progress ticker: if no Telegram message has been sent for progress_interval_sec
 	// (default 120s), the bridge posts 'Still working... (Xm elapsed)' to the thread.
@@ -1470,12 +1474,6 @@ func (m *SessionManager) invokeClaudeAPI(
 			}
 		}()
 	}
-
-	// Determine streaming behavior based on notification mode
-	// live: stream every update (default)
-	// summary: collect all text, send final result only
-	// quiet: collect all text, send minimal output only
-	enableStreaming := (notificationMode == "live")
 
 	// flushEdit sends the current accumulated text as an initial message or an
 	// edit of the streaming placeholder. Skipped if the debounce interval hasn't
@@ -2560,25 +2558,8 @@ func detectColorIntent(text string) (detected bool, targetColor int) {
 	return false, 0
 }
 
-// colorToName converts an icon color integer to a human-readable name.
-func colorToName(color int) string {
-	switch color {
-	case ColorActive:
-		return "active"
-	case ColorComplete:
-		return "complete"
-	case ColorBlocked:
-		return "blocked"
-	case ColorError:
-		return "error"
-	case ColorReview:
-		return "review"
-	case ColorResearch:
-		return "research"
-	default:
-		return fmt.Sprintf("unknown (%d)", color)
-	}
-}
+// extractSessionName extracts a short session name from the first user message.
+func extractSessionName(text string) string {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return fmt.Sprintf("Session %d", time.Now().Unix())

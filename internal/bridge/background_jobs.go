@@ -7,12 +7,10 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
-
-	"github.com/jedarden/telegram-claude-bridge/internal/contract"
 )
 
 const (
@@ -324,7 +322,7 @@ func (m *BackgroundJobManager) Kill(ctx context.Context, jobID string) error {
 	}
 
 	// Send SIGTERM
-	if err := cmd.Process.Signal(exec.Signal(15)); err != nil {
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		return fmt.Errorf("send signal to job %s: %w", jobID, err)
 	}
 

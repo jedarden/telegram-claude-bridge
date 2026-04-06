@@ -78,7 +78,7 @@ func main() {
 	cmdHandler.SetSessionManager(sessionMgr)
 
 	// Create subtask orchestrator and wire it to command handler
-	subtaskOrchestrator := bridge.NewSubtaskOrchestrator(db, sender)
+	subtaskOrchestrator := bridge.NewSubtaskOrchestrator(db, sender, sessionMgr)
 	cmdHandler.SetSubtaskOrchestrator(subtaskOrchestrator)
 
 	// Create background job manager and wire it to command handler
