@@ -29,13 +29,14 @@ const (
 
 // Updater handles periodic self-update checks and binary replacement.
 type Updater struct {
-	mu            sync.Mutex
-	repoPath      string
-	binaryPath    string
-	checkInterval time.Duration
-	sender        *bridge.Sender
-	db            *bridge.DB
-	proxyURL      string
+	mu             sync.Mutex
+	repoPath       string
+	binaryPath     string
+	checkInterval  time.Duration
+	sender         *bridge.Sender
+	db             *bridge.DB
+	proxyURL       string
+	runningCommit  string // CommitSHA embedded in the running binary (may be "unknown")
 
 	// updateCh triggers an immediate update check (non-blocking send)
 	updateCh chan struct{}
@@ -64,6 +65,11 @@ type Config struct {
 
 	// ProxyURL is the base URL of the proxy
 	ProxyURL string
+
+	// RunningCommit is the CommitSHA the running binary was built from (embedded via ldflags).
+	// When set, the updater also triggers a rebuild if local HEAD differs from this value,
+	// catching the case where the repo was updated on the same machine that runs the bridge.
+	RunningCommit string
 }
 
 // New creates a new Updater with the given config.
@@ -78,6 +84,7 @@ func New(cfg *Config) *Updater {
 		sender:        cfg.Sender,
 		db:            cfg.DB,
 		proxyURL:      cfg.ProxyURL,
+		runningCommit: cfg.RunningCommit,
 		updateCh:      make(chan struct{}, 1),
 		stopCh:        make(chan struct{}),
 		doneCh:        make(chan struct{}),
@@ -220,7 +227,12 @@ func (u *Updater) fetchAndCompare(ctx context.Context) (string, bool, error) {
 	}
 	remoteSHA := strings.TrimSpace(string(remoteOutput))
 
+	// If the running binary was built from a different commit than HEAD, we need
+	// to rebuild even though local == remote (happens when pushing from this machine).
 	if localSHA == remoteSHA {
+		if u.runningCommit != "" && u.runningCommit != "unknown" && u.runningCommit != localSHA {
+			return localSHA, true, nil
+		}
 		return "", false, nil
 	}
 

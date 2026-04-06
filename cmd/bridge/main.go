@@ -67,6 +67,7 @@ func main() {
 			Sender:        sender,
 			DB:            db,
 			ProxyURL:      cfg.ProxyURL,
+			RunningCommit: CommitSHA,
 		})
 		upd.Start()
 		defer upd.Stop()
