@@ -1439,7 +1439,8 @@ func (m *SessionManager) invokeClaudeAPI(
 	// (default 120s), the bridge posts 'Still working... (Xm elapsed)' to the thread.
 	progressInterval := time.Duration(group.ProgressIntervalSec) * time.Second
 	lastSent := time.Now() // Track last time a message was sent to Telegram
-	done := make(chan struct{})
+	progressDone := make(chan struct{})
+	defer close(progressDone) // Ensure ticker goroutine exits when scanner loop exits
 	if progressInterval > 0 && enableStreaming {
 		// Start ticker goroutine for progress heartbeat
 		go func() {
@@ -1471,7 +1472,7 @@ func (m *SessionManager) invokeClaudeAPI(
 						}
 						lastSent = time.Now() // Reset after sending heartbeat
 					}
-				case <-done:
+				case <-progressDone:
 					return
 				}
 			}
@@ -1571,6 +1572,7 @@ func (m *SessionManager) invokeClaudeAPI(
 			}
 		}
 		lastEdit = time.Now()
+		lastSent = time.Now() // Reset progress ticker on every successful Telegram edit
 		return true
 	}
 
