@@ -33,6 +33,7 @@ User commands:
 /sessions — list all sessions across all groups
 /close <thread_id> — close a session by topic thread_id
 /cancel [thread_id] — cancel the running request in this topic or another topic
+/dispatch [on|off] — toggle dispatcher mode for this topic (orchestrator system prompt)
 	/timeout [N] — set per-topic timeout in seconds (0 = no limit)
 /cost — show cost information for this group or topic
 /budget [amount] — set group budget
@@ -194,6 +195,8 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply, err = h.cmdJobs(ctx, update, group)
 	case "/kill":
 		reply, err = h.cmdKill(ctx, update, args)
+	case "/dispatch":
+		reply, err = h.cmdDispatch(ctx, update, group, args)
 	default:
 		reply = fmt.Sprintf("Unknown command: %s\n\nUse /help for available commands.", cmd)
 	}
@@ -1824,4 +1827,61 @@ func (h *CommandHandler) cmdKill(ctx context.Context, update contract.Update, ar
 	}
 
 	return fmt.Sprintf("Job `%s` killed.", jobID), nil
+}
+
+// cmdDispatch handles /dispatch [on|off] — toggles dispatcher mode for this topic.
+func (h *CommandHandler) cmdDispatch(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	if update.ThreadID == nil {
+		return "Dispatch commands only work within a topic session. Use /new to create a topic first.", nil
+	}
+	if group == nil {
+		return "This group is not registered.", nil
+	}
+
+	session, err := h.db.GetSession(ctx, update.ChatID, *update.ThreadID)
+	if err != nil {
+		return "", fmt.Errorf("get session: %w", err)
+	}
+	if session == nil {
+		return "No session found for this topic.", nil
+	}
+
+	switch strings.ToLower(strings.TrimSpace(args)) {
+	case "on":
+		if err := h.db.SetSessionDispatcherMode(ctx, update.ChatID, *update.ThreadID, 1); err != nil {
+			return "", fmt.Errorf("set dispatcher mode: %w", err)
+		}
+		return "Dispatcher mode enabled. Orchestrator system prompt will be injected on next invocation.", nil
+	case "off":
+		if err := h.db.SetSessionDispatcherMode(ctx, update.ChatID, *update.ThreadID, 0); err != nil {
+			return "", fmt.Errorf("set dispatcher mode: %w", err)
+		}
+		return "Dispatcher mode disabled. Claude will run in direct mode.", nil
+	case "":
+		// Show current state
+		current := session.DispatcherMode
+		if current == -1 {
+			groupDefault := "enabled"
+			if group.DispatcherMode == 0 {
+				groupDefault = "disabled"
+			}
+			return fmt.Sprintf("Dispatcher mode: using group default (%s)\n\nUse /dispatch on or /dispatch off to override.", groupDefault), nil
+		}
+		state := "enabled"
+		if current == 0 {
+			state = "disabled"
+		}
+		return fmt.Sprintf("Dispatcher mode: %s (per-topic override)\n\nUse /dispatch on, /dispatch off, or /dispatch default to reset.", state), nil
+	case "default":
+		if err := h.db.SetSessionDispatcherMode(ctx, update.ChatID, *update.ThreadID, -1); err != nil {
+			return "", fmt.Errorf("set dispatcher mode: %w", err)
+		}
+		groupDefault := "enabled"
+		if group.DispatcherMode == 0 {
+			groupDefault = "disabled"
+		}
+		return fmt.Sprintf("Dispatcher mode reset to group default (%s).", groupDefault), nil
+	default:
+		return "Usage: /dispatch [on|off|default]\n\nControls whether the orchestrator system prompt (spawn_worker, update_progress tools) is injected.", nil
+	}
 }

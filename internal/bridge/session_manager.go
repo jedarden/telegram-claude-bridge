@@ -1370,6 +1370,11 @@ func (m *SessionManager) invokeClaudeAPI(
 		args = append(args, "--resume", session.SessionID)
 	}
 
+	// Inject dispatcher system prompt when dispatcher mode is enabled.
+	if isDispatcherEnabled(session, group) {
+		args = append(args, "--append-system-prompt", dispatcherSystemPrompt)
+	}
+
 	cmd := exec.CommandContext(subprocCtx, "claude", args...)
 	cmd.Dir = group.CWD
 
@@ -2106,6 +2111,40 @@ func resolveSessionModel(session *Session, group *Group) string {
 		return group.DefaultModel
 	}
 	return defaultSessionModel
+}
+
+// dispatcherSystemPrompt is the system prompt injected into orchestrator sessions
+// when dispatcher mode is enabled. It describes the spawn_worker and update_progress
+// synthetic tools so Claude knows to use them.
+const dispatcherSystemPrompt = `You are running as an orchestrator in a Telegram Claude Bridge.
+You have access to two bridge-provided tools:
+
+spawn_worker(prompt, model?)
+  Dispatches a new headless Claude instance to execute prompt independently.
+  Returns {worker_id}. The worker result will be delivered to you as a tool_result
+  and also posted directly to the Telegram thread.
+
+update_progress(message)
+  Posts a status message to the Telegram thread immediately.
+  Use this to keep the user informed during long-running work.
+  Returns {ok: true}.
+
+Guidelines:
+- Use spawn_worker to parallelise independent sub-tasks (research, analysis, code review, etc.)
+- Use update_progress when more than ~30 seconds have passed without user-visible output.
+- Synthesise worker results into a final response rather than forwarding raw outputs.
+- You do not need to spawn workers for simple, fast requests.`
+
+// isDispatcherEnabled returns true if the orchestrator system prompt should be injected.
+// Session dispatcher_mode=-1 means "use group default"; otherwise it's 1 (enabled) or 0 (disabled).
+func isDispatcherEnabled(session *Session, group *Group) bool {
+	if session != nil && session.DispatcherMode != -1 {
+		return session.DispatcherMode == 1
+	}
+	if group != nil {
+		return group.DispatcherMode == 1
+	}
+	return true // default enabled
 }
 
 // resolvePermissionMode returns the --permission-mode value for a Claude invocation.

@@ -41,6 +41,7 @@ type Group struct {
 	MaxSubtasks        int    // Maximum concurrent subtasks per topic (default 5)
 	MaxWorkers         int    // Maximum concurrent spawn_worker per topic (default 5)
 	ProgressIntervalSec int    // Progress ticker interval in seconds (0 = disabled, default 120)
+	DispatcherMode     int    // 1 = orchestrator system prompt injected (default), 0 = direct mode
 	CreatedAt          time.Time
 }
 
@@ -61,6 +62,7 @@ type Session struct {
 	Summary          string // Summary of the session, generated on close
 	NotificationMode string // Notification mode: "live" (default), "summary", "quiet"
 	TimeoutSec       int    // Per-topic timeout override (0 = use group timeout)
+	DispatcherMode   int    // 1 = dispatcher enabled (default), 0 = direct mode; -1 = use group default
 }
 
 // AllowedUser represents a user permitted to interact with the bot.
@@ -136,7 +138,7 @@ type BackgroundJob struct {
 	StartedAt time.Time // When the job was started
 }
 
-const schemaVersion = 16
+const schemaVersion = 17
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -288,6 +290,10 @@ var migrations = []string{
 
 			CREATE INDEX IF NOT EXISTS idx_workers_chat_thread ON workers(chat_id, thread_id);
 			CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status);`,
+
+			// Version 17 — add dispatcher_mode to groups and sessions for orchestrator system prompt injection.
+			`ALTER TABLE groups ADD COLUMN dispatcher_mode INTEGER NOT NULL DEFAULT 1;
+			 ALTER TABLE sessions ADD COLUMN dispatcher_mode INTEGER NOT NULL DEFAULT -1;`,
 	}
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
 // and applies any pending migrations.
@@ -379,7 +385,8 @@ func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec,
 		        COALESCE(permission_mode,'acceptEdits'),
 		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''),
-		        COALESCE(max_subtasks,5), COALESCE(max_workers,5), COALESCE(progress_interval_sec,120), created_at
+		        COALESCE(max_subtasks,5), COALESCE(max_workers,5), COALESCE(progress_interval_sec,120),
+		        COALESCE(dispatcher_mode,1), created_at
 		 FROM groups WHERE chat_id = ?`, chatID)
 	return scanGroup(row)
 }
@@ -387,8 +394,8 @@ func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 // UpsertGroup inserts or replaces a group record.
 func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers, progress_interval_sec, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers, progress_interval_sec, dispatcher_mode, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(chat_id) DO UPDATE SET
 		   name                = excluded.name,
 		   cwd                  = excluded.cwd,
@@ -400,10 +407,11 @@ func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 		   disallowed_tools     = excluded.disallowed_tools,
 		   max_subtasks         = excluded.max_subtasks,
 		   max_workers          = excluded.max_workers,
-		   progress_interval_sec = excluded.progress_interval_sec`,
+		   progress_interval_sec = excluded.progress_interval_sec,
+		   dispatcher_mode      = excluded.dispatcher_mode`,
 		g.ChatID, g.Name, g.CWD, g.DefaultModel, g.MaxBudget, g.TimeoutSec, g.PermissionMode,
 		nullableString(g.AllowedTools), nullableString(g.DisallowedTools),
-		g.MaxSubtasks, g.MaxWorkers, g.ProgressIntervalSec,
+		g.MaxSubtasks, g.MaxWorkers, g.ProgressIntervalSec, g.DispatcherMode,
 		g.CreatedAt.UTC().Format(time.RFC3339),
 	)
 	return err
@@ -415,7 +423,8 @@ func (d *DB) ListGroups(ctx context.Context) ([]*Group, error) {
 		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec,
 		        COALESCE(permission_mode,'acceptEdits'),
 		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''),
-		        COALESCE(max_subtasks,5), COALESCE(max_workers,5), COALESCE(progress_interval_sec,120), created_at
+		        COALESCE(max_subtasks,5), COALESCE(max_workers,5), COALESCE(progress_interval_sec,120),
+		        COALESCE(dispatcher_mode,1), created_at
 		 FROM groups ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -460,7 +469,7 @@ type groupScanner interface {
 func scanGroup(s groupScanner) (*Group, error) {
 	var g Group
 	var createdAt string
-	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &g.PermissionMode, &g.AllowedTools, &g.DisallowedTools, &g.MaxSubtasks, &g.MaxWorkers, &g.ProgressIntervalSec, &createdAt)
+	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &g.PermissionMode, &g.AllowedTools, &g.DisallowedTools, &g.MaxSubtasks, &g.MaxWorkers, &g.ProgressIntervalSec, &g.DispatcherMode, &createdAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -478,7 +487,7 @@ func (d *DB) GetSession(ctx context.Context, chatID, threadID int64) (*Session, 
 	row := d.db.QueryRowContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
-		        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec
+		        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec, COALESCE(dispatcher_mode,-1)
 		 FROM sessions WHERE chat_id = ? AND thread_id = ?`, chatID, threadID)
 	return scanSession(row)
 }
@@ -534,7 +543,8 @@ func (d *DB) UpdateSession(ctx context.Context, s *Session) error {
 		     total_cost_usd    = ?,
 		     summary           = ?,
 		     notification_mode = ?,
-		     timeout_sec       = ?
+		     timeout_sec       = ?,
+		     dispatcher_mode   = ?
 		 WHERE chat_id = ? AND thread_id = ?`,
 		s.SessionID, s.CWD, nullableString(s.Model), s.Status,
 		s.IconColor,
@@ -545,6 +555,7 @@ func (d *DB) UpdateSession(ctx context.Context, s *Session) error {
 		nullableString(s.Summary),
 		s.NotificationMode,
 		s.TimeoutSec,
+		s.DispatcherMode,
 		s.ChatID, s.ThreadID,
 	)
 	return err
@@ -564,6 +575,16 @@ func (d *DB) SetSessionIconColor(ctx context.Context, chatID, threadID int64, co
 func (d *DB) SetSessionNotificationMode(ctx context.Context, chatID, threadID int64, mode string) error {
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE sessions SET notification_mode = ? WHERE chat_id = ? AND thread_id = ?`,
+		mode, chatID, threadID,
+	)
+	return err
+}
+
+// SetSessionDispatcherMode updates only the dispatcher_mode field for a session.
+// Valid values: 1 (enabled), 0 (disabled), -1 (use group default).
+func (d *DB) SetSessionDispatcherMode(ctx context.Context, chatID, threadID int64, mode int) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE sessions SET dispatcher_mode = ? WHERE chat_id = ? AND thread_id = ?`,
 		mode, chatID, threadID,
 	)
 	return err
@@ -596,7 +617,7 @@ func (d *DB) ListSessions(ctx context.Context, chatID int64) ([]*Session, error)
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
-		        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec
+		        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec, COALESCE(dispatcher_mode,-1)
 		 FROM sessions WHERE chat_id = ? ORDER BY last_active DESC`, chatID)
 	if err != nil {
 		return nil, err
@@ -619,7 +640,7 @@ func (d *DB) ListAllSessions(ctx context.Context) ([]*Session, error) {
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
-		        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec
+		        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec, COALESCE(dispatcher_mode,-1)
 		 FROM sessions ORDER BY last_active DESC`)
 	if err != nil {
 		return nil, err
@@ -667,7 +688,7 @@ func (d *DB) ListStaleSessions(ctx context.Context, ttl time.Duration) ([]*Sessi
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 			        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
-			        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec
+			        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec, COALESCE(dispatcher_mode,-1)
 			 FROM sessions
 			 WHERE status = 'active'
 			   AND datetime(last_active) < datetime('now', '-' || ? || ' seconds')
@@ -833,6 +854,7 @@ func scanSession(s sessionScanner) (*Session, error) {
 		&sess.ChatID, &sess.ThreadID, &sess.SessionID, &sess.CWD,
 		&sess.Model, &sess.Status, &createdAt, &lastActive, &sess.MessageCount, &sess.IconColor,
 		&sess.PinnedMessageID, &sess.TotalCostUSD, &sess.Summary, &sess.NotificationMode, &sess.TimeoutSec,
+		&sess.DispatcherMode,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
