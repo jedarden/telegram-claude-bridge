@@ -384,9 +384,10 @@ type WorkerResult struct {
 // subprocess invocations. Messages that arrive during processing are
 // queued (up to 32) and batched into the next prompt.
 type SessionManager struct {
-	db       *DB
-	sender   *Sender
-	proxyURL string
+	db         *DB
+	sender     *Sender
+	proxyURL   string
+	workerPool *WorkerPool
 
 	mu                    sync.Mutex
 	topics                map[topicKey]*topicWorker
@@ -546,7 +547,7 @@ type toolResultDelta struct {
 // NewSessionManager creates a SessionManager backed by db, sender, and proxyURL.
 // proxyURL is the base URL of the proxy, used to download photo attachments.
 func NewSessionManager(db *DB, sender *Sender, proxyURL string) *SessionManager {
-	return &SessionManager{
+	m := &SessionManager{
 		db:                   db,
 		sender:               sender,
 		proxyURL:             proxyURL,
@@ -556,6 +557,8 @@ func NewSessionManager(db *DB, sender *Sender, proxyURL string) *SessionManager 
 		pendingWorkerResults: make(map[topicKey][]WorkerResult),
 		activeInvocations:    make(map[topicKey]*activeInvocation),
 	}
+	m.workerPool = NewWorkerPool(db, sender, m)
+	return m
 }
 
 // Handle implements SessionHandlerFunc and is registered as router.OnSession.
@@ -1636,6 +1639,42 @@ func (m *SessionManager) invokeClaudeAPI(
 			var start contentBlockStart
 			if err := json.Unmarshal(env.Event, &start); err == nil {
 				if start.Type == "content_block_start" && start.ContentBlock.Type == "tool_use" {
+					// Check for spawn_worker synthetic tool
+					if start.ContentBlock.Name == "spawn_worker" {
+						syntheticToolID := fmt.Sprintf("toolu_%d", time.Now().UnixNano())
+
+						// Spawn the worker — it runs in a goroutine and returns immediately
+						workerID, workerIndex, spawnErr := m.workerPool.SpawnWorker(
+							subprocCtx, chatID, *threadID, origMsgID, group, start.ContentBlock.Input.Raw,
+						)
+
+						var toolContent any
+						if spawnErr != nil {
+							toolContent = map[string]any{"error": spawnErr.Error()}
+							log.Printf("[session_mgr] spawn_worker failed: %v", spawnErr)
+						} else {
+							toolContent = map[string]any{
+								"worker_id": workerID,
+								"index":     workerIndex,
+								"status":    "dispatched",
+							}
+							log.Printf("[session_mgr] spawned worker %d (%s) for (%d,%d)", workerIndex, workerID, chatID, *threadID)
+						}
+
+						// Write tool_result back to stdin so the orchestrator can continue
+						toolResult := map[string]any{
+							"tool_use_id": syntheticToolID,
+							"content":     toolContent,
+							"is_error":    spawnErr != nil,
+						}
+						resultJSON, _ := json.Marshal(toolResult)
+						if _, err := fmt.Fprintf(stdinW, "%s\n", resultJSON); err != nil {
+							log.Printf("[session_mgr] write tool_result for spawn_worker: %v", err)
+						}
+
+						continue
+					}
+
 					// Check for update_progress synthetic tool
 					if start.ContentBlock.Name == "update_progress" {
 						syntheticToolID := fmt.Sprintf("toolu_%d", time.Now().UnixNano())

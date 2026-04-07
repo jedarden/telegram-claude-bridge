@@ -39,6 +39,7 @@ type Group struct {
 	AllowedTools       string // JSON array of tool names, or empty for all tools
 	DisallowedTools    string // JSON array of tool names, or empty for no restrictions
 	MaxSubtasks        int    // Maximum concurrent subtasks per topic (default 5)
+	MaxWorkers         int    // Maximum concurrent spawn_worker per topic (default 5)
 	ProgressIntervalSec int    // Progress ticker interval in seconds (0 = disabled, default 120)
 	CreatedAt          time.Time
 }
@@ -107,6 +108,22 @@ type Subtask struct {
 	FinishedAt   *time.Time // When the subtask finished (nil if running)
 }
 
+// Worker represents a spawned worker process from spawn_worker synthetic tool.
+type Worker struct {
+	ID         string    // Unique worker ID
+	ChatID     int64     // Parent chat ID
+	ThreadID   int64     // Parent thread ID
+	ParentMsg  int64     // Message ID of the parent message that spawned this worker
+	Prompt     string    // The prompt for this worker
+	SessionID  string    // Optional session ID from the worker invocation
+	Model      string    // Model used by this worker
+	Status     string    // "running", "done", "failed"
+	Result     string    // Result text if complete
+	Error      string    // Error message if failed
+	StartedAt  time.Time // When the worker started
+	FinishedAt *time.Time // When the worker finished (nil if running)
+}
+
 // BackgroundJob represents a running background shell process.
 // This is the database version - the background_jobs.go file has the in-memory version with Cmd.
 type BackgroundJob struct {
@@ -119,7 +136,7 @@ type BackgroundJob struct {
 	StartedAt time.Time // When the job was started
 }
 
-const schemaVersion = 15
+const schemaVersion = 16
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -250,6 +267,27 @@ var migrations = []string{
 
 			// Version 15 — add progress_interval_sec to groups for progress ticker.
 			`ALTER TABLE groups ADD COLUMN progress_interval_sec INTEGER NOT NULL DEFAULT 120;`,
+
+			// Version 16 — add workers table for spawn_worker synthetic tool and max_workers to groups.
+			`ALTER TABLE groups ADD COLUMN max_workers INTEGER NOT NULL DEFAULT 5;
+
+			CREATE TABLE IF NOT EXISTS workers (
+				id           TEXT PRIMARY KEY,
+				chat_id      INTEGER NOT NULL,
+				thread_id    INTEGER NOT NULL,
+				parent_msg   INTEGER NOT NULL,
+				prompt       TEXT NOT NULL,
+				session_id   TEXT,
+				model        TEXT,
+				status       TEXT NOT NULL DEFAULT 'running',
+				result       TEXT,
+				error        TEXT,
+				started_at   TEXT NOT NULL DEFAULT (datetime('now')),
+				finished_at  TEXT
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_workers_chat_thread ON workers(chat_id, thread_id);
+			CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status);`,
 	}
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
 // and applies any pending migrations.
@@ -341,7 +379,7 @@ func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec,
 		        COALESCE(permission_mode,'acceptEdits'),
 		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''),
-		        COALESCE(max_subtasks,5), COALESCE(progress_interval_sec,120), created_at
+		        COALESCE(max_subtasks,5), COALESCE(max_workers,5), COALESCE(progress_interval_sec,120), created_at
 		 FROM groups WHERE chat_id = ?`, chatID)
 	return scanGroup(row)
 }
@@ -349,8 +387,8 @@ func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 // UpsertGroup inserts or replaces a group record.
 func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, allowed_tools, disallowed_tools, max_subtasks, progress_interval_sec, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers, progress_interval_sec, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(chat_id) DO UPDATE SET
 		   name                = excluded.name,
 		   cwd                  = excluded.cwd,
@@ -361,10 +399,11 @@ func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 		   allowed_tools        = excluded.allowed_tools,
 		   disallowed_tools     = excluded.disallowed_tools,
 		   max_subtasks         = excluded.max_subtasks,
+		   max_workers          = excluded.max_workers,
 		   progress_interval_sec = excluded.progress_interval_sec`,
 		g.ChatID, g.Name, g.CWD, g.DefaultModel, g.MaxBudget, g.TimeoutSec, g.PermissionMode,
 		nullableString(g.AllowedTools), nullableString(g.DisallowedTools),
-		g.MaxSubtasks, g.ProgressIntervalSec,
+		g.MaxSubtasks, g.MaxWorkers, g.ProgressIntervalSec,
 		g.CreatedAt.UTC().Format(time.RFC3339),
 	)
 	return err
@@ -376,7 +415,7 @@ func (d *DB) ListGroups(ctx context.Context) ([]*Group, error) {
 		`SELECT chat_id, COALESCE(name,''), cwd, default_model, max_budget, timeout_sec,
 		        COALESCE(permission_mode,'acceptEdits'),
 		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''),
-		        COALESCE(max_subtasks,5), COALESCE(progress_interval_sec,120), created_at
+		        COALESCE(max_subtasks,5), COALESCE(max_workers,5), COALESCE(progress_interval_sec,120), created_at
 		 FROM groups ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -421,7 +460,7 @@ type groupScanner interface {
 func scanGroup(s groupScanner) (*Group, error) {
 	var g Group
 	var createdAt string
-	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &g.PermissionMode, &g.AllowedTools, &g.DisallowedTools, &g.MaxSubtasks, &g.ProgressIntervalSec, &createdAt)
+	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &g.PermissionMode, &g.AllowedTools, &g.DisallowedTools, &g.MaxSubtasks, &g.MaxWorkers, &g.ProgressIntervalSec, &createdAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1268,4 +1307,126 @@ func scanBackgroundJob(s backgroundJobScanner) (*BackgroundJob, error) {
 		job.Status = "running"
 	}
 	return &job, nil
+}
+
+// ── workers ────────────────────────────────────────────────────────────────────
+
+// CreateWorker inserts a new worker record.
+func (d *DB) CreateWorker(ctx context.Context, w *Worker) error {
+	if w.StartedAt.IsZero() {
+		w.StartedAt = time.Now().UTC()
+	}
+	if w.Status == "" {
+		w.Status = "running"
+	}
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO workers (id, chat_id, thread_id, parent_msg, prompt, session_id, model, status, result, error, started_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		w.ID, w.ChatID, w.ThreadID, w.ParentMsg, w.Prompt,
+		nullableString(w.SessionID), nullableString(w.Model), w.Status,
+		nullableString(w.Result), nullableString(w.Error),
+		w.StartedAt.UTC().Format(time.RFC3339),
+	)
+	return err
+}
+
+// UpdateWorker updates status, result, error, session_id, and finished_at for a worker.
+func (d *DB) UpdateWorker(ctx context.Context, id, status, result, errorMsg string) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE workers
+			 SET status = ?, result = ?, error = ?, finished_at = datetime('now')
+			 WHERE id = ?`,
+		status, nullableString(result), nullableString(errorMsg), id,
+	)
+	return err
+}
+
+// UpdateWorkerSessionID sets the session_id for a worker.
+func (d *DB) UpdateWorkerSessionID(ctx context.Context, id, sessionID string) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE workers SET session_id = ? WHERE id = ?`,
+		nullableString(sessionID), id,
+	)
+	return err
+}
+
+// GetWorker retrieves a worker by ID.
+func (d *DB) GetWorker(ctx context.Context, id string) (*Worker, error) {
+	row := d.db.QueryRowContext(ctx,
+		`SELECT id, chat_id, thread_id, parent_msg, prompt, session_id, model,
+		        status, result, error, started_at, finished_at
+			 FROM workers WHERE id = ?`, id)
+	return scanWorker(row)
+}
+
+// CountRunningWorkers returns the count of running workers for a topic.
+func (d *DB) CountRunningWorkers(ctx context.Context, chatID, threadID int64) (int, error) {
+	var count int
+	err := d.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM workers WHERE chat_id = ? AND thread_id = ? AND status = 'running'`,
+		chatID, threadID,
+	).Scan(&count)
+	return count, err
+}
+
+// ListWorkersForTopic returns all workers for a topic, ordered by started_at descending.
+func (d *DB) ListWorkersForTopic(ctx context.Context, chatID, threadID int64) ([]*Worker, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT id, chat_id, thread_id, parent_msg, prompt, session_id, model,
+		        status, result, error, started_at, finished_at
+			 FROM workers
+			 WHERE chat_id = ? AND thread_id = ?
+			 ORDER BY started_at DESC`,
+		chatID, threadID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var workers []*Worker
+	for rows.Next() {
+		w, err := scanWorker(rows)
+		if err != nil {
+			return nil, err
+		}
+		workers = append(workers, w)
+	}
+	return workers, rows.Err()
+}
+
+// DeleteWorkersForTopic removes all workers for a topic.
+func (d *DB) DeleteWorkersForTopic(ctx context.Context, chatID, threadID int64) error {
+	_, err := d.db.ExecContext(ctx,
+		`DELETE FROM workers WHERE chat_id = ? AND thread_id = ?`, chatID, threadID)
+	return err
+}
+
+type workerScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanWorker(s workerScanner) (*Worker, error) {
+	var w Worker
+	var startedAt, finishedAt string
+	err := s.Scan(
+		&w.ID, &w.ChatID, &w.ThreadID, &w.ParentMsg,
+		&w.Prompt, &w.SessionID, &w.Model, &w.Status,
+		&w.Result, &w.Error, &startedAt, &finishedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	w.StartedAt, _ = time.Parse(time.RFC3339, startedAt)
+	if finishedAt != "" {
+		t, _ := time.Parse(time.RFC3339, finishedAt)
+		w.FinishedAt = &t
+	}
+	if w.Status == "" {
+		w.Status = "running"
+	}
+	return &w, nil
 }
