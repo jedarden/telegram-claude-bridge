@@ -183,7 +183,7 @@ func (p *Poller) getUpdates(ctx context.Context) ([]Update, error) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("http: %w", err)
+		return nil, fmt.Errorf("http: %s", redactToken(err.Error(), p.token))
 	}
 	defer resp.Body.Close()
 

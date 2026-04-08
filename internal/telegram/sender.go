@@ -64,9 +64,13 @@ func (s *Sender) DownloadFile(ctx context.Context, filePath string) (*http.Respo
 	fileURL := fmt.Sprintf("%s/file/bot%s/%s", s.apiBase, s.token, filePath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s", redactToken(err.Error(), s.token))
 	}
-	return s.downloadClient.Do(req)
+	resp, dlErr := s.downloadClient.Do(req)
+	if dlErr != nil {
+		return nil, fmt.Errorf("%s", redactToken(dlErr.Error(), s.token))
+	}
+	return resp, nil
 }
 
 // tgAPIResponse is the generic Telegram Bot API response envelope.
@@ -395,7 +399,7 @@ func (s *Sender) callMultipart(ctx context.Context, method string, fields map[st
 	// Use downloadClient (no fixed timeout) so context controls the deadline for large uploads.
 	resp, err := s.downloadClient.Do(httpReq)
 	if err != nil {
-		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: fmt.Sprintf("Telegram unreachable: %v", err)}
+		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: redactToken(fmt.Sprintf("Telegram unreachable: %v", err), s.token)}
 	}
 	defer resp.Body.Close()
 
@@ -432,7 +436,7 @@ func (s *Sender) call(ctx context.Context, method string, body map[string]any) (
 
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
-		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: fmt.Sprintf("Telegram unreachable: %v", err)}
+		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: redactToken(fmt.Sprintf("Telegram unreachable: %v", err), s.token)}
 	}
 	defer resp.Body.Close()
 
