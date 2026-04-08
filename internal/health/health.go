@@ -183,7 +183,7 @@ func (c *Checker) checkDatabase(ctx context.Context) Status {
 	}
 
 	// Try to insert a test row
-	if _, err := c.db.ExecContext(ctx, `INSERT INTO health_check (id, ts) VALUES (1, ?)`, time.Now().UTC().Format(time.RFC3339)); err != nil {
+	if _, err := c.db.ExecContext(ctx, `INSERT OR REPLACE INTO health_check (id, ts) VALUES (1, ?)`, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		c.logger.Error("db_check_insert_failed", "error", err)
 		return Status{
 			Name:    "database",
