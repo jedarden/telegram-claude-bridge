@@ -60,34 +60,38 @@ type notifyIntent struct {
 // cancelPhrases is a table of known cancel/abort phrases.
 // Checked case-insensitively; first match wins.
 var cancelPhrases = []string{
+	// Longer phrases first to ensure they match before shorter prefixes
+	"stop what you are doing", "stop what youre doing",
+	"never mind that", "nevermind that",
+	"cancel that", "scratch that", "ignore that", "disregard that",
+	"stop that", "stop it", "kill it",
 	"cancel", "stop", "abort", "never mind", "nevermind", "forget it",
-	"stop that", "kill it", "stop what you are doing", "stop what youre doing",
-	"nevermind that", "never mind that", "cancel that", "stop it",
-	"scratch that", "ignore that", "disregard that",
 }
 
 // notifyPhrases is a table of known notification mode phrases.
 // Checked case-insensitively; first match wins.
 var notifyPhrases = []notifyIntent{
+	// Longer phrases first to ensure they match before shorter substrings
+
+	// Phrases that map to "quiet" mode (must come before "quiet" to avoid substring match)
+	{"be quiet", "quiet"},
+	{"quiet mode", "quiet"},
+	{"dont show progress", "quiet"},
+	{"don't show progress", "quiet"},
+	{"no updates", "quiet"},
+	{"minimal updates", "quiet"},
+
 	// Phrases that map to "summary" mode
-	{"quiet", "summary"},
-	{"silent", "summary"},
 	{"just tell me when done", "summary"},
 	{"notify me when complete", "summary"},
 	{"let me know when finished", "summary"},
-	{"ill check back", "summary"},
-	{"i'll check back", "summary"},
 	{"notify when done", "summary"},
 	{"summary mode", "summary"},
 	{"final result only", "summary"},
-
-	// Phrases that map to "quiet" mode
-	{"be quiet", "quiet"},
-	{"no updates", "quiet"},
-	{"dont show progress", "quiet"},
-	{"don't show progress", "quiet"},
-	{"minimal updates", "quiet"},
-	{"quiet mode", "quiet"},
+	{"ill check back", "summary"},
+	{"i'll check back", "summary"},
+	{"silent", "summary"},
+	{"quiet", "summary"},
 
 	// Phrases that map to "live" mode
 	{"show everything", "live"},
@@ -102,23 +106,24 @@ var notifyPhrases = []notifyIntent{
 // costPhrases is a table of known cost query phrases.
 // Checked case-insensitively; first match wins.
 var costPhrases = []string{
-	"how much",
+	// Longer phrases first to avoid premature prefix match
+	"how much has this cost",
+	"how much have i spent",
+	"what have i spent",
+	"how much money",
 	"what is the cost",
 	"whats the cost",
 	"what's the cost",
-	"show cost",
-	"how much has this cost",
-	"total cost",
-	"how much money",
+	"show me the cost",
 	"whats the bill",
 	"what's the bill",
-	"how much have i spent",
 	"whats the total",
 	"what's the total",
-	"show me the cost",
 	"display cost",
 	"check the cost",
-	"what have i spent",
+	"show cost",
+	"total cost",
+	"how much",
 }
 
 // statusPhrases is a table of known status query phrases.
@@ -2433,6 +2438,7 @@ func detectTimeoutIntent(text string) timeoutIntent {
 
 // parseDuration extracts a duration in seconds from text.
 // Supports patterns like "30 minutes", "1 hour", "2 hours", "90 seconds".
+// Bare numbers are treated as seconds.
 // Returns the duration in seconds, or -1 if no valid duration found.
 func parseDuration(text string) int {
 	lower := strings.ToLower(strings.TrimSpace(text))
@@ -2455,6 +2461,14 @@ func parseDuration(text string) int {
 		case strings.HasPrefix(unit, "hour"):
 			return amount * 3600
 		case strings.HasPrefix(unit, "second"):
+			return amount
+		}
+	}
+
+	// Bare number: treat as seconds
+	if len(words) == 1 {
+		var amount int
+		if _, err := fmt.Sscanf(words[0], "%d", &amount); err == nil && amount > 0 {
 			return amount
 		}
 	}

@@ -1176,11 +1176,13 @@ type subtaskScanner interface {
 
 func scanSubtask(s subtaskScanner) (*Subtask, error) {
 	var subtask Subtask
-	var startedAt, finishedAt string
+	var startedAt string
+	var finishedAt sql.NullString
+	var sessionID, result, errMsg sql.NullString
 	err := s.Scan(
 		&subtask.ID, &subtask.ChatID, &subtask.ThreadID, &subtask.ParentMsgID,
-		&subtask.Prompt, &subtask.SessionID, &subtask.Status,
-		&subtask.Result, &subtask.Error, &startedAt, &finishedAt,
+		&subtask.Prompt, &sessionID, &subtask.Status,
+		&result, &errMsg, &startedAt, &finishedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1188,9 +1190,12 @@ func scanSubtask(s subtaskScanner) (*Subtask, error) {
 	if err != nil {
 		return nil, err
 	}
+	subtask.SessionID = sessionID.String
+	subtask.Result = result.String
+	subtask.Error = errMsg.String
 	subtask.StartedAt, _ = time.Parse(time.RFC3339, startedAt)
-	if finishedAt != "" {
-		t, _ := time.Parse(time.RFC3339, finishedAt)
+	if finishedAt.Valid {
+		t, _ := time.Parse(time.RFC3339, finishedAt.String)
 		subtask.FinishedAt = &t
 	}
 	if subtask.Status == "" {
@@ -1308,7 +1313,8 @@ type backgroundJobScanner interface {
 
 func scanBackgroundJob(s backgroundJobScanner) (*BackgroundJob, error) {
 	var job BackgroundJob
-	var startedAt, finishedAt string
+	var startedAt string
+	var finishedAt sql.NullString
 	var exitCode sql.NullInt32
 	err := s.Scan(
 		&job.ID, &job.ChatID, &job.ThreadID, &job.Command, &job.Status,
@@ -1430,11 +1436,13 @@ type workerScanner interface {
 
 func scanWorker(s workerScanner) (*Worker, error) {
 	var w Worker
-	var startedAt, finishedAt string
+	var startedAt string
+	var finishedAt sql.NullString
+	var sessionID, model, result, errMsg sql.NullString
 	err := s.Scan(
 		&w.ID, &w.ChatID, &w.ThreadID, &w.ParentMsg,
-		&w.Prompt, &w.SessionID, &w.Model, &w.Status,
-		&w.Result, &w.Error, &startedAt, &finishedAt,
+		&w.Prompt, &sessionID, &model, &w.Status,
+		&result, &errMsg, &startedAt, &finishedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1442,9 +1450,13 @@ func scanWorker(s workerScanner) (*Worker, error) {
 	if err != nil {
 		return nil, err
 	}
+	w.SessionID = sessionID.String
+	w.Model = model.String
+	w.Result = result.String
+	w.Error = errMsg.String
 	w.StartedAt, _ = time.Parse(time.RFC3339, startedAt)
-	if finishedAt != "" {
-		t, _ := time.Parse(time.RFC3339, finishedAt)
+	if finishedAt.Valid {
+		t, _ := time.Parse(time.RFC3339, finishedAt.String)
 		w.FinishedAt = &t
 	}
 	if w.Status == "" {
