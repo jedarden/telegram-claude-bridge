@@ -153,8 +153,9 @@ func (m *BackgroundJobManager) runJob(ctx context.Context, job *BackgroundJob, c
 	}()
 
 	// Goroutine to close output channel when both pipes are done
+	waitResult := make(chan error, 1)
 	go func() {
-		cmd.Wait()
+		waitResult <- cmd.Wait()
 		close(outputLines)
 		close(done)
 	}()
@@ -227,15 +228,19 @@ func (m *BackgroundJobManager) runJob(ctx context.Context, job *BackgroundJob, c
 		}
 	}
 
-	// Wait for command to complete and get exit code
-	err := cmd.Wait()
+	// Get exit code from the goroutine that already called Wait()
 	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
+	select {
+	case err := <-waitResult:
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				exitCode = exitErr.ExitCode()
+			} else {
+				exitCode = 1
+			}
 		}
+	default:
+		// Process already reaped via the done channel path
 	}
 
 	// Final output flush

@@ -1384,13 +1384,11 @@ func (m *SessionManager) invokeClaudeAPI(
 	defer stdinW.Close()
 
 	// Write the initial prompt in a goroutine to avoid blocking
-	promptWritten := make(chan struct{}, 1)
 	go func() {
 		defer stdinW.Close()
 		if _, err := io.WriteString(stdinW, prompt); err != nil {
 			log.Printf("[session_mgr] write prompt to stdin: %v", err)
 		}
-		close(promptWritten)
 	}()
 
 	stdoutPipe, err := cmd.StdoutPipe()
