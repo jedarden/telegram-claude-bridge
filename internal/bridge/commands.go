@@ -1122,13 +1122,21 @@ func (h *CommandHandler) cmdModel(ctx context.Context, update contract.Update, g
 		if currentModel == "" {
 			currentModel = defaultSessionModel
 		}
-		return fmt.Sprintf("Current model: %s\n\nCommon models: claude-haiku-4-5, claude-sonnet-4-6, claude-opus-4-7\nUse /model <name> to change.", currentModel), nil
+		return fmt.Sprintf("Current model: %s\n\nShortcuts: opus, sonnet, haiku\nFull names: claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5", currentModel), nil
 	}
 
 	// Accept any model name — the Claude CLI will reject invalid ones at invocation time.
-	newModel := strings.TrimSpace(args)
-	if newModel == "" {
-		return "Usage: /model <model-name>\n\nExamples: claude-haiku-4-5, claude-sonnet-4-6, claude-opus-4-7", nil
+	// Short aliases are expanded to full model IDs.
+	newModel := strings.TrimSpace(strings.ToLower(args))
+	switch newModel {
+	case "haiku":
+		newModel = "claude-haiku-4-5"
+	case "sonnet":
+		newModel = "claude-sonnet-4-6"
+	case "opus":
+		newModel = "claude-opus-4-7"
+	case "":
+		return "Usage: /model <name>\n\nShortcuts: opus, sonnet, haiku\nFull names: claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5", nil
 	}
 
 	session.Model = newModel
