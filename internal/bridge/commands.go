@@ -1122,18 +1122,13 @@ func (h *CommandHandler) cmdModel(ctx context.Context, update contract.Update, g
 		if currentModel == "" {
 			currentModel = defaultSessionModel
 		}
-		return fmt.Sprintf("Current model: %s\n\nAvailable models: claude-haiku-4-5, claude-sonnet-4-6, claude-opus-4-6", currentModel), nil
+		return fmt.Sprintf("Current model: %s\n\nCommon models: claude-haiku-4-5, claude-sonnet-4-6, claude-opus-4-7\nUse /model <name> to change.", currentModel), nil
 	}
 
-	// Validate and set the new model
+	// Accept any model name — the Claude CLI will reject invalid ones at invocation time.
 	newModel := strings.TrimSpace(args)
-	validModels := map[string]bool{
-		"claude-haiku-4-5":  true,
-		"claude-sonnet-4-6": true,
-		"claude-opus-4-6":   true,
-	}
-	if !validModels[newModel] {
-		return fmt.Sprintf("Invalid model %q.\n\nAvailable models: claude-haiku-4-5, claude-sonnet-4-6, claude-opus-4-6", newModel), nil
+	if newModel == "" {
+		return "Usage: /model <model-name>\n\nExamples: claude-haiku-4-5, claude-sonnet-4-6, claude-opus-4-7", nil
 	}
 
 	session.Model = newModel
