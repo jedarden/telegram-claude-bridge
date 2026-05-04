@@ -1304,6 +1304,8 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	if text == "" {
 		text = "(no response)"
 	}
+	// In quiet mode, the result is already set to a minimal confirmation ("Done ✓")
+	// by invokeClaudeAPI, so we send it. In other modes, send the full result.
 	if err := m.sender.SendStreamFinal(ctx, key.chatID, tidPtr, origMsgID, out.StreamMsgID, text); err != nil {
 		log.Printf("[session_mgr] send response (%d,%d): %v", key.chatID, key.threadID, err)
 	}
@@ -1676,11 +1678,11 @@ func (m *SessionManager) invokeClaudeAPI(
 		return true
 	}
 
-	// flushToolEdit sends a tool status update. Skipped in quiet mode or if
+	// flushToolEdit sends a tool status update. Skipped in quiet/summary mode or if
 	// the debounce interval hasn't elapsed (unless force=true).
 	flushToolEdit := func(force bool, status string) {
-		// Skip in quiet mode
-		if notificationMode == "quiet" {
+		// Skip in quiet or summary mode (only live mode gets tool updates)
+		if notificationMode != "live" {
 			return
 		}
 		// Skip if not enough time has elapsed (unless forced)
@@ -1784,12 +1786,15 @@ func (m *SessionManager) invokeClaudeAPI(
 						// Parse the input to get the message
 						var input updateProgressInput
 						if err := json.Unmarshal(start.ContentBlock.Input.Raw, &input); err == nil && input.Message != "" {
-							// Send a new message to the Telegram thread (not an edit)
-							if err := m.sender.SendResponse(sendCtx, chatID, threadID, 0, input.Message); err != nil {
-								log.Printf("[session_mgr] send update_progress message: %v", err)
-							} else {
-								// Reset the progress ticker timer
-								lastSent = time.Now()
+							// Only send update_progress messages in live mode
+							if notificationMode == "live" {
+								// Send a new message to the Telegram thread (not an edit)
+								if err := m.sender.SendResponse(sendCtx, chatID, threadID, 0, input.Message); err != nil {
+									log.Printf("[session_mgr] send update_progress message: %v", err)
+								} else {
+									// Reset the progress ticker timer
+									lastSent = time.Now()
+								}
 							}
 						}
 
