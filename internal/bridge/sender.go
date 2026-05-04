@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"strings"
 	"time"
@@ -120,8 +121,15 @@ func (s *Sender) SendToGeneral(ctx context.Context, chatID int64, text string) e
 // when the text exceeds 4096 characters. The first chunk is sent as a reply
 // to origMsgID; subsequent chunks are standalone messages in the same topic.
 // Each sent message ID is stored in the sent_messages table.
+//
+// If a single code block exceeds 4096 characters, it is extracted and sent
+// as a document attachment instead of being split mid-content.
 func (s *Sender) SendResponse(ctx context.Context, chatID int64, threadID *int64, origMsgID int64, text string) error {
-	chunks := chunkText(text)
+	// First, extract any oversized code blocks and replace with placeholders
+	modifiedText, oversizedBlocks := extractOversizedCodeBlocks(text)
+
+	// Send the modified text (with placeholders for oversized blocks)
+	chunks := chunkText(modifiedText)
 	for i, chunk := range chunks {
 		req := contract.SendRequest{
 			ChatID:   chatID,
@@ -145,6 +153,87 @@ func (s *Sender) SendResponse(ctx context.Context, chatID int64, threadID *int64
 			log.Printf("[bridge/sender] db insert failed: %v", dbErr)
 		}
 	}
+
+	// Send oversized code blocks as document attachments
+	for i, block := range oversizedBlocks {
+		// Only reply to the original message for the first document
+		replyTo := int64(0)
+		if i == 0 && len(chunks) == 0 {
+			replyTo = origMsgID
+		}
+
+		caption := fmt.Sprintf("Code block %d of %d (oversized)", i+1, len(oversizedBlocks))
+		if err := s.SendDocument(ctx, chatID, threadID, replyTo, caption, block.filename, []byte(block.content)); err != nil {
+			log.Printf("[bridge/sender] failed to send oversized code block %d as document: %v", i+1, err)
+			// Continue with other blocks even if one fails
+		}
+	}
+
+	return nil
+}
+
+// SendDocument sends a document via the proxy's /send_document endpoint.
+// Used for oversized code blocks that exceed the 4096 character limit.
+func (s *Sender) SendDocument(ctx context.Context, chatID int64, threadID *int64, origMsgID int64, caption string, filename string, content []byte) error {
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+
+	// Write metadata fields
+	if err := w.WriteField("chat_id", fmt.Sprintf("%d", chatID)); err != nil {
+		return fmt.Errorf("write chat_id: %w", err)
+	}
+	if threadID != nil {
+		if err := w.WriteField("thread_id", fmt.Sprintf("%d", *threadID)); err != nil {
+			return fmt.Errorf("write thread_id: %w", err)
+		}
+	}
+	if caption != "" {
+		if err := w.WriteField("caption", caption); err != nil {
+			return fmt.Errorf("write caption: %w", err)
+		}
+	}
+	if origMsgID != 0 {
+		if err := w.WriteField("reply_to_message_id", fmt.Sprintf("%d", origMsgID)); err != nil {
+			return fmt.Errorf("write reply_to_message_id: %w", err)
+		}
+	}
+
+	// Write the file content
+	fw, err := w.CreateFormFile("document", filename)
+	if err != nil {
+		return fmt.Errorf("create form file: %w", err)
+	}
+	if _, err := fw.Write(content); err != nil {
+		return fmt.Errorf("write file data: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("close multipart writer: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.proxyURL+"/send_document", &body)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp contract.ErrorResponse
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		if errResp.ErrorCode == 0 {
+			errResp.ErrorCode = resp.StatusCode
+		}
+		if errResp.Description == "" {
+			errResp.Description = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		}
+		return &errResp
+	}
+
 	return nil
 }
 
@@ -319,10 +408,13 @@ func (s *Sender) SendStreamOverflow(ctx context.Context, chatID int64, threadID 
 // If both are zero (no streaming occurred and no placeholder), it behaves exactly
 // like SendResponse.
 func (s *Sender) SendStreamFinal(ctx context.Context, chatID int64, threadID *int64, origMsgID, streamMsgID, placeholderID int64, text string) error {
+	// First, extract any oversized code blocks and replace with placeholders
+	modifiedText, oversizedBlocks := extractOversizedCodeBlocks(text)
+
 	// In summary mode: streamMsgID is 0, but placeholderID may be non-zero
 	// Edit the placeholder instead of sending a new message
 	if streamMsgID == 0 && placeholderID != 0 {
-		chunks := chunkText(text)
+		chunks := chunkText(modifiedText)
 		if err := s.postWithRetry(ctx, "/edit", contract.EditRequest{
 			ChatID:    chatID,
 			MessageID: placeholderID,
@@ -350,12 +442,19 @@ func (s *Sender) SendStreamFinal(ctx context.Context, chatID int64, threadID *in
 				log.Printf("[bridge/sender] db insert failed: %v", dbErr)
 			}
 		}
+		// Send oversized code blocks as documents
+		for _, block := range oversizedBlocks {
+			caption := fmt.Sprintf("Oversized code block")
+			if err := s.SendDocument(ctx, chatID, threadID, 0, caption, block.filename, []byte(block.content)); err != nil {
+				log.Printf("[bridge/sender] failed to send oversized code block as document: %v", err)
+			}
+		}
 		return nil
 	}
 	if streamMsgID == 0 {
 		return s.SendResponse(ctx, chatID, threadID, origMsgID, text)
 	}
-	chunks := chunkText(text)
+	chunks := chunkText(modifiedText)
 	// Edit the streaming placeholder with the first (or only) chunk.
 	if err := s.postWithRetry(ctx, "/edit", contract.EditRequest{
 		ChatID:    chatID,
@@ -382,6 +481,13 @@ func (s *Sender) SendStreamFinal(ctx context.Context, chatID int64, threadID *in
 			chatID, nullableInt64(threadID), origMsgID, resp.MessageID, i+1, time.Now().Unix(),
 		); dbErr != nil {
 			log.Printf("[bridge/sender] db insert failed: %v", dbErr)
+		}
+	}
+	// Send oversized code blocks as documents
+	for _, block := range oversizedBlocks {
+		caption := fmt.Sprintf("Oversized code block")
+		if err := s.SendDocument(ctx, chatID, threadID, 0, caption, block.filename, []byte(block.content)); err != nil {
+			log.Printf("[bridge/sender] failed to send oversized code block as document: %v", err)
 		}
 	}
 	return nil
@@ -734,4 +840,87 @@ func nullableInt64(v *int64) any {
 		return nil
 	}
 	return *v
+}
+
+// oversizedCodeBlock represents a code block that exceeds the message size limit.
+type oversizedCodeBlock struct {
+	content  string   // The raw code content (inside <code>...</code>)
+	filename string   // Suggested filename
+	lang     string   // Language from class attribute
+}
+
+// extractOversizedCodeBlocks scans HTML for code blocks larger than maxMessageLen.
+// Returns the HTML with oversized blocks replaced by placeholders, and the list of blocks to send.
+func extractOversizedCodeBlocks(html string) (modifiedHTML string, oversized []oversizedCodeBlock) {
+	blocks := findCodeBlocks(html)
+	if len(blocks) == 0 {
+		return html, nil
+	}
+
+	var out strings.Builder
+	lastEnd := 0
+	docIndex := 0
+
+	for _, block := range blocks {
+		// Extract the content inside <pre><code>...</code></pre>
+		blockText := html[block.start:block.end]
+
+		// Find where the actual code content starts
+		// Look for <code> tag, accounting for potential class attribute
+		codeTagStart := strings.Index(blockText, "<code")
+		if codeTagStart < 0 {
+			continue // No code tag found
+		}
+		codeTagEnd := strings.Index(blockText[codeTagStart:], ">")
+		if codeTagEnd < 0 {
+			continue // Unclosed code tag
+		}
+		codeTagEnd += codeTagStart + 1 // Position after the > of <code ...>
+
+		// Find where the code content ends (at </code>)
+		codeCloseStart := strings.Index(blockText[codeTagEnd:], "</code>")
+		if codeCloseStart < 0 {
+			continue // No closing code tag
+		}
+		rawContent := blockText[codeTagEnd : codeTagEnd+codeCloseStart]
+
+		// Check if the code content exceeds the message limit
+		if runeLen(rawContent) <= maxMessageLen {
+			continue // Code content fits, skip this block
+		}
+
+		// Extract language from class attribute
+		lang := "txt"
+		classStart := strings.Index(blockText, `class="language-`)
+		if classStart >= 0 {
+			classStart += len(`class="language-`)
+			classEnd := strings.Index(blockText[classStart:], `"`)
+			if classEnd >= 0 {
+				lang = blockText[classStart : classStart+classEnd]
+			}
+		}
+
+		docIndex++
+		filename := fmt.Sprintf("code_block_%d.%s", docIndex, lang)
+
+		// Append everything before this block
+		out.WriteString(html[lastEnd:block.start])
+
+		// Append a placeholder message
+		out.WriteString(fmt.Sprintf(`📎 <b>Code block %d (oversized)</b> — see attached file`, docIndex))
+
+		// Store for document upload
+		oversized = append(oversized, oversizedCodeBlock{
+			content:  rawContent,
+			filename: filename,
+			lang:     lang,
+		})
+
+		lastEnd = block.end
+	}
+
+	// Append any remaining content after the last oversized block
+	out.WriteString(html[lastEnd:])
+
+	return out.String(), oversized
 }
