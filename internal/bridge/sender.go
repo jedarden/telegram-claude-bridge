@@ -148,6 +148,52 @@ func (s *Sender) SendResponse(ctx context.Context, chatID int64, threadID *int64
 	return nil
 }
 
+// SendToolApprovalPrompt sends a tool approval prompt with approve/deny inline keyboard buttons.
+// The callback data format is "action:chatID:threadID:toolIndex" where action is "approve_tool" or "deny_tool".
+func (s *Sender) SendToolApprovalPrompt(ctx context.Context, chatID int64, threadID *int64, toolName, toolInput string, toolIndex int64) (int64, error) {
+	// Truncate tool input for display
+	maxInputLen := 100
+	if len(toolInput) > maxInputLen {
+		toolInput = toolInput[:maxInputLen] + "..."
+	}
+
+	text := fmt.Sprintf("🔒 Tool approval required\n\n<b>Tool:</b> %s\n<b>Input:</b> <code>%s</code>\n\nApprove or deny this tool use:", toolName, toolInput)
+
+	// Build inline keyboard with Approve and Deny buttons
+	approveData := fmt.Sprintf("approve_tool:%d:%d:%d", chatID, int64(ptrVal(threadID)), toolIndex)
+	denyData := fmt.Sprintf("deny_tool:%d:%d:%d", chatID, int64(ptrVal(threadID)), toolIndex)
+
+	keyboard := &contract.InlineKeyboard{
+		InlineKeyboard: [][]contract.InlineButton{
+			{
+				{Text: "✅ Approve", CallbackData: approveData},
+				{Text: "❌ Deny", CallbackData: denyData},
+			},
+		},
+	}
+
+	req := contract.SendRequest{
+		ChatID:      chatID,
+		ThreadID:    threadID,
+		Text:        text,
+		ReplyMarkup: keyboard,
+	}
+
+	var resp contract.SendResponse
+	if err := s.postWithRetry(ctx, "/send", req, &resp); err != nil {
+		return 0, err
+	}
+	return resp.MessageID, nil
+}
+
+// ptrVal returns the int64 value if ptr is non-nil, otherwise 0.
+func ptrVal(ptr *int64) int64 {
+	if ptr == nil {
+		return 0
+	}
+	return *ptr
+}
+
 // sendInitialStream sends the first streaming message as a reply to origMsgID
 // and returns the sent message ID. Used by invokeClaudeAPI to post the initial
 // live-edit placeholder.

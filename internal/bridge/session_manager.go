@@ -384,6 +384,12 @@ type WorkerResult struct {
 	Error  string // Worker's error message (empty if successful)
 }
 
+// toolApproval represents a user's approval/denial response for a tool use request.
+type toolApproval struct {
+	toolIndex int64  // The index of the tool being approved/denied
+	response  string // "y" for approve, "n" for deny
+}
+
 // SessionManager manages per-topic Claude Code subprocess sessions.
 // Each forum topic gets exactly one worker goroutine that serialises
 // subprocess invocations. Messages that arrive during processing are
@@ -400,6 +406,7 @@ type SessionManager struct {
 	pendingContext        map[topicKey]string            // pending context to inject into next prompt
 	pendingWorkerResults  map[topicKey][]WorkerResult    // completed worker results to inject into next prompt
 	activeInvocations     map[topicKey]*activeInvocation // tracks running commands for cancellation
+	approvalChans         map[topicKey]chan toolApproval // tool approval channels for plan mode
 }
 
 type topicKey struct {
@@ -561,6 +568,7 @@ func NewSessionManager(db *DB, sender *Sender, proxyURL string) *SessionManager 
 		pendingContext:       make(map[topicKey]string),
 		pendingWorkerResults: make(map[topicKey][]WorkerResult),
 		activeInvocations:    make(map[topicKey]*activeInvocation),
+		approvalChans:        make(map[topicKey]chan toolApproval),
 	}
 	m.workerPool = NewWorkerPool(db, sender, m)
 	return m
@@ -1358,7 +1366,7 @@ func (m *SessionManager) invokeClaudeAPI(
 		"-p",
 		"--output-format", "stream-json",
 		"--verbose",
-		"--dangerously-skip-permissions",
+		"--permission-mode", resolvePermissionMode(group),
 		"--model", resolveSessionModel(session, group),
 	}
 
@@ -1400,8 +1408,13 @@ func (m *SessionManager) invokeClaudeAPI(
 	if err != nil {
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
+	// Use stderrPipe for approval prompt detection in plan mode
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stderr pipe: %w", err)
+	}
 	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
+	stderrReader := io.TeeReader(stderrPipe, &stderrBuf)
 
 	// Register the active command for cancellation before starting
 	active := &activeInvocation{
@@ -1422,6 +1435,85 @@ func (m *SessionManager) invokeClaudeAPI(
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start claude: %w", err)
 	}
+
+	// Set up approval channel for this topic (plan mode)
+	approvalChan := make(chan toolApproval, 1)
+	m.mu.Lock()
+	m.approvalChans[key] = approvalChan
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.approvalChans, key)
+		m.mu.Unlock()
+		close(approvalChan)
+	}()
+
+	// Start stderr scanner goroutine to detect approval prompts
+	go func() {
+		scanner := bufio.NewScanner(stderrReader)
+		var toolCounter int64 // Incrementing counter for tool approval indexes
+		for scanner.Scan() {
+			line := scanner.Text()
+			log.Printf("[session_mgr] stderr: %s", line)
+
+			// Check for approval prompt pattern: "Allow use of tool: X with input: Y? (y/n)"
+			if strings.Contains(line, "Allow use of tool:") && strings.Contains(line, "? (y/n)") {
+				// Parse tool name and input from the prompt
+				// Format: "Allow use of tool: <tool_name> with input: <input_json>? (y/n)"
+				toolName := ""
+				toolInput := "{}"
+
+				// Extract tool name
+				if idx := strings.Index(line, "tool: "); idx != -1 {
+					remaining := line[idx+6:]
+					if endIdx := strings.Index(remaining, " with input:"); endIdx != -1 {
+						toolName = strings.TrimSpace(remaining[:endIdx])
+					}
+				}
+
+				// Extract tool input
+				if idx := strings.Index(line, "input: "); idx != -1 {
+					remaining := line[idx+7:]
+					if endIdx := strings.Index(remaining, "? (y/n)"); endIdx != -1 {
+						toolInput = strings.TrimSpace(remaining[:endIdx])
+					}
+				}
+
+				log.Printf("[session_mgr] approval prompt: tool=%s input=%s", toolName, toolInput)
+
+				// Send inline keyboard to Telegram
+				toolCounter++
+				toolIndex := toolCounter
+				if _, err := m.sender.SendToolApprovalPrompt(sendCtx, chatID, threadID, toolName, toolInput, toolIndex); err != nil {
+					log.Printf("[session_mgr] send approval prompt: %v", err)
+				}
+
+				// Wait for user approval/denial with matching toolIndex
+				// Loop until we receive an approval for this specific tool (ignore stale approvals)
+				for {
+					select {
+					case approval := <-approvalChan:
+						if approval.toolIndex == toolIndex {
+							// Write the user's response to stdin
+							response := approval.response + "\n"
+							if _, err := io.WriteString(stdinW, response); err != nil {
+								log.Printf("[session_mgr] write approval response to stdin: %v", err)
+							}
+							log.Printf("[session_mgr] sent approval response: %s", approval.response)
+							// Break out of the wait loop and continue processing
+							goto approvalDone
+						}
+						// Ignore approval for a different tool (stale button press)
+						log.Printf("[session_mgr] ignoring stale approval for tool %d, waiting for %d", approval.toolIndex, toolIndex)
+					case <-subprocCtx.Done():
+						log.Printf("[session_mgr] approval wait cancelled for (%d,%d)", chatID, *threadID)
+						return
+					}
+				}
+				approvalDone:
+			}
+		}
+	}()
 
 	scanner := bufio.NewScanner(stdoutPipe)
 	scanner.Buffer(make([]byte, scannerMaxBuf), scannerMaxBuf)
@@ -2965,6 +3057,29 @@ func (m *SessionManager) CancelTopic(ctx context.Context, chatID, threadID int64
 	return false
 }
 
+// SubmitToolApproval sends a tool approval/denial to the appropriate session's approval channel.
+// This is called by the callback handler when the user presses Approve/Deny buttons.
+func (m *SessionManager) SubmitToolApproval(chatID, threadID int64, toolIndex int64, response string) {
+	key := topicKey{chatID: chatID, threadID: threadID}
+
+	m.mu.Lock()
+	approvalChan, exists := m.approvalChans[key]
+	m.mu.Unlock()
+
+	if !exists {
+		log.Printf("[session_mgr] no approval channel for (%d,%d), tool approval ignored", chatID, threadID)
+		return
+	}
+
+	// Send the approval to the waiting goroutine
+	select {
+	case approvalChan <- toolApproval{toolIndex: toolIndex, response: response}:
+		log.Printf("[session_mgr] sent tool approval: chat=%d thread=%d toolIndex=%d response=%s", chatID, threadID, toolIndex, response)
+	default:
+		log.Printf("[session_mgr] approval channel full for (%d,%d), tool approval dropped", chatID, threadID)
+	}
+}
+
 // createNewSession creates a new forum topic, starts a Claude session,
 // and returns the thread ID and any error. The first message text is
 // sent to the new session as the initial prompt.
@@ -3038,7 +3153,7 @@ func (m *SessionManager) createClaudeSession(ctx context.Context, group *Group, 
 	args := []string{
 		"-p",
 		"--output-format", "json",
-		"--dangerously-skip-permissions",
+		"--permission-mode", resolvePermissionMode(group),
 		"--model", resolveSessionModel(nil, group),
 	}
 

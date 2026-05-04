@@ -93,10 +93,14 @@ func main() {
 
 	serviceHandler := bridge.NewServiceHandler(db, sender, cfg.ProxyURL, &http.Client{Timeout: 10 * time.Second})
 
+	// Create callback handler for inline keyboard interactions
+	callbackHandler := bridge.NewCallbackHandler(db, sender, cfg.ProxyURL, &http.Client{Timeout: 10 * time.Second}, sessionMgr)
+
 	router := bridge.NewRouter(db)
 	router.OnCommand = cmdHandler.Handle
 	router.OnSession = sessionMgr.Handle
 	router.OnService = serviceHandler.Handle
+	router.OnCallback = callbackHandler.Handle
 
 	updates := make(chan contract.Update, 64)
 	poller := bridge.NewPoller(cfg.ProxyURL, cfg.PollTimeout, updates)
