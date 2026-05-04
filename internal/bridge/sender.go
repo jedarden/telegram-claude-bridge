@@ -315,8 +315,43 @@ func (s *Sender) SendStreamOverflow(ctx context.Context, chatID int64, threadID 
 // SendStreamFinal concludes a streaming response. If streamMsgID is non-zero it
 // edits that message with the first chunk of the final text and sends any
 // overflow chunks as new (non-reply) messages in the same topic. If streamMsgID
-// is zero (no streaming occurred) it behaves exactly like SendResponse.
-func (s *Sender) SendStreamFinal(ctx context.Context, chatID int64, threadID *int64, origMsgID, streamMsgID int64, text string) error {
+// is zero and placeholderID is non-zero, it edits the placeholder with the result.
+// If both are zero (no streaming occurred and no placeholder), it behaves exactly
+// like SendResponse.
+func (s *Sender) SendStreamFinal(ctx context.Context, chatID int64, threadID *int64, origMsgID, streamMsgID, placeholderID int64, text string) error {
+	// In summary mode: streamMsgID is 0, but placeholderID may be non-zero
+	// Edit the placeholder instead of sending a new message
+	if streamMsgID == 0 && placeholderID != 0 {
+		chunks := chunkText(text)
+		if err := s.postWithRetry(ctx, "/edit", contract.EditRequest{
+			ChatID:    chatID,
+			MessageID: placeholderID,
+			Text:      chunks[0],
+		}, nil); err != nil {
+			log.Printf("[bridge/sender] placeholder edit failed: %v, falling back to new message", err)
+			return s.SendResponse(ctx, chatID, threadID, origMsgID, text)
+		}
+		// Send any overflow chunks as new messages in the topic
+		for i, chunk := range chunks[1:] {
+			req := contract.SendRequest{
+				ChatID:   chatID,
+				ThreadID: threadID,
+				Text:     chunk,
+			}
+			var resp contract.SendResponse
+			if err := s.postWithRetry(ctx, "/send", req, &resp); err != nil {
+				return fmt.Errorf("overflow chunk %d: %w", i+1, err)
+			}
+			if _, dbErr := s.db.ExecContext(ctx,
+				`INSERT INTO sent_messages (chat_id, thread_id, orig_msg_id, sent_msg_id, chunk_index, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?)`,
+				chatID, nullableInt64(threadID), origMsgID, resp.MessageID, i+1, time.Now().Unix(),
+			); dbErr != nil {
+				log.Printf("[bridge/sender] db insert failed: %v", dbErr)
+			}
+		}
+		return nil
+	}
 	if streamMsgID == 0 {
 		return s.SendResponse(ctx, chatID, threadID, origMsgID, text)
 	}

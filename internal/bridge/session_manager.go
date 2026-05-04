@@ -451,6 +451,7 @@ type msgExtra struct {
 // claudeOutput holds the results of a Claude CLI invocation.
 // StreamMsgID is non-zero when a live-edit streaming message was posted during
 // the subprocess run; processBatch edits it with the final canonical text.
+// PlaceholderID is the "Thinking…" message ID for summary/quiet mode handling.
 type claudeOutput struct {
 	Type         string     `json:"type"`
 	SessionID    string     `json:"session_id"`
@@ -459,6 +460,7 @@ type claudeOutput struct {
 	TotalCostUSD float64    `json:"total_cost_usd"`
 	Usage        *UsageInfo `json:"usage,omitempty"`
 	StreamMsgID  int64      // non-zero when streaming edits were posted
+	PlaceholderID int64     // non-zero when placeholder was sent (used in summary mode)
 }
 
 // streamLine is the envelope for each NDJSON line emitted by
@@ -1306,7 +1308,7 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	}
 	// In quiet mode, the result is already set to a minimal confirmation ("Done ✓")
 	// by invokeClaudeAPI, so we send it. In other modes, send the full result.
-	if err := m.sender.SendStreamFinal(ctx, key.chatID, tidPtr, origMsgID, out.StreamMsgID, text); err != nil {
+	if err := m.sender.SendStreamFinal(ctx, key.chatID, tidPtr, origMsgID, out.StreamMsgID, out.PlaceholderID, text); err != nil {
 		log.Printf("[session_mgr] send response (%d,%d): %v", key.chatID, key.threadID, err)
 	}
 
@@ -1900,6 +1902,7 @@ func (m *SessionManager) invokeClaudeAPI(
 		// Live mode: normal streaming behavior
 		out.StreamMsgID = streamMsgID
 	}
+	out.PlaceholderID = placeholderID
 	return &out, nil
 }
 
