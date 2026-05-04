@@ -92,6 +92,7 @@ type CostEvent struct {
 	CacheReadTokens      int
 	CacheCreationTokens  int
 	Model                string
+	FromUserID           int64 // Telegram user ID who triggered this cost event
 	CreatedAt            time.Time
 }
 
@@ -138,7 +139,7 @@ type BackgroundJob struct {
 	StartedAt time.Time // When the job was started
 }
 
-const schemaVersion = 17
+const schemaVersion = 18
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -294,6 +295,9 @@ var migrations = []string{
 			// Version 17 — add dispatcher_mode to groups and sessions for orchestrator system prompt injection.
 			`ALTER TABLE groups ADD COLUMN dispatcher_mode INTEGER NOT NULL DEFAULT 1;
 			 ALTER TABLE sessions ADD COLUMN dispatcher_mode INTEGER NOT NULL DEFAULT -1;`,
+
+			// Version 18 — add from_user_id to cost_events for per-user attribution.
+			`ALTER TABLE cost_events ADD COLUMN from_user_id INTEGER NOT NULL DEFAULT 0;`,
 	}
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
 // and applies any pending migrations.
@@ -739,10 +743,11 @@ func (d *DB) RecordCostEvent(ctx context.Context, e *CostEvent) error {
 	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO cost_events
 		   (chat_id, thread_id, cost_usd, input_tokens, output_tokens,
-		    cache_read_tokens, cache_creation_tokens, model, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		    cache_read_tokens, cache_creation_tokens, model, from_user_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.ChatID, e.ThreadID, e.CostUSD, e.InputTokens, e.OutputTokens,
 		e.CacheReadTokens, e.CacheCreationTokens, nullableString(e.Model),
+		e.FromUserID,
 		e.CreatedAt.UTC().Format(time.RFC3339),
 	)
 	return err
@@ -827,6 +832,139 @@ func (d *DB) GetDailyCosts(ctx context.Context, chatID int64, days int) ([]*Dail
 	for rows.Next() {
 		var s DailyCostSummary
 		if err := rows.Scan(&s.Date, &s.TotalCost); err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, &s)
+	}
+	return summaries, rows.Err()
+}
+
+// UserCostSummary holds cost data for a single user.
+type UserCostSummary struct {
+	UserID     int64
+	TotalCost  float64
+	EventCount int
+}
+
+// GetUserTotalCost returns the sum of all costs for a user across all chats.
+func (d *DB) GetUserTotalCost(ctx context.Context, userID int64) (float64, error) {
+	var total float64
+	row := d.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events WHERE from_user_id = ?`, userID)
+	err := row.Scan(&total)
+	return total, err
+}
+
+// GetUserTopicCost returns the sum of all costs for a user in a specific topic.
+func (d *DB) GetUserTopicCost(ctx context.Context, chatID, threadID, userID int64) (float64, error) {
+	var total float64
+	row := d.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events WHERE chat_id = ? AND thread_id = ? AND from_user_id = ?`,
+		chatID, threadID, userID)
+	err := row.Scan(&total)
+	return total, err
+}
+
+// GetCostsByUser returns a list of users with their costs for a group.
+func (d *DB) GetCostsByUser(ctx context.Context, chatID int64) ([]*UserCostSummary, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT from_user_id,
+			        COALESCE(SUM(cost_usd), 0) as total_cost,
+			        COUNT(*) as event_count
+			 FROM cost_events
+			 WHERE chat_id = ?
+			 GROUP BY from_user_id
+			 ORDER BY total_cost DESC`,
+		chatID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var summaries []*UserCostSummary
+	for rows.Next() {
+		var s UserCostSummary
+		if err := rows.Scan(&s.UserID, &s.TotalCost, &s.EventCount); err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, &s)
+	}
+	return summaries, rows.Err()
+}
+
+// GetUserRecentCosts returns recent cost events for a user across all groups.
+func (d *DB) GetUserRecentCosts(ctx context.Context, userID int64, limit int) ([]*CostEvent, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT id, chat_id, thread_id, cost_usd, input_tokens, output_tokens,
+		        cache_read_tokens, cache_creation_tokens, model, from_user_id, created_at
+		 FROM cost_events
+		 WHERE from_user_id = ?
+		 ORDER BY created_at DESC LIMIT ?`,
+		userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []*CostEvent
+	for rows.Next() {
+		var e CostEvent
+		var model sql.NullString
+		var createdAt string
+		err := rows.Scan(&e.ID, &e.ChatID, &e.ThreadID, &e.CostUSD,
+			&e.InputTokens, &e.OutputTokens, &e.CacheReadTokens, &e.CacheCreationTokens,
+			&model, &e.FromUserID, &createdAt)
+		if err != nil {
+			return nil, err
+		}
+		e.Model = model.String
+		e.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		events = append(events, &e)
+	}
+	return events, rows.Err()
+}
+
+// GetSessionParticipants returns the user IDs who have participated in a session.
+func (d *DB) GetSessionParticipants(ctx context.Context, chatID, threadID int64) ([]int64, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT DISTINCT from_user_id FROM cost_events WHERE chat_id = ? AND thread_id = ? AND from_user_id > 0`,
+		chatID, threadID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []int64
+	for rows.Next() {
+		var userID int64
+		if err := rows.Scan(&userID); err != nil {
+			return nil, err
+		}
+		users = append(users, userID)
+	}
+	return users, rows.Err()
+}
+
+// GetSessionUserCosts returns cost breakdown by user for a session.
+func (d *DB) GetSessionUserCosts(ctx context.Context, chatID, threadID int64) ([]*UserCostSummary, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT from_user_id,
+			        COALESCE(SUM(cost_usd), 0) as total_cost,
+			        COUNT(*) as event_count
+			 FROM cost_events
+			 WHERE chat_id = ? AND thread_id = ? AND from_user_id > 0
+			 GROUP BY from_user_id
+			 ORDER BY total_cost DESC`,
+		chatID, threadID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var summaries []*UserCostSummary
+	for rows.Next() {
+		var s UserCostSummary
+		if err := rows.Scan(&s.UserID, &s.TotalCost, &s.EventCount); err != nil {
 			return nil, err
 		}
 		summaries = append(summaries, &s)

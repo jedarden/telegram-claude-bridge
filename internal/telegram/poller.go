@@ -35,6 +35,10 @@ type Poller struct {
 	polling bool
 	started time.Time
 	newData chan struct{} // cap-1 signal: new updates are available
+
+	// messageCache stores recent message content for /get_message endpoint
+	// Key: chatID:MessageID, Value: MessageContent
+	messageCache map[string]*contract.MessageContent
 }
 
 // NewPoller creates a Poller. Pass an empty apiBase to use the production Telegram API.
@@ -46,14 +50,15 @@ func NewPoller(token, apiBase, version, commitSHA, offsetPath string) *Poller {
 		apiBase = telegramAPIBase
 	}
 	p := &Poller{
-		token:     token,
-		apiBase:   apiBase,
-		version:   version,
-		commitSHA: commitSHA,
-		client:    &http.Client{Timeout: 40 * time.Second},
-		started:   time.Now(),
-		newData:   make(chan struct{}, 1),
-		offsetPath: offsetPath,
+		token:        token,
+		apiBase:      apiBase,
+		version:      version,
+		commitSHA:    commitSHA,
+		client:       &http.Client{Timeout: 40 * time.Second},
+		started:      time.Now(),
+		newData:      make(chan struct{}, 1),
+		offsetPath:   offsetPath,
+		messageCache: make(map[string]*contract.MessageContent),
 	}
 
 	// Load initial offset from file if configured
@@ -128,6 +133,40 @@ func (p *Poller) Start(ctx context.Context) {
 			p.updates = append(p.updates, normalized...)
 			id := normalized[len(normalized)-1].UpdateID
 			p.lastID = &id
+
+			// Cache message content for /get_message endpoint
+			for _, upd := range normalized {
+				if upd.Content != nil {
+					key := fmt.Sprintf("%d:%d", upd.ChatID, upd.MessageID)
+					content := &contract.MessageContent{
+						Type: upd.Content.Type,
+					}
+					if upd.Content.Text != nil {
+						content.Text = upd.Content.Text
+					}
+					if upd.Content.Caption != nil {
+						content.Caption = upd.Content.Caption
+					}
+					if upd.Content.FileName != nil {
+						content.FileName = upd.Content.FileName
+					}
+					p.messageCache[key] = content
+
+					// Keep cache size bounded (last 1000 messages per chat)
+					if len(p.messageCache) > 10000 {
+						// Simple eviction: remove oldest entries (first 1000)
+						evictCount := 0
+						for k := range p.messageCache {
+							delete(p.messageCache, k)
+							evictCount++
+							if evictCount >= 1000 {
+								break
+							}
+						}
+					}
+				}
+			}
+
 			p.mu.Unlock()
 
 			select {
@@ -178,6 +217,15 @@ func (p *Poller) Health() contract.HealthResponse {
 		Version:         p.version,
 		CommitSHA:       p.commitSHA,
 	}
+}
+
+// GetMessage retrieves the content of a specific message from the cache.
+// Returns nil if the message is not found in the cache (e.g., too old).
+func (p *Poller) GetMessage(chatID, messageID int64) *contract.MessageContent {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := fmt.Sprintf("%d:%d", chatID, messageID)
+	return p.messageCache[key]
 }
 
 // offsetFile represents the JSON structure of the offset file.

@@ -1339,7 +1339,9 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		return
 	}
 
-	if err := m.persistSession(ctx, key, session, group, out); err != nil {
+	// Extract from_user_id from the last message for attribution
+	fromUserID := last.update.FromUser.ID
+	if err := m.persistSession(ctx, key, session, group, out, fromUserID); err != nil {
 		log.Printf("[session_mgr] persist session (%d,%d): %v", key.chatID, key.threadID, err)
 		// Non-fatal: still deliver the response.
 	}
@@ -1999,7 +2001,8 @@ func (m *SessionManager) invokeClaudeAPI(
 }
 
 // persistSession writes a new session record or updates the existing one.
-func (m *SessionManager) persistSession(ctx context.Context, key topicKey, existing *Session, group *Group, out *claudeOutput) error {
+// fromUserID is the Telegram user ID of the user who triggered this invocation.
+func (m *SessionManager) persistSession(ctx context.Context, key topicKey, existing *Session, group *Group, out *claudeOutput, fromUserID int64) error {
 	if existing == nil {
 		// New session: create the record
 		sess := &Session{
@@ -2023,11 +2026,12 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 
 		// Record detailed cost event for the first invocation
 		costEvent := &CostEvent{
-			ChatID:    key.chatID,
-			ThreadID:  key.threadID,
-			CostUSD:   out.TotalCostUSD,
-			Model:     resolveSessionModel(nil, group),
-			CreatedAt: time.Now().UTC(),
+			ChatID:     key.chatID,
+			ThreadID:   key.threadID,
+			CostUSD:    out.TotalCostUSD,
+			Model:      resolveSessionModel(nil, group),
+			FromUserID: fromUserID,
+			CreatedAt:  time.Now().UTC(),
 		}
 		if out.Usage != nil {
 			costEvent.InputTokens = out.Usage.InputTokens
@@ -2082,11 +2086,12 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 
 	// Record detailed cost event
 	costEvent := &CostEvent{
-		ChatID:    key.chatID,
-		ThreadID:  key.threadID,
-		CostUSD:   out.TotalCostUSD,
-		Model:     resolveSessionModel(existing, group),
-		CreatedAt: time.Now().UTC(),
+		ChatID:     key.chatID,
+		ThreadID:   key.threadID,
+		CostUSD:    out.TotalCostUSD,
+		Model:      resolveSessionModel(existing, group),
+		FromUserID: fromUserID,
+		CreatedAt:  time.Now().UTC(),
 	}
 	if out.Usage != nil {
 		costEvent.InputTokens = out.Usage.InputTokens
@@ -3069,22 +3074,10 @@ func (m *SessionManager) GetSessionContext(ctx context.Context, chatID, threadID
 
 // GetPinnedSnippetsContext retrieves and formats all pinned snippets for a chat.
 // Returns a formatted string ready to inject into a prompt, or empty string if no pinned snippets exist.
+// TODO: Implement pinned snippets feature (Phase 5.2).
 func (m *SessionManager) GetPinnedSnippetsContext(ctx context.Context, chatID int64) string {
-	snippets, err := m.db.ListPinnedSnippets(ctx, chatID)
-	if err != nil {
-		log.Printf("[session_mgr] list pinned snippets failed for chat %d: %v", chatID, err)
-		return ""
-	}
-	if len(snippets) == 0 {
-		return ""
-	}
-
-	var parts []string
-	for _, s := range snippets {
-		parts = append(parts, fmt.Sprintf("## %s\n%s", s.Name, s.Content))
-	}
-
-	return fmt.Sprintf("[Pinned context snippets]\n%s", strings.Join(parts, "\n\n"))
+	// Snippets feature not yet implemented
+	return ""
 }
 
 // FormatCostResponse returns a formatted cost response for a topic.

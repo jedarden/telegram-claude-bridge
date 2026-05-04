@@ -54,6 +54,7 @@ func main() {
 	mux.HandleFunc("/close_topic", handleCloseTopic(sender))
 	mux.HandleFunc("/reopen_topic", handleReopenTopic(sender))
 	mux.HandleFunc("/pin_message", handlePinMessage(sender))
+	mux.HandleFunc("/get_message", handleGetMessage(poller))
 	mux.HandleFunc("/answer_callback", handleAnswerCallback(sender))
 	mux.HandleFunc("GET /file/{file_id}", handleFile(sender))
 	mux.HandleFunc("/send_photo", handleSendPhoto(sender))
@@ -299,6 +300,55 @@ func handlePinMessage(s *telegram.Sender) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(contract.OKResponse{OK: true}); err != nil {
 			log.Printf("pin_message encode: %v", err)
+		}
+	}
+}
+
+func handleGetMessage(p *telegram.Poller) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req contract.GetMessageRequest
+		if r.Method == http.MethodPost {
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeProxyError(w, http.StatusBadRequest, 400, "invalid JSON: "+err.Error())
+				return
+			}
+		} else {
+			// GET method: parse from query string
+			chatIDStr := r.URL.Query().Get("chat_id")
+			messageIDStr := r.URL.Query().Get("message_id")
+			if chatIDStr == "" || messageIDStr == "" {
+				writeProxyError(w, http.StatusBadRequest, 400, "missing chat_id or message_id")
+				return
+			}
+			var err error
+			req.ChatID, err = strconv.ParseInt(chatIDStr, 10, 64)
+			if err != nil {
+				writeProxyError(w, http.StatusBadRequest, 400, "invalid chat_id")
+				return
+			}
+			req.MessageID, err = strconv.ParseInt(messageIDStr, 10, 64)
+			if err != nil {
+				writeProxyError(w, http.StatusBadRequest, 400, "invalid message_id")
+				return
+			}
+		}
+
+		msgContent := p.GetMessage(req.ChatID, req.MessageID)
+		if msgContent == nil {
+			writeProxyError(w, http.StatusNotFound, 404, "message not found in cache (may be too old)")
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(contract.GetMessageResponse{
+			OK:      true,
+			Message: msgContent,
+		}); err != nil {
+			log.Printf("get_message encode: %v", err)
 		}
 	}
 }

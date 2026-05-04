@@ -104,7 +104,7 @@ func serviceUpdate(userID, chatID int64, threadID *int64, svcType string) contra
 
 func TestRouter_UnauthorizedUserDropped(t *testing.T) {
 	db := openTestDB(t)
-	r := NewRouter(db)
+	r := NewRouter(db, nil)
 
 	called := false
 	r.OnCommand = func(_ context.Context, _ contract.Update, _ *Group) { called = true }
@@ -124,7 +124,7 @@ func TestRouter_UnauthorizedUserDropped(t *testing.T) {
 func TestRouter_CallbackQuery(t *testing.T) {
 	db := openTestDB(t)
 	seedUser(t, db, 1)
-	r := NewRouter(db)
+	r := NewRouter(db, nil)
 
 	var got *contract.Update
 	r.OnCallback = func(_ context.Context, u contract.Update) { got = &u }
@@ -142,7 +142,7 @@ func TestRouter_CallbackQuery(t *testing.T) {
 func TestRouter_ServiceMessage(t *testing.T) {
 	db := openTestDB(t)
 	seedUser(t, db, 1)
-	r := NewRouter(db)
+	r := NewRouter(db, nil)
 
 	var got *contract.Update
 	r.OnService = func(_ context.Context, u contract.Update) { got = &u }
@@ -166,7 +166,7 @@ func TestRouter_GeneralTopic_Command(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			db := openTestDB(t)
 			seedUser(t, db, 1)
-			r := NewRouter(db)
+			r := NewRouter(db, nil)
 
 			var got *contract.Update
 			r.OnCommand = func(_ context.Context, u contract.Update, _ *Group) { got = &u }
@@ -183,7 +183,7 @@ func TestRouter_GeneralTopic_Command(t *testing.T) {
 func TestRouter_GeneralTopic_NonCommandIgnored(t *testing.T) {
 	db := openTestDB(t)
 	seedUser(t, db, 1)
-	r := NewRouter(db)
+	r := NewRouter(db, nil)
 
 	called := false
 	r.OnCommand = func(_ context.Context, _ contract.Update, _ *Group) { called = true }
@@ -201,7 +201,7 @@ func TestRouter_GeneralTopic_PassesGroupToCommandHandler(t *testing.T) {
 	db := openTestDB(t)
 	seedUser(t, db, 1)
 	seedGroup(t, db, 100)
-	r := NewRouter(db)
+	r := NewRouter(db, nil)
 
 	var gotGroup *Group
 	r.OnCommand = func(_ context.Context, _ contract.Update, g *Group) { gotGroup = g }
@@ -220,7 +220,7 @@ func TestRouter_GeneralTopic_NilGroupWhenUnregistered(t *testing.T) {
 	db := openTestDB(t)
 	seedUser(t, db, 1)
 	// no group seeded for chat 100
-	r := NewRouter(db)
+	r := NewRouter(db, nil)
 
 	var gotGroup *Group
 	called := false
@@ -244,7 +244,7 @@ func TestRouter_NamedTopic_ExistingSession(t *testing.T) {
 	seedUser(t, db, 1)
 	seedGroup(t, db, 100)
 	sess := seedSession(t, db, 100, 5)
-	r := NewRouter(db)
+	r := NewRouter(db, nil)
 
 	var gotSess *Session
 	var gotGroup *Group
@@ -271,7 +271,7 @@ func TestRouter_NamedTopic_NewSession_RegisteredGroup(t *testing.T) {
 	seedUser(t, db, 1)
 	seedGroup(t, db, 100)
 	// no session for thread 7
-	r := NewRouter(db)
+	r := NewRouter(db, nil)
 
 	var gotSess *Session
 	var gotGroup *Group
@@ -297,7 +297,7 @@ func TestRouter_NamedTopic_UnregisteredGroup_Ignored(t *testing.T) {
 	db := openTestDB(t)
 	seedUser(t, db, 1)
 	// no group registered for chat 999
-	r := NewRouter(db)
+	r := NewRouter(db, nil)
 
 	called := false
 	r.OnSession = func(_ context.Context, _ contract.Update, _ *Session, _ *Group) { called = true }
@@ -315,7 +315,7 @@ func TestRouter_NilHandlers_NoPanic(t *testing.T) {
 	seedGroup(t, db, 100)
 	seedSession(t, db, 100, 5)
 
-	r := NewRouter(db) // all handlers nil
+	r := NewRouter(db, nil) // all handlers nil
 
 	updates := []contract.Update{
 		callbackUpdate(1, 100),

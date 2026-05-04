@@ -400,10 +400,11 @@ func TestCostEvents(t *testing.T) {
 	}
 
 	ev := &CostEvent{
-		ChatID:   1,
-		ThreadID: 10,
-		CostUSD:  0.025,
-		Model:    "claude-sonnet-4-6",
+		ChatID:     1,
+		ThreadID:   10,
+		CostUSD:    0.025,
+		Model:      "claude-sonnet-4-6",
+		FromUserID: 12345,
 	}
 	if err := db.RecordCostEvent(ctx, ev); err != nil {
 		t.Fatalf("RecordCostEvent: %v", err)
@@ -423,5 +424,52 @@ func TestCostEvents(t *testing.T) {
 	}
 	if topicCost != 0.025 {
 		t.Errorf("GetTopicTotalCost: got %f, want 0.025", topicCost)
+	}
+
+	// Test per-user cost functions
+	userTotal, err := db.GetUserTotalCost(ctx, 12345)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if userTotal != 0.025 {
+		t.Errorf("GetUserTotalCost: got %f, want 0.025", userTotal)
+	}
+
+	userTopicCost, err := db.GetUserTopicCost(ctx, 1, 10, 12345)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if userTopicCost != 0.025 {
+		t.Errorf("GetUserTopicCost: got %f, want 0.025", userTopicCost)
+	}
+
+	// Test GetCostsByUser
+	byUser, err := db.GetCostsByUser(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byUser) != 1 {
+		t.Errorf("GetCostsByUser: got %d users, want 1", len(byUser))
+	}
+	if len(byUser) > 0 && byUser[0].UserID != 12345 {
+		t.Errorf("GetCostsByUser[0].UserID: got %d, want 12345", byUser[0].UserID)
+	}
+
+	// Test GetSessionParticipants
+	participants, err := db.GetSessionParticipants(ctx, 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(participants) != 1 {
+		t.Errorf("GetSessionParticipants: got %d participants, want 1", len(participants))
+	}
+
+	// Test GetSessionUserCosts
+	sessionUserCosts, err := db.GetSessionUserCosts(ctx, 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessionUserCosts) != 1 {
+		t.Errorf("GetSessionUserCosts: got %d users, want 1", len(sessionUserCosts))
 	}
 }

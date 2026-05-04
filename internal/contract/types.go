@@ -210,6 +210,27 @@ type AnswerCallbackRequest struct {
 	ShowAlert       *bool   `json:"show_alert,omitempty"`
 }
 
+// GetMessageRequest is the body of GET /get_message.
+type GetMessageRequest struct {
+	ChatID    int64 `json:"chat_id"`
+	MessageID int64 `json:"message_id"`
+}
+
+// MessageContent represents the content of a fetched message.
+type MessageContent struct {
+	Type     ContentType `json:"type"`
+	Text     *string     `json:"text,omitempty"`
+	Caption  *string     `json:"caption,omitempty"`
+	FileName *string     `json:"file_name,omitempty"`
+}
+
+// GetMessageResponse is the response from GET /get_message.
+type GetMessageResponse struct {
+	OK      bool           `json:"ok"`
+	Message *MessageContent `json:"message,omitempty"`
+	Error   *ErrorResponse  `json:"error,omitempty"`
+}
+
 // InlineKeyboard is the reply_markup for inline keyboard buttons.
 type InlineKeyboard struct {
 	InlineKeyboard [][]InlineButton `json:"inline_keyboard"`

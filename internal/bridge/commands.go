@@ -28,7 +28,7 @@ User commands:
 /opus — quick switch to claude-opus-4-6
 /color [name] — set topic icon color (active, complete, blocked, error, review, research)
 /notify [mode] — set notification mode (live, summary, quiet)
-/context <thread_id> — fetch context from another topic and inject it into the next prompt
+/context <thread_id> — fetch context from another topic and inject it
 /info — show session info (model, cwd, session_id, messages, notification mode)
 /status — list active sessions in this group
 /sessions — list all sessions across all groups
@@ -457,8 +457,19 @@ func (h *CommandHandler) cmdStatus(ctx context.Context, update contract.Update, 
 	fmt.Fprintf(&sb, "Active sessions (%d):\n", len(active))
 	for _, s := range active {
 		since := time.Since(s.LastActive).Round(time.Second)
-		fmt.Fprintf(&sb, "  • thread %d — %d messages, last active %s ago\n",
+		fmt.Fprintf(&sb, "  • thread %d — %d messages, last active %s ago",
 			s.ThreadID, s.MessageCount, since)
+
+		// Show user attribution
+		participants, err := h.db.GetSessionParticipants(ctx, s.ChatID, s.ThreadID)
+		if err == nil && len(participants) > 0 {
+			userStrs := make([]string, 0, len(participants))
+			for _, uid := range participants {
+				userStrs = append(userStrs, fmt.Sprintf("user:%d", uid))
+			}
+			fmt.Fprintf(&sb, "\n    users: %s", strings.Join(userStrs, ", "))
+		}
+		sb.WriteByte('\n')
 	}
 	return strings.TrimRight(sb.String(), "\n"), nil
 }
@@ -478,8 +489,19 @@ func (h *CommandHandler) cmdSessions(ctx context.Context) (string, error) {
 	fmt.Fprintf(&sb, "All sessions (%d):\n", len(sessions))
 	for _, s := range sessions {
 		since := time.Since(s.LastActive).Round(time.Second)
-		fmt.Fprintf(&sb, "  • chat %d / thread %d [%s] — %d messages, last active %s ago\n",
+		fmt.Fprintf(&sb, "  • chat %d / thread %d [%s] — %d messages, last active %s ago",
 			s.ChatID, s.ThreadID, s.Status, s.MessageCount, since)
+
+		// Show user attribution
+		participants, err := h.db.GetSessionParticipants(ctx, s.ChatID, s.ThreadID)
+		if err == nil && len(participants) > 0 {
+			userStrs := make([]string, 0, len(participants))
+			for _, uid := range participants {
+				userStrs = append(userStrs, fmt.Sprintf("user:%d", uid))
+			}
+			fmt.Fprintf(&sb, "\n    users: %s", strings.Join(userStrs, ", "))
+		}
+		sb.WriteByte('\n')
 	}
 	return strings.TrimRight(sb.String(), "\n"), nil
 }
@@ -1307,6 +1329,19 @@ func (h *CommandHandler) cmdCost(ctx context.Context, update contract.Update, gr
 				fmt.Fprintf(&sb, "  • %s: $%.4f\n", dc.Date, dc.TotalCost)
 			}
 		}
+
+		// Per-user breakdown
+		byUser, err := h.db.GetCostsByUser(ctx, update.ChatID)
+		if err != nil {
+			return "", fmt.Errorf("get costs by user: %w", err)
+		}
+
+		if len(byUser) > 0 {
+			sb.WriteString("\nCost by user:\n")
+			for _, uc := range byUser {
+				fmt.Fprintf(&sb, "  • User %d: $%.4f (%d events)\n", uc.UserID, uc.TotalCost, uc.EventCount)
+			}
+		}
 	} else {
 		// In a topic: show this topic's cost only
 		topicCost, err := h.db.GetTopicTotalCost(ctx, update.ChatID, *update.ThreadID)
@@ -1323,6 +1358,19 @@ func (h *CommandHandler) cmdCost(ctx context.Context, update contract.Update, gr
 		}
 		if session != nil {
 			fmt.Fprintf(&sb, "Session: %s\nMessages: %d\n", session.SessionID, session.MessageCount)
+		}
+
+		// Per-user breakdown for this topic
+		byUser, err := h.db.GetSessionUserCosts(ctx, update.ChatID, *update.ThreadID)
+		if err != nil {
+			return "", fmt.Errorf("get session user costs: %w", err)
+		}
+
+		if len(byUser) > 0 {
+			sb.WriteString("\nCost by user:\n")
+			for _, uc := range byUser {
+				fmt.Fprintf(&sb, "  • User %d: $%.4f (%d events)\n", uc.UserID, uc.TotalCost, uc.EventCount)
+			}
 		}
 	}
 
@@ -1522,27 +1570,16 @@ func (h *CommandHandler) cmdUsers(ctx context.Context, update contract.Update) (
 	return strings.TrimRight(sb.String(), "\n"), nil
 }
 
-// cmdContext handles /context <thread_id> — fetches context from another topic
-// and injects it into the next prompt for the current topic.
+// cmdContext handles /context <thread_id> — fetches context from another topic.
 func (h *CommandHandler) cmdContext(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
 	if args == "" {
-		return "Usage: /context <thread_id>\n\nFetches context from another topic and injects it into your next prompt.\n\nThe context is taken from the referenced topic's summary (if available) or its session metadata.", nil
+		return "Usage: /context <thread_id>\n\nFetches context from another topic and injects it into your next prompt.", nil
 	}
 	if group == nil {
 		return "This group is not registered. Use /cwd <path> to register it.", nil
 	}
 
-	// Parse the thread_id from arguments
-	threadID, err := strconv.ParseInt(strings.TrimSpace(args), 10, 64)
-	if err != nil {
-		return fmt.Sprintf("Invalid thread_id %q — must be a number.", args), nil
-	}
-
-	// Get context from the referenced session
-	contextStr, err := h.sessionMgr.GetSessionContext(ctx, update.ChatID, threadID)
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err), nil
-	}
+	arg := strings.TrimSpace(args)
 
 	// Determine the target topic for storing the context
 	var targetThreadID int64
@@ -1552,10 +1589,32 @@ func (h *CommandHandler) cmdContext(ctx context.Context, update contract.Update,
 		return "Context commands only work within a topic session. Use /new to create a topic first.", nil
 	}
 
+	// Try parsing as thread_id
+	threadID, err := strconv.ParseInt(arg, 10, 64)
+	if err != nil {
+		return fmt.Sprintf("Invalid thread_id %q — must be a number.", arg), nil
+	}
+
+	// Get context from the referenced topic
+	contextStr, err := h.sessionMgr.GetSessionContext(ctx, update.ChatID, threadID)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), nil
+	}
+
 	// Store the context for the current topic
 	h.sessionMgr.SetPendingContext(update.ChatID, targetThreadID, contextStr)
 
 	return fmt.Sprintf("Context from thread %d will be included in your next prompt.", threadID), nil
+}
+
+// cmdSnippet handles /snippet — not implemented yet.
+func (h *CommandHandler) cmdSnippet(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	return "Snippet commands are not yet implemented.", nil
+}
+
+// cmdSnippets handles /snippets — not implemented yet.
+func (h *CommandHandler) cmdSnippets(ctx context.Context, update contract.Update, group *Group) (string, error) {
+	return "Snippet commands are not yet implemented.", nil
 }
 
 // cmdCancel handles /cancel [thread_id] — cancels the running request in this topic.
