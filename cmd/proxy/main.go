@@ -35,7 +35,7 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	poller := telegram.NewPoller(cfg.TelegramToken, "", Version, CommitSHA)
+	poller := telegram.NewPoller(cfg.TelegramToken, "", Version, CommitSHA, cfg.OffsetFilePath)
 	sender := telegram.NewSender(cfg.TelegramToken, "")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

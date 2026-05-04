@@ -78,7 +78,7 @@ func TestPoller_OffsetTracking(t *testing.T) {
 	})
 	defer srv.Close()
 
-	p := NewPoller("test-token", srv.URL, "test-version", "test-sha")
+	p := NewPoller("test-token", srv.URL, "test-version", "test-sha", "")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -121,7 +121,7 @@ func TestPoller_MultipleBatches(t *testing.T) {
 	})
 	defer srv.Close()
 
-	p := NewPoller("test-token", srv.URL, "test-version", "test-sha")
+	p := NewPoller("test-token", srv.URL, "test-version", "test-sha", "")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -154,7 +154,7 @@ func TestPoller_TakeUpdates_Timeout(t *testing.T) {
 	srv, _ := mockTelegramServer(t, nil)
 	defer srv.Close()
 
-	p := NewPoller("test-token", srv.URL, "test-version", "test-sha")
+	p := NewPoller("test-token", srv.URL, "test-version", "test-sha", "")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -178,7 +178,7 @@ func TestPoller_Health(t *testing.T) {
 	srv, _ := mockTelegramServer(t, nil)
 	defer srv.Close()
 
-	p := NewPoller("test-token", srv.URL, "test-version", "test-sha")
+	p := NewPoller("test-token", srv.URL, "test-version", "test-sha", "")
 
 	h := p.Health()
 	if h.Polling {
@@ -225,7 +225,7 @@ func TestPoller_ContextCancel(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := NewPoller("test-token", srv.URL, "test-version", "test-sha")
+	p := NewPoller("test-token", srv.URL, "test-version", "test-sha", "")
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan struct{})

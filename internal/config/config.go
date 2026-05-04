@@ -23,6 +23,10 @@ type ProxyConfig struct {
 
 	// DBPath is the path to the SQLite database file.
 	DBPath string
+
+	// OffsetFilePath is the path to persist the Telegram polling offset.
+	// If empty, offset is not persisted and will be lost on restart.
+	OffsetFilePath string
 }
 
 // BridgeConfig holds configuration for the bridge component.
@@ -82,10 +86,11 @@ func LoadProxyConfig() (*ProxyConfig, error) {
 	}
 
 	cfg := &ProxyConfig{
-		TelegramToken: token,
-		ListenAddr:    envOrDefault("PROXY_LISTEN_ADDR", ":8080"),
-		DBPath:        envOrDefault("PROXY_DB_PATH", "proxy.db"),
-		PollTimeout:   30,
+		TelegramToken:  token,
+		ListenAddr:     envOrDefault("PROXY_LISTEN_ADDR", ":8080"),
+		DBPath:         envOrDefault("PROXY_DB_PATH", "proxy.db"),
+		OffsetFilePath: envOrDefault("OFFSET_FILE_PATH", "/data/offset.json"),
+		PollTimeout:    30,
 	}
 
 	if v := os.Getenv("POLL_TIMEOUT"); v != "" {

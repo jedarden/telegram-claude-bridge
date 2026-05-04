@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -19,11 +21,12 @@ const telegramAPIBase = "https://api.telegram.org"
 
 // Poller manages Telegram long-polling and buffers normalized updates for consumption.
 type Poller struct {
-	token     string
-	apiBase   string
-	client    *http.Client
-	version   string
-	commitSHA string
+	token        string
+	apiBase      string
+	client       *http.Client
+	version      string
+	commitSHA    string
+	offsetPath   string // path to persist offset; empty means no persistence
 
 	mu      sync.Mutex
 	offset  int64
@@ -36,11 +39,13 @@ type Poller struct {
 
 // NewPoller creates a Poller. Pass an empty apiBase to use the production Telegram API.
 // The version and commitSHA parameters are used for health endpoint reporting.
-func NewPoller(token, apiBase, version, commitSHA string) *Poller {
+// If offsetPath is non-empty, the poller will persist its offset to that file and
+// reload it on startup to survive restarts.
+func NewPoller(token, apiBase, version, commitSHA, offsetPath string) *Poller {
 	if apiBase == "" {
 		apiBase = telegramAPIBase
 	}
-	return &Poller{
+	p := &Poller{
 		token:     token,
 		apiBase:   apiBase,
 		version:   version,
@@ -48,7 +53,18 @@ func NewPoller(token, apiBase, version, commitSHA string) *Poller {
 		client:    &http.Client{Timeout: 40 * time.Second},
 		started:   time.Now(),
 		newData:   make(chan struct{}, 1),
+		offsetPath: offsetPath,
 	}
+
+	// Load initial offset from file if configured
+	if offsetPath != "" {
+		if offset := p.loadOffset(); offset > 0 {
+			p.offset = offset
+			log.Printf("poller: loaded offset %d from %s", offset, offsetPath)
+		}
+	}
+
+	return p
 }
 
 // Start runs the long-polling loop until ctx is cancelled. Call in a goroutine.
@@ -164,6 +180,68 @@ func (p *Poller) Health() contract.HealthResponse {
 	}
 }
 
+// offsetFile represents the JSON structure of the offset file.
+type offsetFile struct {
+	Offset int64 `json:"offset"`
+}
+
+// loadOffset reads the persisted offset from disk. Returns 0 if file doesn't exist
+// or on error (in which case we start fresh from offset 0).
+func (p *Poller) loadOffset() int64 {
+	if p.offsetPath == "" {
+		return 0
+	}
+
+	data, err := os.ReadFile(p.offsetPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("poller: error reading offset file: %v — starting from offset 0", err)
+		}
+		return 0
+	}
+
+	var of offsetFile
+	if err := json.Unmarshal(data, &of); err != nil {
+		log.Printf("poller: error parsing offset file: %v — starting from offset 0", err)
+		return 0
+	}
+
+	return of.Offset
+}
+
+// saveOffset writes the current offset to disk atomically using a temp file + rename.
+// Errors are logged but don't stop polling (we'll retry on the next getUpdates).
+func (p *Poller) saveOffset(offset int64) {
+	if p.offsetPath == "" {
+		return
+	}
+
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(p.offsetPath), 0755); err != nil {
+		log.Printf("poller: error creating offset directory: %v", err)
+		return
+	}
+
+	data, err := json.Marshal(offsetFile{Offset: offset})
+	if err != nil {
+		log.Printf("poller: error marshaling offset: %v", err)
+		return
+	}
+
+	// Write to temp file first, then rename for atomicity
+	tmpPath := p.offsetPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		log.Printf("poller: error writing offset temp file: %v", err)
+		return
+	}
+
+	if err := os.Rename(tmpPath, p.offsetPath); err != nil {
+		log.Printf("poller: error renaming offset file: %v", err)
+		os.Remove(tmpPath) // clean up temp file
+		return
+	}
+}
+
 // getUpdates calls the Telegram getUpdates API with offset and a 30-second timeout.
 func (p *Poller) getUpdates(ctx context.Context) ([]Update, error) {
 	p.mu.Lock()
@@ -218,6 +296,7 @@ func (p *Poller) getUpdates(ctx context.Context) ([]Update, error) {
 		p.mu.Lock()
 		p.offset = lastID + 1
 		p.mu.Unlock()
+		p.saveOffset(p.offset)
 	}
 
 	return result.Result, nil
