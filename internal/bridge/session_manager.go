@@ -1185,7 +1185,7 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		}
 	}
 
-	prompt := m.buildSessionPrompt(key, batch, extras)
+	prompt := m.buildSessionPrompt(ctx, key, batch, extras)
 	if prompt == "" {
 		return // no content to process
 	}
@@ -2112,9 +2112,8 @@ func (m *SessionManager) updatePinnedMetadata(ctx context.Context, session *Sess
 // extras maps each batch index to resolved attachment data (image path or transcription).
 // Single message: used as-is.
 // Multiple messages: previous ones listed under a header, last one highlighted.
-// If pending worker results exist, they are prepended before the user message.
-// If pending context exists for the topic, it's prepended to the prompt.
-func (m *SessionManager) buildSessionPrompt(key topicKey, batch []sessionMsg, extras []msgExtra) string {
+// Pinned snippets are prepended first, then worker results, then pending context.
+func (m *SessionManager) buildSessionPrompt(ctx context.Context, key topicKey, batch []sessionMsg, extras []msgExtra) string {
 	texts := make([]string, 0, len(batch))
 	for i, msg := range batch {
 		var ex msgExtra
@@ -2163,7 +2162,13 @@ func (m *SessionManager) buildSessionPrompt(key topicKey, batch []sessionMsg, ex
 		prompt = fmt.Sprintf("%s\n\n[User message]\n%s", workerResultsText, prompt)
 	}
 
-	// Check for pending context and prepend it (after worker results)
+	// Prepend pinned snippets (injected into all prompts for this chat)
+	pinnedSnippets := m.GetPinnedSnippetsContext(ctx, key.chatID)
+	if pinnedSnippets != "" {
+		prompt = fmt.Sprintf("%s\n\n---\n\n%s", pinnedSnippets, prompt)
+	}
+
+	// Check for pending context and prepend it (after worker results and pinned snippets)
 	m.mu.Lock()
 	pendingCtx, hasPending := m.pendingContext[key]
 	if hasPending {
@@ -3002,6 +3007,26 @@ func (m *SessionManager) GetSessionContext(ctx context.Context, chatID, threadID
 	}
 
 	return contextStr, nil
+}
+
+// GetPinnedSnippetsContext retrieves and formats all pinned snippets for a chat.
+// Returns a formatted string ready to inject into a prompt, or empty string if no pinned snippets exist.
+func (m *SessionManager) GetPinnedSnippetsContext(ctx context.Context, chatID int64) string {
+	snippets, err := m.db.ListPinnedSnippets(ctx, chatID)
+	if err != nil {
+		log.Printf("[session_mgr] list pinned snippets failed for chat %d: %v", chatID, err)
+		return ""
+	}
+	if len(snippets) == 0 {
+		return ""
+	}
+
+	var parts []string
+	for _, s := range snippets {
+		parts = append(parts, fmt.Sprintf("## %s\n%s", s.Name, s.Content))
+	}
+
+	return fmt.Sprintf("[Pinned context snippets]\n%s", strings.Join(parts, "\n\n"))
 }
 
 // FormatCostResponse returns a formatted cost response for a topic.
