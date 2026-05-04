@@ -1518,6 +1518,9 @@ func (m *SessionManager) invokeClaudeAPI(
 		m.mu.Unlock()
 	}()
 
+	// Capture start time before subprocess begins for media detection
+	startTime := time.Now()
+
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start claude: %w", err)
 	}
@@ -1969,7 +1972,7 @@ func (m *SessionManager) invokeClaudeAPI(
 
 	// Detect generated media files in the working directory
 	// Look for audio/video files created during this invocation
-	if err := m.detectGeneratedMedia(group.CWD, time.Now(), &out); err != nil {
+	if err := m.detectGeneratedMedia(group.CWD, startTime, &out); err != nil {
 		log.Printf("[session_mgr] detect generated media: %v", err)
 		// Non-fatal: continue without media attachments
 	}
