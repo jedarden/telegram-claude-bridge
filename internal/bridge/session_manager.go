@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -488,6 +489,23 @@ type claudeOutput struct {
 	Usage        *UsageInfo `json:"usage,omitempty"`
 	StreamMsgID  int64      // non-zero when streaming edits were posted
 	PlaceholderID int64     // non-zero when placeholder was sent (used in summary mode)
+	// File attachments for outbound media (audio/video)
+	AudioFiles []audioAttachment `json:"audio_files,omitempty"`
+	VideoFiles []videoAttachment `json:"video_files,omitempty"`
+}
+
+// audioAttachment represents an audio file to be sent to Telegram.
+type audioAttachment struct {
+	Path     string // Path to the audio file
+	Filename string // Filename to use when sending
+	Caption  string // Optional caption for the audio
+}
+
+// videoAttachment represents a video file to be sent to Telegram.
+type videoAttachment struct {
+	Path     string // Path to the video file
+	Filename string // Filename to use when sending
+	Caption  string // Optional caption for the video
 }
 
 // streamLine is the envelope for each NDJSON line emitted by
@@ -1346,6 +1364,36 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		log.Printf("[session_mgr] send response (%d,%d): %v", key.chatID, key.threadID, err)
 	}
 
+	// Send any generated audio files
+	for _, af := range out.AudioFiles {
+		content, err := os.ReadFile(af.Path)
+		if err != nil {
+			log.Printf("[session_mgr] read audio file %s: %v", af.Path, err)
+			continue
+		}
+		if err := m.sender.SendAudio(ctx, key.chatID, tidPtr, 0, af.Caption, af.Filename, content); err != nil {
+			log.Printf("[session_mgr] send audio %s: %v", af.Filename, err)
+			// Continue with other files even if one fails
+		} else {
+			log.Printf("[session_mgr] sent audio file: %s", af.Filename)
+		}
+	}
+
+	// Send any generated video files
+	for _, vf := range out.VideoFiles {
+		content, err := os.ReadFile(vf.Path)
+		if err != nil {
+			log.Printf("[session_mgr] read video file %s: %v", vf.Path, err)
+			continue
+		}
+		if err := m.sender.SendVideo(ctx, key.chatID, tidPtr, 0, vf.Caption, vf.Filename, content); err != nil {
+			log.Printf("[session_mgr] send video %s: %v", vf.Filename, err)
+			// Continue with other files even if one fails
+		} else {
+			log.Printf("[session_mgr] sent video file: %s", vf.Filename)
+		}
+	}
+
 	// Update the pinned metadata message with the new message count and cost
 	if session != nil && session.PinnedMessageID != 0 {
 		if err := m.updatePinnedMetadata(ctx, session, group); err != nil {
@@ -1917,6 +1965,13 @@ func (m *SessionManager) invokeClaudeAPI(
 
 	if out.IsError {
 		return nil, fmt.Errorf("claude error: %s", out.Result)
+	}
+
+	// Detect generated media files in the working directory
+	// Look for audio/video files created during this invocation
+	if err := m.detectGeneratedMedia(group.CWD, time.Now(), &out); err != nil {
+		log.Printf("[session_mgr] detect generated media: %v", err)
+		// Non-fatal: continue without media attachments
 	}
 
 	// Handle notification modes for final output
@@ -3282,4 +3337,110 @@ func (m *SessionManager) createClaudeSession(ctx context.Context, group *Group, 
 		return "", fmt.Errorf("claude returned empty session_id")
 	}
 	return out.SessionID, nil
+}
+
+// detectGeneratedMedia scans the working directory for audio and video files
+// created during the session invocation. It populates out.AudioFiles and out.VideoFiles
+// with any discovered media files. Only files created or modified after startTime
+// are considered.
+func (m *SessionManager) detectGeneratedMedia(cwd string, startTime time.Time, out *claudeOutput) error {
+	// Audio file extensions to look for
+	audioExts := map[string]bool{
+		".mp3":  true,
+		".wav":  true,
+		".m4a":  true,
+		".ogg":  true,
+		".flac": true,
+		".aac":  true,
+		".opus": true,
+	}
+
+	// Video file extensions to look for
+	videoExts := map[string]bool{
+		".mp4":  true,
+		".mov":  true,
+		".avi":  true,
+		".mkv":  true,
+		".webm": true,
+		".flv":  true,
+	}
+
+	// Walk the working directory looking for media files
+	err := filepath.Walk(cwd, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			// Skip directories we can't access
+			if os.IsPermission(err) {
+				return filepath.SkipDir
+			}
+			return err
+		}
+
+		// Skip directories and hidden files
+		if info.IsDir() {
+			if filepath.Base(path)[0] == '.' {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Skip hidden files
+		if filepath.Base(path)[0] == '.' {
+			return nil
+		}
+
+		// Check if file was created or modified during the session
+		// Use modTime as a proxy - files created during the session will have modTime >= startTime
+		if info.ModTime().Before(startTime) {
+			return nil
+		}
+
+		ext := strings.ToLower(filepath.Ext(path))
+		baseName := filepath.Base(path)
+
+		// Skip temp files and common non-output files
+		if strings.HasPrefix(baseName, "tmp") || strings.HasPrefix(baseName, "temp") {
+			return nil
+		}
+		if strings.Contains(baseName, ".git") {
+			return nil
+		}
+
+		// Check for audio files
+		if audioExts[ext] {
+			// Skip if already in the list
+			for _, af := range out.AudioFiles {
+				if af.Path == path {
+					return nil
+				}
+			}
+			out.AudioFiles = append(out.AudioFiles, audioAttachment{
+				Path:     path,
+				Filename: baseName,
+				Caption:  "", // No caption by default
+			})
+			log.Printf("[session_mgr] detected generated audio file: %s", path)
+			return nil
+		}
+
+		// Check for video files
+		if videoExts[ext] {
+			// Skip if already in the list
+			for _, vf := range out.VideoFiles {
+				if vf.Path == path {
+					return nil
+				}
+			}
+			out.VideoFiles = append(out.VideoFiles, videoAttachment{
+				Path:     path,
+				Filename: baseName,
+				Caption:  "", // No caption by default
+			})
+			log.Printf("[session_mgr] detected generated video file: %s", path)
+			return nil
+		}
+
+		return nil
+	})
+
+	return err
 }
