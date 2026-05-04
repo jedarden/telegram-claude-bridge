@@ -12,6 +12,7 @@ import (
 	"github.com/jedarden/telegram-claude-bridge/internal/bridge"
 	"github.com/jedarden/telegram-claude-bridge/internal/config"
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
+	"github.com/jedarden/telegram-claude-bridge/internal/events"
 	"github.com/jedarden/telegram-claude-bridge/internal/health"
 	"github.com/jedarden/telegram-claude-bridge/internal/updater"
 )
@@ -73,8 +74,18 @@ func main() {
 		defer upd.Stop()
 	}
 
-	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL, upd, Version, CommitSHA, BuildDate)
-	sessionMgr := bridge.NewSessionManager(db, sender, cfg.ProxyURL)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// Initialize event publisher for dashboard monitoring
+	eventPublisher := events.GetPublisher(cfg.EventPublishingEnabled, cfg.EventSocketPath, checker)
+	if pub, ok := eventPublisher.(*events.Publisher); ok {
+		pub.Start(ctx)
+	}
+	defer events.StopPublisher(eventPublisher)
+
+	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL, upd, eventPublisher, Version, CommitSHA, BuildDate)
+	sessionMgr := bridge.NewSessionManager(db, sender, cfg.ProxyURL, eventPublisher)
 	defer sessionMgr.Shutdown()
 	cmdHandler.SetSessionManager(sessionMgr)
 
@@ -96,17 +107,17 @@ func main() {
 	// Create callback handler for inline keyboard interactions
 	callbackHandler := bridge.NewCallbackHandler(db, sender, cfg.ProxyURL, &http.Client{Timeout: 10 * time.Second}, sessionMgr)
 
-	router := bridge.NewRouter(db)
+	updates := make(chan contract.Update, 64)
+	poller := bridge.NewPoller(cfg.ProxyURL, cfg.PollTimeout, updates)
+
+	// Wire event publisher to health checker for health status events
+	checker.SetEventPublisher(eventPublisher)
+
+	router := bridge.NewRouter(db, eventPublisher)
 	router.OnCommand = cmdHandler.Handle
 	router.OnSession = sessionMgr.Handle
 	router.OnService = serviceHandler.Handle
 	router.OnCallback = callbackHandler.Handle
-
-	updates := make(chan contract.Update, 64)
-	poller := bridge.NewPoller(cfg.ProxyURL, cfg.PollTimeout, updates)
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 
 	// Start health server on localhost:9091
 	healthAddr := "127.0.0.1:9091"

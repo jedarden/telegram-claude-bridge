@@ -10,9 +10,11 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
+	"github.com/jedarden/telegram-claude-bridge/internal/events"
 	_ "modernc.org/sqlite"
 )
 
@@ -26,9 +28,11 @@ const (
 // Sender posts responses back to Telegram through the proxy and records sent
 // message IDs in SQLite for future edit-in-place streaming support.
 type Sender struct {
-	proxyURL string
-	client   *http.Client
-	db       *sql.DB
+	proxyURL       string
+	client         *http.Client
+	db             *sql.DB
+	eventPublisher events.Publishable
+	mu             sync.RWMutex
 }
 
 // NewSender creates a Sender that sends via the proxy at proxyURL and stores
@@ -52,6 +56,29 @@ func NewSender(proxyURL, dbPath string) (*Sender, error) {
 // Close releases the database connection.
 func (s *Sender) Close() error {
 	return s.db.Close()
+}
+
+// SetEventPublisher sets the event publisher for message sent events.
+// May be nil if event publishing is disabled.
+func (s *Sender) SetEventPublisher(pub events.Publishable) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.eventPublisher = pub
+}
+
+// publishMessageSent publishes a message sent event if the publisher is set.
+func (s *Sender) publishMessageSent(chatID int64, threadID *int64, messageID int64, purpose string) {
+	s.mu.RLock()
+	pub := s.eventPublisher
+	s.mu.RUnlock()
+
+	if pub != nil {
+		tid := int64(0)
+		if threadID != nil {
+			tid = *threadID
+		}
+		pub.PublishMessageSent(chatID, tid, messageID, purpose)
+	}
 }
 
 func initSenderDB(db *sql.DB) error {
@@ -114,7 +141,12 @@ func (s *Sender) SendToGeneral(ctx context.Context, chatID int64, text string) e
 		ThreadID: &threadID,
 		Text:     text,
 	}
-	return s.postWithRetry(ctx, "/send", req, nil)
+	var resp contract.SendResponse
+	if err := s.postWithRetry(ctx, "/send", req, &resp); err != nil {
+		return err
+	}
+	s.publishMessageSent(chatID, &threadID, resp.MessageID, "system_notification")
+	return nil
 }
 
 // SendResponse sends text back to the user, chunking at paragraph boundaries

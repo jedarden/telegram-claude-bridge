@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
+	"github.com/jedarden/telegram-claude-bridge/internal/events"
 )
 
 const HelpText = `Available commands:
@@ -72,6 +73,7 @@ type CommandHandler struct {
 	sessionMgr          *SessionManager // optional, for context commands
 	subtaskOrchestrator *SubtaskOrchestrator // optional, for parallel commands
 	bgJobMgr            *BackgroundJobManager // optional, for background job commands
+	eventPublisher      events.Publishable // optional, for dashboard events
 	bridgeVer           string
 	bridgeSHA           string
 	buildDate           string
@@ -93,17 +95,19 @@ type UpdateResult struct {
 
 // NewCommandHandler returns a CommandHandler backed by db and sender.
 // updater is optional; pass nil to disable update commands.
+// eventPublisher is optional; pass nil to disable event publishing.
 // version, commitSHA, and buildDate are build-time version info.
-func NewCommandHandler(db *DB, sender *Sender, proxyURL string, updater UpdaterInterface, version, commitSHA, buildDate string) *CommandHandler {
+func NewCommandHandler(db *DB, sender *Sender, proxyURL string, updater UpdaterInterface, eventPublisher events.Publishable, version, commitSHA, buildDate string) *CommandHandler {
 	return &CommandHandler{
-		db:        db,
-		sender:    sender,
-		proxyURL:  proxyURL,
-		client:    &http.Client{Timeout: 10 * time.Second},
-		updater:   updater,
-		bridgeVer: version,
-		bridgeSHA: commitSHA,
-		buildDate: buildDate,
+		db:             db,
+		sender:         sender,
+		proxyURL:       proxyURL,
+		client:         &http.Client{Timeout: 10 * time.Second},
+		updater:        updater,
+		eventPublisher: eventPublisher,
+		bridgeVer:      version,
+		bridgeSHA:      commitSHA,
+		buildDate:      buildDate,
 	}
 }
 
@@ -541,6 +545,11 @@ func (h *CommandHandler) cmdClose(ctx context.Context, update contract.Update, g
 
 	if err := h.db.CloseSession(ctx, update.ChatID, threadID); err != nil {
 		return "", fmt.Errorf("close session: %w", err)
+	}
+
+	// Publish session closed event
+	if h.eventPublisher != nil {
+		h.eventPublisher.PublishSessionClosed(update.ChatID, threadID, session.SessionID)
 	}
 
 	// Set the color to green (complete) when closing

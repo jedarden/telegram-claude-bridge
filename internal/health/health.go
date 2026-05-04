@@ -50,6 +50,19 @@ type Checker struct {
 	mu          sync.RWMutex
 	lastHealthy bool
 	logger      *slog.Logger
+	eventPublisher any
+}
+
+// HealthCheck represents a single health check result for event publishing.
+type HealthCheck struct {
+	Name    string `json:"name"`
+	Healthy bool   `json:"healthy"`
+	Message string `json:"message,omitempty"`
+}
+
+// publisher is the minimal interface needed for event publishing.
+type publisher interface {
+	PublishHealthCheck(healthy bool, checks []HealthCheck)
 }
 
 // NewChecker creates a new health checker.
@@ -74,6 +87,13 @@ func (c *Checker) SetLogLevel(level slog.Level) {
 	c.logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: level,
 	}))
+}
+
+// SetEventPublisher sets the event publisher for health check events.
+func (c *Checker) SetEventPublisher(pub any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.eventPublisher = pub
 }
 
 // Check runs all health checks and returns the overall result.
@@ -114,6 +134,21 @@ func (c *Checker) Check(ctx context.Context) *Result {
 		c.logger.Info("health_recovered", "status", "healthy")
 	} else if wasHealthy && !result.Healthy {
 		c.logger.Error("health_failed", "status", "unhealthy")
+	}
+
+	// Publish health check event if publisher is set
+	if c.eventPublisher != nil {
+		checks := make([]HealthCheck, len(result.Checks))
+		for i, check := range result.Checks {
+			checks[i] = HealthCheck{
+				Name:    check.Name,
+				Healthy: check.Healthy,
+				Message: check.Message,
+			}
+		}
+		if pub, ok := c.eventPublisher.(publisher); ok {
+			pub.PublishHealthCheck(result.Healthy, checks)
+		}
 	}
 
 	return result
@@ -294,6 +329,11 @@ func (c *Checker) LogWarn(msg string, args ...any) {
 // LogInfo logs info at INFO level.
 func (c *Checker) LogInfo(msg string, args ...any) {
 	c.logger.Info(msg, args...)
+}
+
+// LogDebug logs debug messages at DEBUG level.
+func (c *Checker) LogDebug(msg string, args ...any) {
+	c.logger.Debug(msg, args...)
 }
 
 // Server serves the HTTP health endpoint.

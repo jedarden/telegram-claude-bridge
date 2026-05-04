@@ -72,6 +72,12 @@ type BridgeConfig struct {
 	// This user is automatically granted admin access on startup if not already in the database.
 	// Set to 0 to disable auto-admin bootstrapping.
 	AdminUserID int64
+
+	// EventPublishingEnabled enables event publishing to the Unix socket for the dashboard.
+	EventPublishingEnabled bool
+
+	// EventSocketPath is the path to the Unix socket for event publishing.
+	EventSocketPath string
 }
 
 // LoadProxyConfig reads ProxyConfig from environment variables.
@@ -196,6 +202,20 @@ func LoadBridgeConfig() (*BridgeConfig, error) {
 		}
 		cfg.AdminUserID = n
 	}
+
+	// Event publishing configuration
+	if v := os.Getenv("EVENT_PUBLISHING_ENABLED"); v != "" {
+		switch v {
+		case "1", "true", "yes", "on":
+			cfg.EventPublishingEnabled = true
+		case "0", "false", "no", "off":
+			cfg.EventPublishingEnabled = false
+		default:
+			return nil, fmt.Errorf("EVENT_PUBLISHING_ENABLED must be a boolean value (0/1, true/false, yes/no, on/off), got %q", v)
+		}
+	}
+
+	cfg.EventSocketPath = envOrDefault("EVENT_SOCKET_PATH", "/tmp/telegram-bridge-events.sock")
 
 	return cfg, nil
 }

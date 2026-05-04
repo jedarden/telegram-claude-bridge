@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
+	"github.com/jedarden/telegram-claude-bridge/internal/events"
 )
 
 // Rate limiter configuration
@@ -109,8 +110,9 @@ type CallbackHandlerFunc func(ctx context.Context, update contract.Update)
 // It is the security boundary: updates from unauthorized users are dropped here
 // before reaching any handler.
 type Router struct {
-	db         *DB
-	rateLimiter *rateLimiter
+	db             *DB
+	rateLimiter    *rateLimiter
+	eventPublisher events.Publishable
 
 	// OnCommand is called for bot commands in the General topic.
 	OnCommand CommandHandlerFunc
@@ -126,10 +128,12 @@ type Router struct {
 }
 
 // NewRouter returns a Router backed by db.
-func NewRouter(db *DB) *Router {
+// eventPublisher may be nil if event publishing is disabled.
+func NewRouter(db *DB, eventPublisher events.Publishable) *Router {
 	return &Router{
-		db:          db,
-		rateLimiter: newRateLimiter(),
+		db:             db,
+		rateLimiter:    newRateLimiter(),
+		eventPublisher: eventPublisher,
 	}
 }
 
@@ -196,6 +200,11 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 				log.Printf("[router] get group for chat %d: %v", update.ChatID, err)
 				return
 			}
+			// Publish command event
+			if r.eventPublisher != nil {
+				command, _ := update.Content.ExtractCommandAndArgs()
+				r.eventPublisher.PublishCommandExecuted(update.ChatID, command, update.FromUser.ID, true)
+			}
 			r.OnCommand(ctx, update, group)
 		}
 		// Non-command messages in General topic are silently ignored.
@@ -204,6 +213,12 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 
 	// ── 6. Named topic ───────────────────────────────────────────────────────────
 	tid := *update.ThreadID
+
+	// Publish message received event
+	if r.eventPublisher != nil && update.Content != nil {
+		contentType := update.Content.Type
+		r.eventPublisher.PublishMessageReceived(update.ChatID, tid, update.MessageID, contentType, update.FromUser.ID)
+	}
 
 	session, err := r.db.GetSession(ctx, update.ChatID, tid)
 	if err != nil {

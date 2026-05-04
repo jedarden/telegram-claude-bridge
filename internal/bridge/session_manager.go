@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
+	"github.com/jedarden/telegram-claude-bridge/internal/events"
 )
 
 const (
@@ -395,10 +396,11 @@ type toolApproval struct {
 // subprocess invocations. Messages that arrive during processing are
 // queued (up to 32) and batched into the next prompt.
 type SessionManager struct {
-	db         *DB
-	sender     *Sender
-	proxyURL   string
-	workerPool *WorkerPool
+	db             *DB
+	sender         *Sender
+	proxyURL       string
+	workerPool     *WorkerPool
+	eventPublisher events.Publishable
 
 	mu                    sync.Mutex
 	topics                map[topicKey]*topicWorker
@@ -446,6 +448,31 @@ type msgExtra struct {
 	docPath       string   // local path for document attachments (ContentTypeDocument)
 	docMsg        string   // unsupported file type warning message
 	cleanupPaths  []string // all temp files to remove after prompt is sent
+}
+
+// sessionToMap converts a Session to a map for event publishing.
+func sessionToMap(sess *Session) map[string]interface{} {
+	if sess == nil {
+		return nil
+	}
+	return map[string]interface{}{
+		"chat_id":           sess.ChatID,
+		"thread_id":         sess.ThreadID,
+		"session_id":        sess.SessionID,
+		"cwd":               sess.CWD,
+		"model":             sess.Model,
+		"status":            sess.Status,
+		"icon_color":        sess.IconColor,
+		"created_at":        sess.CreatedAt.Format(time.RFC3339),
+		"last_active":       sess.LastActive.Format(time.RFC3339),
+		"message_count":     sess.MessageCount,
+		"pinned_message_id": sess.PinnedMessageID,
+		"total_cost_usd":    sess.TotalCostUSD,
+		"summary":           sess.Summary,
+		"notification_mode": sess.NotificationMode,
+		"timeout_sec":       sess.TimeoutSec,
+		"dispatcher_mode":   sess.DispatcherMode,
+	}
 }
 
 // claudeOutput holds the results of a Claude CLI invocation.
@@ -560,11 +587,13 @@ type toolResultDelta struct {
 
 // NewSessionManager creates a SessionManager backed by db, sender, and proxyURL.
 // proxyURL is the base URL of the proxy, used to download photo attachments.
-func NewSessionManager(db *DB, sender *Sender, proxyURL string) *SessionManager {
+// eventPublisher may be nil if event publishing is disabled.
+func NewSessionManager(db *DB, sender *Sender, proxyURL string, eventPublisher events.Publishable) *SessionManager {
 	m := &SessionManager{
 		db:                   db,
 		sender:               sender,
 		proxyURL:             proxyURL,
+		eventPublisher:       eventPublisher,
 		topics:               make(map[topicKey]*topicWorker),
 		pinnedUpdateLastSeen: make(map[topicKey]time.Time),
 		pendingContext:       make(map[topicKey]string),
@@ -1085,6 +1114,11 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 				log.Printf("[session_mgr] close session (%d,%d): %v", key.chatID, key.threadID, err)
 				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Error closing session.")
 				return
+			}
+
+			// Publish session closed event
+			if m.eventPublisher != nil {
+				m.eventPublisher.PublishSessionClosed(key.chatID, key.threadID, session.SessionID)
 			}
 
 			// Update topic color to green (complete)
@@ -1924,6 +1958,11 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 			return err
 		}
 
+		// Publish session created event
+		if m.eventPublisher != nil {
+			m.eventPublisher.PublishSessionCreated(sessionToMap(sess))
+		}
+
 		// Record detailed cost event for the first invocation
 		costEvent := &CostEvent{
 			ChatID:    key.chatID,
@@ -1943,6 +1982,11 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 			// Non-fatal: continue anyway
 		}
 
+		// Publish cost recorded event
+		if m.eventPublisher != nil && out.TotalCostUSD > 0 {
+			m.eventPublisher.PublishCostRecorded(key.chatID, key.threadID, out.TotalCostUSD, resolveSessionModel(nil, group))
+		}
+
 		// Send and pin the initial metadata message
 		pinnedMsgID, err := m.createAndPinMetadata(ctx, sess, group)
 		if err != nil {
@@ -1953,7 +1997,15 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 
 		// Store the pinned message ID in the session
 		sess.PinnedMessageID = pinnedMsgID
-		return m.db.UpdateSession(ctx, sess)
+		if err := m.db.UpdateSession(ctx, sess); err != nil {
+			return err
+		}
+
+		// Publish session updated event
+		if m.eventPublisher != nil {
+			m.eventPublisher.PublishSessionUpdated(sessionToMap(sess))
+		}
+		return nil
 	}
 
 	// Existing session: update the record
@@ -1963,6 +2015,11 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 	existing.TotalCostUSD += out.TotalCostUSD
 	if err := m.db.UpdateSession(ctx, existing); err != nil {
 		return err
+	}
+
+	// Publish session updated event
+	if m.eventPublisher != nil {
+		m.eventPublisher.PublishSessionUpdated(sessionToMap(existing))
 	}
 
 	// Record detailed cost event
@@ -1982,6 +2039,11 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 	if err := m.db.RecordCostEvent(ctx, costEvent); err != nil {
 		log.Printf("[session_mgr] record cost event (%d,%d): %v", key.chatID, key.threadID, err)
 		// Non-fatal: continue anyway
+	}
+
+	// Publish cost recorded event
+	if m.eventPublisher != nil && out.TotalCostUSD > 0 {
+		m.eventPublisher.PublishCostRecorded(key.chatID, key.threadID, out.TotalCostUSD, resolveSessionModel(existing, group))
 	}
 
 	return nil
