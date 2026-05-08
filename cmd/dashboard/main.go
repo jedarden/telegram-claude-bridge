@@ -25,6 +25,8 @@ const (
 	// Maximum number of log entries to keep
 	maxLogEntries = 100
 	maxCmdEntries = 50
+	// Maximum number of cost entries to keep (24 hours * 60 minutes = 1440, round to 2000)
+	maxCostEntries = 2000
 )
 
 // Event represents a single event from the NDJSON stream.
@@ -46,6 +48,15 @@ type CommandEntry struct {
 	Command string
 	UserID  int64
 	Success bool
+}
+
+// CostEntry represents a single cost event with timestamp.
+type CostEntry struct {
+	Time     time.Time
+	ChatID   int64
+	ThreadID int64
+	CostUSD  float64
+	Model    string
 }
 
 // SessionInfo represents a session's current state.
@@ -83,6 +94,7 @@ type State struct {
 	health            HealthStatus
 	messageLog        []LogEntry
 	commandLog        []CommandEntry
+	costLog           []CostEntry
 	totalCostUSD      float64
 	activeMessageCount int
 	lastUpdate        time.Time
@@ -94,6 +106,7 @@ func NewState() *State {
 		sessions:   make(map[string]*SessionInfo),
 		messageLog: make([]LogEntry, 0, maxLogEntries),
 		commandLog: make([]CommandEntry, 0, maxCmdEntries),
+		costLog:    make([]CostEntry, 0, maxCostEntries),
 		health: HealthStatus{
 			Checks: []HealthCheck{
 				{Name: "proxy", Healthy: false, Message: "unknown"},
@@ -251,6 +264,54 @@ func (s *State) DecrementActiveMessageCount() {
 		s.activeMessageCount--
 	}
 	s.lastUpdate = time.Now()
+}
+
+// AddCostEntry adds a cost entry with timestamp.
+func (s *State) AddCostEntry(chatID, threadID int64, costUSD float64, model string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := CostEntry{
+		Time:     time.Now(),
+		ChatID:   chatID,
+		ThreadID: threadID,
+		CostUSD:  costUSD,
+		Model:    model,
+	}
+	s.costLog = append(s.costLog, entry)
+	if len(s.costLog) > maxCostEntries {
+		s.costLog = s.costLog[1:]
+	}
+	s.lastUpdate = time.Now()
+}
+
+// GetCostToday returns the total cost for today (UTC).
+func (s *State) GetCostToday() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now().UTC()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	total := 0.0
+	for _, entry := range s.costLog {
+		if entry.Time.UTC().After(todayStart) || entry.Time.UTC().Equal(todayStart) {
+			total += entry.CostUSD
+		}
+	}
+	return total
+}
+
+// GetCostThisHour returns the total cost for the current hour (UTC).
+func (s *State) GetCostThisHour() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now().UTC()
+	hourStart := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, time.UTC)
+	total := 0.0
+	for _, entry := range s.costLog {
+		if entry.Time.UTC().After(hourStart) || entry.Time.UTC().Equal(hourStart) {
+			total += entry.CostUSD
+		}
+	}
+	return total
 }
 
 // tickMsg is sent periodically to update the UI.
@@ -448,6 +509,7 @@ func (m *model) handleEvent(event Event) {
 		if m, ok := event.Data["model"].(string); ok {
 			model = m
 		}
+		m.state.AddCostEntry(chatID, threadID, costUSD, model)
 		m.state.AddLogEntry(fmt.Sprintf("COST ch=%d th=%d $%.4f %s", chatID, threadID, costUSD, model))
 	case "health_check":
 		healthy := false
@@ -621,8 +683,13 @@ func (m model) View() string {
 
 	// Cost Tracker Panel
 	totalCost := m.state.GetTotalCost()
+	costToday := m.state.GetCostToday()
+	costThisHour := m.state.GetCostThisHour()
+	activeCount := len(sessions)
+
 	costPanel := headerStyle.Render("Cost Tracker") + "\n"
-	costPanel += fmt.Sprintf("Total Cost: $%.4f\n", totalCost)
+	costPanel += fmt.Sprintf("Today: $%.4f  │  This Hour: $%.4f  │  Active: %d\n", costToday, costThisHour, activeCount)
+	costPanel += dimStyle.Render(fmt.Sprintf("Total: $%.4f\n", totalCost))
 	if len(sessions) > 0 {
 		costPanel += dimStyle.Render("Top sessions by cost:\n")
 		// Sort sessions by cost
@@ -635,7 +702,7 @@ func (m model) View() string {
 				}
 			}
 		}
-		for i := 0; i < len(sortedSessions) && i < 5; i++ {
+		for i := 0; i < len(sortedSessions) && i < 3; i++ {
 			sess := sortedSessions[i]
 			costPanel += fmt.Sprintf("  ch=%d th=%d: $%.4f\n", sess.ChatID, sess.ThreadID, sess.TotalCostUSD)
 		}
