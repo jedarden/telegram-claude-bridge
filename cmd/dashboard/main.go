@@ -27,6 +27,8 @@ const (
 	maxCmdEntries = 50
 	// Maximum number of cost entries to keep (24 hours * 60 minutes = 1440, round to 2000)
 	maxCostEntries = 2000
+	// Maximum number of messages in flight to keep
+	maxMessagesInFlight = 100
 )
 
 // Event represents a single event from the NDJSON stream.
@@ -46,6 +48,19 @@ type CommandEntry struct {
 	Command string
 	UserID  int64
 	Success bool
+}
+
+// MessageInFlight represents a single message in the ring buffer.
+type MessageInFlight struct {
+	Time        string
+	Direction   string // "in" for inbound (→), "out" for outbound (←)
+	Topic       string
+	User        string // For inbound messages
+	Preview     string // Message preview (truncated)
+	Status      string // For outbound: "streaming" or "complete"
+	Tokens      int    // For outbound messages
+	CostUSD     float64 // For outbound complete messages
+	ElapsedMs   int64  // For outbound messages
 }
 
 // CostEntry represents a single cost event with timestamp.
@@ -97,6 +112,7 @@ type State struct {
 	messageLog        []LogEntry
 	commandLog        []CommandEntry
 	costLog           []CostEntry
+	messagesInFlight  []MessageInFlight
 	totalCostUSD      float64
 	activeMessageCount int
 	lastUpdate        time.Time
@@ -105,10 +121,11 @@ type State struct {
 // NewState creates a new application state.
 func NewState() *State {
 	return &State{
-		sessions:   make(map[string]*SessionInfo),
-		messageLog: make([]LogEntry, 0, maxLogEntries),
-		commandLog: make([]CommandEntry, 0, maxCmdEntries),
-		costLog:    make([]CostEntry, 0, maxCostEntries),
+		sessions:         make(map[string]*SessionInfo),
+		messageLog:       make([]LogEntry, 0, maxLogEntries),
+		commandLog:       make([]CommandEntry, 0, maxCmdEntries),
+		costLog:          make([]CostEntry, 0, maxCostEntries),
+		messagesInFlight: make([]MessageInFlight, 0, maxMessagesInFlight),
 		health: HealthStatus{
 			Checks: []HealthCheck{
 				{Name: "proxy", Healthy: false, Message: "unknown"},
@@ -341,6 +358,53 @@ func (s *State) GetCostThisHour() float64 {
 	return total
 }
 
+// AddMessageInFlight adds an inbound message to the ring buffer.
+func (s *State) AddMessageInFlight(topic, user, preview string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := MessageInFlight{
+		Time:      time.Now().Format("15:04:05"),
+		Direction: "in",
+		Topic:     topic,
+		User:      user,
+		Preview:   preview,
+	}
+	s.messagesInFlight = append(s.messagesInFlight, entry)
+	if len(s.messagesInFlight) > maxMessagesInFlight {
+		s.messagesInFlight = s.messagesInFlight[1:]
+	}
+	s.lastUpdate = time.Now()
+}
+
+// AddMessageOutFlight adds an outbound message to the ring buffer.
+func (s *State) AddMessageOutFlight(topic, status string, tokens int, costUSD float64, elapsedMs int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := MessageInFlight{
+		Time:      time.Now().Format("15:04:05"),
+		Direction: "out",
+		Topic:     topic,
+		Status:    status,
+		Tokens:    tokens,
+		CostUSD:   costUSD,
+		ElapsedMs: elapsedMs,
+	}
+	s.messagesInFlight = append(s.messagesInFlight, entry)
+	if len(s.messagesInFlight) > maxMessagesInFlight {
+		s.messagesInFlight = s.messagesInFlight[1:]
+	}
+	s.lastUpdate = time.Now()
+}
+
+// GetMessagesInFlight returns a copy of the messages in flight.
+func (s *State) GetMessagesInFlight() []MessageInFlight {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	msgs := make([]MessageInFlight, len(s.messagesInFlight))
+	copy(msgs, s.messagesInFlight)
+	return msgs
+}
+
 // tickMsg is sent periodically to update the UI.
 type tickMsg time.Time
 
@@ -506,6 +570,7 @@ func (m *model) handleEvent(event Event) {
 		user := getString(event, "user")
 		preview := getString(event, "preview")
 		m.state.AddLogEntry(fmt.Sprintf("MSG IN %s %s: %s", topic, user, preview))
+		m.state.AddMessageInFlight(topic, user, preview)
 		m.state.IncrementActiveMessageCount()
 
 	case "message_out":
@@ -515,12 +580,15 @@ func (m *model) handleEvent(event Event) {
 		status := getString(event, "status")
 		tokens := int(getFloat64(event, "tokens"))
 		costUSD := getFloat64(event, "cost_usd")
+		elapsedMs := getInt64(event, "elapsed_ms")
 
 		if status == "streaming" {
 			m.state.AddLogEntry(fmt.Sprintf("MSG OUT %s streaming %d tokens", topic, tokens))
+			m.state.AddMessageOutFlight(topic, status, tokens, 0, elapsedMs)
 		} else if status == "complete" {
 			m.state.AddCostEntry(chatID, threadID, costUSD, "")
 			m.state.AddLogEntry(fmt.Sprintf("MSG OUT %s done %d tokens $%.4f", topic, tokens, costUSD))
+			m.state.AddMessageOutFlight(topic, status, tokens, costUSD, elapsedMs)
 			m.state.DecrementActiveMessageCount()
 		}
 
@@ -682,13 +750,41 @@ func (m model) View() string {
 	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("241"))    // Grey
 	statusStyle := lipgloss.NewStyle().Bold(true)                       // Bold for status
 
-	// Calculate layout
+	// Calculate layout for 3-row design:
+	// - Top row: Active Sessions (left) + System Health (right)
+	// - Middle row: Messages In Flight (full width)
+	// - Bottom row: Command Log (left) + Cost Tracker (right)
+
+	// Reserve space for header and gaps
+	availableHeight := m.height - 3 // 2 for header lines, 1 for bottom margin
+	if availableHeight < 10 {
+		availableHeight = 10
+	}
+
+	// Split height: ~30% top, ~50% middle, ~20% bottom
+	topRowHeight := availableHeight * 3 / 10
+	if topRowHeight < 6 {
+		topRowHeight = 6
+	}
+	middleRowHeight := availableHeight * 5 / 10
+	if middleRowHeight < 8 {
+		middleRowHeight = 8
+	}
+	bottomRowHeight := availableHeight - topRowHeight - middleRowHeight
+	if bottomRowHeight < 6 {
+		bottomRowHeight = 6
+	}
+
+	// Width calculations for columns
 	leftWidth := m.width / 2
 	rightWidth := m.width - leftWidth - 4 // 4 for borders/gaps
 
-	sessionHeight := m.height / 2
-	healthHeight := 6
-	logHeight := m.height - sessionHeight - healthHeight - 4 // 4 for headers/gaps
+	// Panel heights for layout (account for header lines)
+	sessionHeight := topRowHeight
+	healthHeight := topRowHeight
+	messagesHeight := middleRowHeight
+	cmdLogHeight := bottomRowHeight
+	costHeight := bottomRowHeight
 
 	// Header
 	header := titleStyle.Render("Telegram Claude Bridge Dashboard")
@@ -709,7 +805,7 @@ func (m model) View() string {
 		sessionsPanel += dimStyle.Render("No active sessions")
 	} else {
 		for i, sess := range sessions {
-			if i >= sessionHeight-2 {
+			if i >= topRowHeight-2 {
 				break
 			}
 			// Color-coded status: green=idle, blue=processing, yellow=streaming, red=error
@@ -740,8 +836,8 @@ func (m model) View() string {
 			)
 			sessionsPanel += statusColor.Render(line) + "\n"
 		}
-		if len(sessions) > sessionHeight-2 {
-			sessionsPanel += dimStyle.Render(fmt.Sprintf("... and %d more", len(sessions)-(sessionHeight-2)))
+		if len(sessions) > topRowHeight-2 {
+			sessionsPanel += dimStyle.Render(fmt.Sprintf("... and %d more", len(sessions)-(topRowHeight-2)))
 		}
 	}
 
@@ -811,20 +907,42 @@ func (m model) View() string {
 	)
 
 	// Messages In Flight Panel
-	logEntries := m.state.GetMessageLog()
+	messagesInFlight := m.state.GetMessagesInFlight()
 	logPanel := headerStyle.Render(fmt.Sprintf("Messages In Flight (%d active)", m.state.GetActiveMessageCount())) + "\n"
-	startIdx := len(logEntries) - logHeight + 1
+	startIdx := len(messagesInFlight) - middleRowHeight + 1
 	if startIdx < 0 {
 		startIdx = 0
 	}
-	for i := startIdx; i < len(logEntries); i++ {
-		logPanel += dimStyle.Render(logEntries[i].Time+" ") + logEntries[i].Msg + "\n"
+	for i := startIdx; i < len(messagesInFlight); i++ {
+		msg := messagesInFlight[i]
+		if msg.Direction == "in" {
+			// Inbound message: → topic @user: preview
+			previewWidth := m.width - 40 // Reserve space for time, direction, topic, user
+			if previewWidth < 20 {
+				previewWidth = 20
+			}
+			logPanel += dimStyle.Render(msg.Time+" → ") +
+				infoStyle.Render(truncateString(msg.Topic, 12)) + " " +
+				dimStyle.Render(msg.User+" ") +
+				truncateString(msg.Preview, previewWidth) + "\n"
+		} else {
+			// Outbound message: ← topic [status] tokens cost elapsed
+			if msg.Status == "streaming" {
+				logPanel += dimStyle.Render(msg.Time+" ← ") +
+					warningStyle.Render(truncateString(msg.Topic, 12)) + " " +
+					dimStyle.Render(fmt.Sprintf("[%s] %d tokens %dms", msg.Status, msg.Tokens, msg.ElapsedMs)) + "\n"
+			} else {
+				logPanel += dimStyle.Render(msg.Time+" ← ") +
+					successStyle.Render(truncateString(msg.Topic, 12)) + " " +
+					dimStyle.Render(fmt.Sprintf("[%s] %d tokens $%.4f %dms", msg.Status, msg.Tokens, msg.CostUSD, msg.ElapsedMs)) + "\n"
+			}
+		}
 	}
 
 	// Command Log Panel
 	cmdEntries := m.state.GetCommandLog()
 	cmdPanel := headerStyle.Render("Command Log") + "\n"
-	cmdStartIdx := len(cmdEntries) - logHeight + 1
+	cmdStartIdx := len(cmdEntries) - cmdLogHeight + 1
 	if cmdStartIdx < 0 {
 		cmdStartIdx = 0
 	}
@@ -866,19 +984,29 @@ func (m model) View() string {
 		}
 	}
 
-	// Layout
-	// Health panel is now in top-right (task 6.4)
-	leftColumn := lipgloss.JoinVertical(lipgloss.Left,
+	// Layout: 3-row design
+	// - Top row: Active Sessions (left) + System Health (right)
+	// - Middle row: Messages In Flight (full width)
+	// - Bottom row: Command Log (left) + Cost Tracker (right)
+
+	// Top row: Active Sessions + System Health
+	topRow := lipgloss.JoinHorizontal(lipgloss.Top,
 		panelStyle.Width(leftWidth).Height(sessionHeight).Render(sessionsPanel),
-		panelStyle.Width(leftWidth).Height(logHeight).Render(logPanel),
-	)
-	rightColumn := lipgloss.JoinVertical(lipgloss.Left,
 		panelStyle.Width(rightWidth).Height(healthHeight).Render(healthPanel),
-		panelStyle.Width(rightWidth).Height(logHeight).Render(cmdPanel),
-		panelStyle.Width(rightWidth).Height(6).Render(costPanel),
 	)
 
-	mainContent := lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, rightColumn)
+	// Middle row: Messages In Flight (full width, minus borders)
+	messagesPanelWidth := m.width - 4 // Account for panel borders
+	middleRow := panelStyle.Width(messagesPanelWidth).Height(messagesHeight).Render(logPanel)
+
+	// Bottom row: Command Log + Cost Tracker
+	bottomRow := lipgloss.JoinHorizontal(lipgloss.Top,
+		panelStyle.Width(leftWidth).Height(cmdLogHeight).Render(cmdPanel),
+		panelStyle.Width(rightWidth).Height(costHeight).Render(costPanel),
+	)
+
+	// Join rows vertically
+	mainContent := lipgloss.JoinVertical(lipgloss.Left, topRow, middleRow, bottomRow)
 
 	return header + "\n" + mainContent
 }
