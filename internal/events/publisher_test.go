@@ -230,7 +230,7 @@ func TestPublishMethodVerifiesFlatStructure(t *testing.T) {
 		{
 			name: "PublishHealth",
 			fn: func() {
-				pub.PublishHealth(true, true, 210, 6)
+				pub.PublishHealth(true, true, 210, 6, false, nil, 0)
 			},
 			checkType: EventHealth,
 			checkKeys:  []string{"proxy_ok", "proxy_latency_ms", "db_ok", "db_latency_ms"},
