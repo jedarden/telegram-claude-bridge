@@ -46,7 +46,8 @@ type LogEntry struct {
 type CommandEntry struct {
 	Time    string
 	Command string
-	UserID  int64
+	Topic   string
+	User    string
 	Success bool
 }
 
@@ -156,13 +157,14 @@ func (s *State) AddLogEntry(msg string) {
 }
 
 // AddCommandEntry adds a command entry, respecting the max limit.
-func (s *State) AddCommandEntry(cmd string, userID int64, success bool) {
+func (s *State) AddCommandEntry(cmd, topic, user string, success bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry := CommandEntry{
 		Time:    time.Now().Format("15:04:05"),
 		Command: cmd,
-		UserID:  userID,
+		Topic:   topic,
+		User:    user,
 		Success: success,
 	}
 	s.commandLog = append(s.commandLog, entry)
@@ -598,7 +600,7 @@ func (m *model) handleEvent(event Event) {
 		topic := getString(event, "topic")
 		user := getString(event, "user")
 		result := getString(event, "result")
-		m.state.AddCommandEntry(command+" "+args, 0, result == "ok")
+		m.state.AddCommandEntry(command+" "+args, topic, user, result == "ok")
 		m.state.AddLogEntry(fmt.Sprintf("CMD %s %s %s %s → %s", topic, user, command, args, result))
 
 	case "session_update":
@@ -677,7 +679,7 @@ func (m *model) handleEvent(event Event) {
 		command := getString(event, "command")
 		userID := getInt64(event, "user_id")
 		success := getBool(event, "success")
-		m.state.AddCommandEntry(command, userID, success)
+		m.state.AddCommandEntry(command, "", "", success)
 		m.state.AddLogEntry(fmt.Sprintf("CMD ch=%d %s uid=%d ok=%t", chatID, command, userID, success))
 
 	case "cost_recorded":
@@ -952,9 +954,19 @@ func (m model) View() string {
 		if !cmd.Success {
 			cmdStyle = errorStyle
 		}
+		// Format: time [topic] user: command
+		topicStr := ""
+		if cmd.Topic != "" {
+			topicStr = infoStyle.Render("[" + truncateString(cmd.Topic, 10) + "] ") + dimStyle.Render(" ")
+		}
+		userStr := ""
+		if cmd.User != "" {
+			userStr = truncateString(cmd.User, 12) + dimStyle.Render(": ")
+		}
 		cmdPanel += dimStyle.Render(cmd.Time+" ") +
-			cmdStyle.Render(truncateString(cmd.Command, 30)) +
-			dimStyle.Render(fmt.Sprintf(" uid=%d", cmd.UserID)) + "\n"
+			topicStr +
+			userStr +
+			cmdStyle.Render(truncateString(cmd.Command, 25)) + "\n"
 	}
 
 	// Cost Tracker Panel
@@ -967,7 +979,7 @@ func (m model) View() string {
 	costPanel += fmt.Sprintf("Today: $%.4f  │  This Hour: $%.4f  │  Active: %d\n", costToday, costThisHour, activeCount)
 	costPanel += dimStyle.Render(fmt.Sprintf("Total: $%.4f\n", totalCost))
 	if len(sessions) > 0 {
-		costPanel += dimStyle.Render("Top sessions by cost:\n")
+		costPanel += dimStyle.Render("Sessions by cost:\n")
 		// Sort sessions by cost
 		sortedSessions := make([]*SessionInfo, len(sessions))
 		copy(sortedSessions, sessions)
@@ -978,9 +990,27 @@ func (m model) View() string {
 				}
 			}
 		}
-		for i := 0; i < len(sortedSessions) && i < 3; i++ {
+		// Show up to 6 sessions with details
+		maxSessions := 6
+		if len(sortedSessions) < maxSessions {
+			maxSessions = len(sortedSessions)
+		}
+		for i := 0; i < maxSessions; i++ {
 			sess := sortedSessions[i]
-			costPanel += fmt.Sprintf("  ch=%d th=%d: $%.4f\n", sess.ChatID, sess.ThreadID, sess.TotalCostUSD)
+			// Display topic name, or chat_id/thread_id if no topic
+			topicDisplay := sess.Topic
+			if topicDisplay == "" {
+				topicDisplay = fmt.Sprintf("ch=%d", sess.ChatID)
+			}
+			costPanel += fmt.Sprintf("  %s: $%.4f (%s) %d msg\n",
+				truncateString(topicDisplay, 12),
+				sess.TotalCostUSD,
+				truncateString(sess.Model, 8),
+				sess.MessageCount,
+			)
+		}
+		if len(sortedSessions) > maxSessions {
+			costPanel += dimStyle.Render(fmt.Sprintf("  ... and %d more\n", len(sortedSessions)-maxSessions))
 		}
 	}
 
