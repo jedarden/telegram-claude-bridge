@@ -63,6 +63,7 @@ type HealthCheck struct {
 // publisher is the minimal interface needed for event publishing.
 type publisher interface {
 	PublishHealthCheck(healthy bool, checks []HealthCheck)
+	PublishHealth(proxyOK, dbOK bool, proxyLatencyMs, dbLatencyMs int64)
 }
 
 // NewChecker creates a new health checker.
@@ -147,7 +148,35 @@ func (c *Checker) Check(ctx context.Context) *Result {
 			}
 		}
 		if pub, ok := c.eventPublisher.(publisher); ok {
+			// Legacy event format
 			pub.PublishHealthCheck(result.Healthy, checks)
+
+			// Phase 6 event format: extract proxy and DB latency
+			var proxyOK, dbOK bool
+			var proxyLatencyMs, dbLatencyMs int64
+
+			for _, check := range result.Checks {
+				if check.Name == "proxy" {
+					proxyOK = check.Healthy
+					if check.Healthy && check.Message != "" {
+						// Parse latency from message (e.g., "12ms" or "1.2s")
+						if d, err := time.ParseDuration(check.Message); err == nil {
+							proxyLatencyMs = d.Milliseconds()
+						}
+					}
+				}
+				if check.Name == "database" {
+					dbOK = check.Healthy
+					if check.Healthy && check.Message != "" {
+						// Parse latency from message (e.g., "12ms" or "1.2s")
+						if d, err := time.ParseDuration(check.Message); err == nil {
+							dbLatencyMs = d.Milliseconds()
+						}
+					}
+				}
+			}
+
+			pub.PublishHealth(proxyOK, dbOK, proxyLatencyMs, dbLatencyMs)
 		}
 	}
 

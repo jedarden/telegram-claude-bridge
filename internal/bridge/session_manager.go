@@ -1295,6 +1295,9 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		}
 	}
 
+	// Track start time for Phase 6 event publishing
+	startTime := time.Now()
+
 	// Resolve timeout: session override -> group timeout -> default
 	timeoutSec := defaultSessionTimeout
 	if session != nil && session.TimeoutSec > noTimeout {
@@ -1364,6 +1367,17 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	// by invokeClaudeAPI, so we send it. In other modes, send the full result.
 	if err := m.sender.SendStreamFinal(ctx, key.chatID, tidPtr, origMsgID, out.StreamMsgID, out.PlaceholderID, text); err != nil {
 		log.Printf("[session_mgr] send response (%d,%d): %v", key.chatID, key.threadID, err)
+	}
+
+	// Publish Phase 6 message_out complete event
+	if m.eventPublisher != nil {
+		elapsedMs := time.Since(startTime).Milliseconds()
+		topic := events.FormatTopicID(key.threadID)
+		totalTokens := 0
+		if out.Usage != nil {
+			totalTokens = out.Usage.InputTokens + out.Usage.OutputTokens
+		}
+		m.eventPublisher.PublishMessageOutComplete(key.chatID, key.threadID, topic, totalTokens, out.TotalCostUSD, elapsedMs)
 	}
 
 	// Send any generated audio files
@@ -1762,6 +1776,13 @@ func (m *SessionManager) invokeClaudeAPI(
 				}
 			}
 		}
+		// Publish Phase 6 streaming event
+		if m.eventPublisher != nil {
+			elapsedMs := time.Since(startTime).Milliseconds()
+			topic := events.FormatTopicID(*threadID)
+			// Use 0 for tokens during streaming - we don't have intermediate counts
+			m.eventPublisher.PublishMessageOutStreaming(chatID, *threadID, topic, 0, elapsedMs)
+		}
 		lastEdit = time.Now()
 		lastSent = time.Now() // Reset progress ticker on every successful Telegram edit
 		return true
@@ -2066,6 +2087,13 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 		// Publish session updated event
 		if m.eventPublisher != nil {
 			m.eventPublisher.PublishSessionUpdated(sessionToMap(sess))
+		}
+
+		// Publish Phase 6 session_update event
+		if m.eventPublisher != nil {
+			topic := events.FormatTopicID(sess.ThreadID)
+			model := resolveSessionModel(sess, group)
+			m.eventPublisher.PublishSessionUpdate(sess.ChatID, sess.ThreadID, topic, sess.Status, model)
 		}
 		return nil
 	}

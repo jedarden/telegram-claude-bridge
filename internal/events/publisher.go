@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,34 +24,107 @@ const (
 type EventType string
 
 const (
-	// Session lifecycle events
-	EventSessionCreated EventType = "session_created"
-	EventSessionUpdated EventType = "session_updated"
-	EventSessionClosed  EventType = "session_closed"
+	// Phase 6 Event Stream Specification
+	// These event types match the TUI dashboard specification in docs/plan/plan.md
 
-	// Message flow events
+	EventMessageIn  EventType = "message_in"  // Incoming message from Telegram
+	EventMessageOut EventType = "message_out" // Outgoing response to Telegram
+	EventCommand    EventType = "command"     // Command execution
+	EventSessionUpdate EventType = "session_update" // Session status update
+	EventHealth     EventType = "health"      // Health check status
+
+	// Legacy events for backward compatibility
+	EventSessionCreated  EventType = "session_created"
+	EventSessionUpdated  EventType = "session_updated"
+	EventSessionClosed   EventType = "session_closed"
 	EventMessageReceived EventType = "message_received"
 	EventMessageSent     EventType = "message_sent"
-
-	// Command events
 	EventCommandExecuted EventType = "command_executed"
-
-	// Cost tracking events
-	EventCostRecorded EventType = "cost_recorded"
-
-	// Health status events
-	EventHealthCheck EventType = "health_check"
-
-	// System events
-	EventSystemError EventType = "system_error"
-	EventSystemInfo  EventType = "system_info"
+	EventCostRecorded    EventType = "cost_recorded"
+	EventHealthCheck     EventType = "health_check"
+	EventSystemError     EventType = "system_error"
+	EventSystemInfo      EventType = "system_info"
 )
 
+// ============================================================================
+// Helper functions for formatting event data
+// ============================================================================
+
+// FormatTopicID returns a topic identifier for events.
+// If threadID is 1 (General topic), returns "General".
+// Otherwise returns "#" followed by the thread ID.
+func FormatTopicID(threadID int64) string {
+	if threadID == 1 {
+		return "General"
+	}
+	return fmt.Sprintf("#%d", threadID)
+}
+
+// FormatTopicName returns a formatted topic name.
+// If name is provided, returns "#" + name.
+// Otherwise returns FormatTopicID(threadID).
+func FormatTopicName(name string, threadID int64) string {
+	if name != "" {
+		if name[0] == '#' {
+			return name
+		}
+		return "#" + name
+	}
+	return FormatTopicID(threadID)
+}
+
+// FormatUsername returns a formatted username for events.
+// If username is provided, returns "@username".
+// Otherwise returns the first name.
+func FormatUsername(username, firstName string) string {
+	if username != "" {
+		if username[0] == '@' {
+			return username
+		}
+		return "@" + username
+	}
+	if firstName != "" {
+		return firstName
+	}
+	return "unknown"
+}
+
+// TruncatePreview truncates a text preview to a maximum length.
+func TruncatePreview(text string, maxLen int) string {
+	if len(text) <= maxLen {
+		return text
+	}
+	// Truncate at a word boundary if possible
+	truncated := text[:maxLen]
+	if lastSpace := strings.LastIndex(truncated, " "); lastSpace > 0 {
+		truncated = truncated[:lastSpace]
+	}
+	return truncated + "..."
+}
+
 // Event represents a single event in the NDJSON stream.
+// Events are marshaled with a flat structure where type and timestamp
+// are at the top level alongside event-specific fields.
 type Event struct {
-	Type      EventType              `json:"type"`
-	Timestamp string                 `json:"timestamp"`
-	Data      map[string]interface{} `json:"data"`
+	Type      EventType
+	Timestamp string
+	Fields    map[string]interface{} // Event-specific fields, flattened into output
+}
+
+// MarshalJSON implements json.Marshaler to produce a flat event structure.
+// The output combines Type, Timestamp, and all Fields at the top level,
+// matching the Phase 6 event stream specification in docs/plan/plan.md.
+func (e Event) MarshalJSON() ([]byte, error) {
+	// Start with type and timestamp
+	obj := map[string]interface{}{
+		"type":      e.Type,
+		"timestamp": e.Timestamp,
+	}
+	// Merge in event-specific fields
+	for k, v := range e.Fields {
+		obj[k] = v
+	}
+	return json.Marshal(obj)
 }
 
 // Publisher writes NDJSON events to a Unix socket.
@@ -178,11 +252,11 @@ func (p *Publisher) monitorConnection(ctx context.Context) {
 
 // Publish writes an event to the socket if a listener is connected.
 // This is non-blocking — if no listener is present, the event is dropped.
-func (p *Publisher) Publish(eventType EventType, data map[string]interface{}) {
+func (p *Publisher) Publish(eventType EventType, fields map[string]interface{}) {
 	event := Event{
 		Type:      eventType,
 		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
-		Data:      data,
+		Fields:    fields,
 	}
 
 	jsonBytes, err := json.Marshal(event)
@@ -215,6 +289,107 @@ func (p *Publisher) Publish(eventType EventType, data map[string]interface{}) {
 		p.mu.Unlock()
 	}
 }
+
+// ============================================================================
+// Phase 6 Event Stream Methods (matching docs/plan/plan.md specification)
+// ============================================================================
+
+// PublishMessageIn publishes an incoming message event.
+// Schema: {"type":"message_in","timestamp":"...","chat_id":...,"thread_id":...,"topic":"#trading-bot","user":"@jed","preview":"add stop-loss logic"}
+func (p *Publisher) PublishMessageIn(chatID, threadID int64, topic, user, preview string) {
+	if p == nil {
+		return
+	}
+	p.Publish(EventMessageIn, map[string]interface{}{
+		"chat_id":   chatID,
+		"thread_id": threadID,
+		"topic":     topic,
+		"user":      user,
+		"preview":   preview,
+	})
+}
+
+// PublishMessageOutStreaming publishes an outgoing message streaming event.
+// Schema: {"type":"message_out","timestamp":"...","chat_id":...,"thread_id":...,"topic":"#trading-bot","status":"streaming","tokens":340,"elapsed_ms":1200}
+func (p *Publisher) PublishMessageOutStreaming(chatID, threadID int64, topic string, tokens int, elapsedMs int64) {
+	if p == nil {
+		return
+	}
+	p.Publish(EventMessageOut, map[string]interface{}{
+		"chat_id":    chatID,
+		"thread_id":  threadID,
+		"topic":      topic,
+		"status":     "streaming",
+		"tokens":     tokens,
+		"elapsed_ms": elapsedMs,
+	})
+}
+
+// PublishMessageOutComplete publishes an outgoing message complete event.
+// Schema: {"type":"message_out","timestamp":"...","chat_id":...,"thread_id":...,"topic":"#trading-bot","status":"complete","tokens":1200,"cost_usd":0.032,"elapsed_ms":4800}
+func (p *Publisher) PublishMessageOutComplete(chatID, threadID int64, topic string, tokens int, costUSD float64, elapsedMs int64) {
+	if p == nil {
+		return
+	}
+	p.Publish(EventMessageOut, map[string]interface{}{
+		"chat_id":    chatID,
+		"thread_id":  threadID,
+		"topic":      topic,
+		"status":     "complete",
+		"tokens":     tokens,
+		"cost_usd":   costUSD,
+		"elapsed_ms": elapsedMs,
+	})
+}
+
+// PublishCommand publishes a command execution event.
+// Schema: {"type":"command","timestamp":"...","command":"/model","args":"opus","topic":"#new-feature","user":"@jed","result":"ok"}
+func (p *Publisher) PublishCommand(chatID int64, command, args, topic, user, result string) {
+	if p == nil {
+		return
+	}
+	p.Publish(EventCommand, map[string]interface{}{
+		"chat_id": chatID,
+		"command": command,
+		"args":    args,
+		"topic":   topic,
+		"user":    user,
+		"result":  result,
+	})
+}
+
+// PublishSessionUpdate publishes a session status update event.
+// Schema: {"type":"session_update","timestamp":"...","chat_id":...,"thread_id":...,"topic":"#new-feature","status":"active","model":"claude-opus-4-6"}
+func (p *Publisher) PublishSessionUpdate(chatID, threadID int64, topic, status, model string) {
+	if p == nil {
+		return
+	}
+	p.Publish(EventSessionUpdate, map[string]interface{}{
+		"chat_id":   chatID,
+		"thread_id": threadID,
+		"topic":     topic,
+		"status":    status,
+		"model":     model,
+	})
+}
+
+// PublishHealth publishes a health status event.
+// Schema: {"type":"health","timestamp":"...","proxy_ok":true,"proxy_latency_ms":210,"db_ok":true,"db_latency_ms":6}
+func (p *Publisher) PublishHealth(proxyOK, dbOK bool, proxyLatencyMs, dbLatencyMs int64) {
+	if p == nil {
+		return
+	}
+	p.Publish(EventHealth, map[string]interface{}{
+		"proxy_ok":          proxyOK,
+		"proxy_latency_ms":  proxyLatencyMs,
+		"db_ok":             dbOK,
+		"db_latency_ms":     dbLatencyMs,
+	})
+}
+
+// ============================================================================
+// Legacy Event Methods (for backward compatibility)
+// ============================================================================
 
 // PublishSessionCreated publishes a session creation event.
 func (p *Publisher) PublishSessionCreated(sessionData map[string]interface{}) {
@@ -290,10 +465,10 @@ func (p *Publisher) PublishCostRecorded(chatID, threadID int64, costUSD float64,
 		return
 	}
 	p.Publish(EventCostRecorded, map[string]interface{}{
-		"chat_id":    chatID,
-		"thread_id":  threadID,
-		"cost_usd":   costUSD,
-		"model":      model,
+		"chat_id":  chatID,
+		"thread_id": threadID,
+		"cost_usd": costUSD,
+		"model":    model,
 	})
 }
 
@@ -329,6 +504,17 @@ func (p *Publisher) PublishSystemInfo(message string) {
 	})
 }
 
+// PublishFormat publishes a formatted event.
+func (p *Publisher) PublishFormat(eventType EventType, format string, args ...any) {
+	p.Publish(eventType, map[string]interface{}{
+		"message": fmt.Sprintf(format, args...),
+	})
+}
+
+// ============================================================================
+// NullPublisher (no-op implementation)
+// ============================================================================
+
 // NullPublisher is a no-op publisher that drops all events.
 // Used when event publishing is disabled.
 type NullPublisher struct{}
@@ -347,38 +533,41 @@ func (p *NullPublisher) Stop() {}
 // Publish is a no-op for NullPublisher.
 func (p *NullPublisher) Publish(eventType EventType, data map[string]interface{}) {}
 
-// PublishSessionCreated is a no-op for NullPublisher.
+// Phase 6 methods for NullPublisher
+func (p *NullPublisher) PublishMessageIn(chatID, threadID int64, topic, user, preview string) {}
+func (p *NullPublisher) PublishMessageOutStreaming(chatID, threadID int64, topic string, tokens int, elapsedMs int64) {}
+func (p *NullPublisher) PublishMessageOutComplete(chatID, threadID int64, topic string, tokens int, costUSD float64, elapsedMs int64) {}
+func (p *NullPublisher) PublishCommand(chatID int64, command, args, topic, user, result string) {}
+func (p *NullPublisher) PublishSessionUpdate(chatID, threadID int64, topic, status, model string) {}
+func (p *NullPublisher) PublishHealth(proxyOK, dbOK bool, proxyLatencyMs, dbLatencyMs int64) {}
+
+// Legacy methods for NullPublisher
 func (p *NullPublisher) PublishSessionCreated(sessionData map[string]interface{}) {}
-
-// PublishSessionUpdated is a no-op for NullPublisher.
 func (p *NullPublisher) PublishSessionUpdated(sessionData map[string]interface{}) {}
-
-// PublishSessionClosed is a no-op for NullPublisher.
 func (p *NullPublisher) PublishSessionClosed(chatID, threadID int64, sessionID string) {}
-
-// PublishMessageReceived is a no-op for NullPublisher.
 func (p *NullPublisher) PublishMessageReceived(chatID, threadID int64, messageID int64, contentType string, userID int64) {}
-
-// PublishMessageSent is a no-op for NullPublisher.
 func (p *NullPublisher) PublishMessageSent(chatID, threadID int64, messageID int64, purpose string) {}
-
-// PublishCommandExecuted is a no-op for NullPublisher.
 func (p *NullPublisher) PublishCommandExecuted(chatID int64, command string, userID int64, success bool) {}
-
-// PublishCostRecorded is a no-op for NullPublisher.
 func (p *NullPublisher) PublishCostRecorded(chatID, threadID int64, costUSD float64, model string) {}
-
-// PublishHealthCheck is a no-op for NullPublisher.
 func (p *NullPublisher) PublishHealthCheck(healthy bool, checks []health.HealthCheck) {}
-
-// PublishSystemError is a no-op for NullPublisher.
 func (p *NullPublisher) PublishSystemError(component, message string) {}
-
-// PublishSystemInfo is a no-op for NullPublisher.
 func (p *NullPublisher) PublishSystemInfo(message string) {}
+
+// ============================================================================
+// Publishable Interface
+// ============================================================================
 
 // Publishable is the interface for publishers that can be nil-safe.
 type Publishable interface {
+	// Phase 6 methods
+	PublishMessageIn(chatID, threadID int64, topic, user, preview string)
+	PublishMessageOutStreaming(chatID, threadID int64, topic string, tokens int, elapsedMs int64)
+	PublishMessageOutComplete(chatID, threadID int64, topic string, tokens int, costUSD float64, elapsedMs int64)
+	PublishCommand(chatID int64, command, args, topic, user, result string)
+	PublishSessionUpdate(chatID, threadID int64, topic, status, model string)
+	PublishHealth(proxyOK, dbOK bool, proxyLatencyMs, dbLatencyMs int64)
+
+	// Legacy methods
 	PublishSessionCreated(sessionData map[string]interface{})
 	PublishSessionUpdated(sessionData map[string]interface{})
 	PublishSessionClosed(chatID, threadID int64, sessionID string)
@@ -400,16 +589,6 @@ func GetPublisher(enabled bool, socketPath string, logger Logger) Publishable {
 		return NewNullPublisher()
 	}
 	return NewPublisher(socketPath, logger)
-}
-
-// Ensure the Publisher implements Publishable
-var _ Publishable = &Publisher{}
-
-// PublishFormat publishes a formatted event.
-func (p *Publisher) PublishFormat(eventType EventType, format string, args ...any) {
-	p.Publish(eventType, map[string]interface{}{
-		"message": fmt.Sprintf(format, args...),
-	})
 }
 
 // StopPublisher stops a Publishable publisher if it supports stopping.

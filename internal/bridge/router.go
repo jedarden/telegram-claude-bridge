@@ -200,10 +200,21 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 				log.Printf("[router] get group for chat %d: %v", update.ChatID, err)
 				return
 			}
-			// Publish command event
+			// Publish command event (Phase 6 format)
 			if r.eventPublisher != nil {
-				command, _ := update.Content.ExtractCommandAndArgs()
-				r.eventPublisher.PublishCommandExecuted(update.ChatID, command, update.FromUser.ID, true)
+				command, args := update.Content.ExtractCommandAndArgs()
+				username := ""
+				if update.FromUser.Username != nil {
+					username = *update.FromUser.Username
+				}
+				r.eventPublisher.PublishCommand(
+					update.ChatID,
+					command,
+					args,
+					"General",
+					events.FormatUsername(username, update.FromUser.FirstName),
+					"ok",
+				)
 			}
 			r.OnCommand(ctx, update, group)
 		}
@@ -214,10 +225,31 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 	// ── 6. Named topic ───────────────────────────────────────────────────────────
 	tid := *update.ThreadID
 
-	// Publish message received event
+	// Publish message received event (Phase 6 format)
 	if r.eventPublisher != nil && update.Content != nil {
-		contentType := update.Content.Type
-		r.eventPublisher.PublishMessageReceived(update.ChatID, tid, update.MessageID, contentType, update.FromUser.ID)
+		username := ""
+		if update.FromUser.Username != nil {
+			username = *update.FromUser.Username
+		}
+		user := events.FormatUsername(username, update.FromUser.FirstName)
+
+		// Extract preview from text content
+		preview := ""
+		if update.Content.Text != nil {
+			preview = events.TruncatePreview(*update.Content.Text, 100)
+		} else if update.Content.Caption != nil {
+			preview = events.TruncatePreview(*update.Content.Caption, 100)
+		} else {
+			preview = update.Content.Type
+		}
+
+		r.eventPublisher.PublishMessageIn(
+			update.ChatID,
+			tid,
+			events.FormatTopicID(tid),
+			user,
+			preview,
+		)
 	}
 
 	session, err := r.db.GetSession(ctx, update.ChatID, tid)

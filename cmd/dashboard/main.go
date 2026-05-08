@@ -30,11 +30,9 @@ const (
 )
 
 // Event represents a single event from the NDJSON stream.
-type Event struct {
-	Type      string                 `json:"type"`
-	Timestamp string                 `json:"timestamp"`
-	Data      map[string]interface{} `json:"data"`
-}
+// Events use a flat structure where type, timestamp, and all event-specific
+// fields are at the top level (matching the Phase 6 event specification).
+type Event map[string]interface{}
 
 // LogEntry represents a single log entry for display.
 type LogEntry struct {
@@ -428,104 +426,171 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// getFloat64 extracts a float64 value from an event field.
+func getFloat64(event Event, key string) float64 {
+	if v, ok := event[key]; ok {
+		switch val := v.(type) {
+		case float64:
+			return val
+		case int:
+			return float64(val)
+		case int64:
+			return float64(val)
+		}
+	}
+	return 0
+}
+
+// getInt64 extracts an int64 value from an event field.
+func getInt64(event Event, key string) int64 {
+	return int64(getFloat64(event, key))
+}
+
+// getString extracts a string value from an event field.
+func getString(event Event, key string) string {
+	if v, ok := event[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// getBool extracts a bool value from an event field.
+func getBool(event Event, key string) bool {
+	if v, ok := event[key]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return false
+}
+
 // handleEvent processes a single event from the stream.
 func (m *model) handleEvent(event Event) {
-	switch event.Type {
+	eventType := getString(event, "type")
+
+	switch eventType {
+	// Phase 6 Event Types
+	case "message_in":
+		topic := getString(event, "topic")
+		user := getString(event, "user")
+		preview := getString(event, "preview")
+		m.state.AddLogEntry(fmt.Sprintf("MSG IN %s %s: %s", topic, user, preview))
+		m.state.IncrementActiveMessageCount()
+
+	case "message_out":
+		chatID := getInt64(event, "chat_id")
+		threadID := getInt64(event, "thread_id")
+		topic := getString(event, "topic")
+		status := getString(event, "status")
+		tokens := int(getFloat64(event, "tokens"))
+		costUSD := getFloat64(event, "cost_usd")
+
+		if status == "streaming" {
+			m.state.AddLogEntry(fmt.Sprintf("MSG OUT %s streaming %d tokens", topic, tokens))
+		} else if status == "complete" {
+			m.state.AddCostEntry(chatID, threadID, costUSD, "")
+			m.state.AddLogEntry(fmt.Sprintf("MSG OUT %s done %d tokens $%.4f", topic, tokens, costUSD))
+			m.state.DecrementActiveMessageCount()
+		}
+
+	case "command":
+		command := getString(event, "command")
+		args := getString(event, "args")
+		topic := getString(event, "topic")
+		user := getString(event, "user")
+		result := getString(event, "result")
+		m.state.AddCommandEntry(command+" "+args, 0, result == "ok")
+		m.state.AddLogEntry(fmt.Sprintf("CMD %s %s %s %s → %s", topic, user, command, args, result))
+
+	case "session_update":
+		chatID := getInt64(event, "chat_id")
+		threadID := getInt64(event, "thread_id")
+		topic := getString(event, "topic")
+		status := getString(event, "status")
+		model := getString(event, "model")
+		m.state.UpdateSession(chatID, threadID, "", model, status, "live", "", 0, 0)
+		m.state.AddLogEntry(fmt.Sprintf("SESSION %s %s: %s (%s)", topic, status, model, status))
+
+	case "health":
+		proxyOK := getBool(event, "proxy_ok")
+		dbOK := getBool(event, "db_ok")
+		proxyLatencyMs := getInt64(event, "proxy_latency_ms")
+		dbLatencyMs := getInt64(event, "db_latency_ms")
+
+		checks := []HealthCheck{
+			{Name: "proxy", Healthy: proxyOK, Message: fmt.Sprintf("%dms", proxyLatencyMs)},
+			{Name: "database", Healthy: dbOK, Message: fmt.Sprintf("%dms", dbLatencyMs)},
+		}
+		m.state.UpdateHealth(proxyOK && dbOK, checks)
+
+	// Legacy Event Types (for backward compatibility)
 	case "session_created", "session_updated":
-		chatID := int64(event.Data["chat_id"].(float64))
-		threadID := int64(event.Data["thread_id"].(float64))
-		sessionID := event.Data["session_id"].(string)
-		model := ""
-		if m, ok := event.Data["model"].(string); ok {
-			model = m
+		chatID := getInt64(event, "chat_id")
+		threadID := getInt64(event, "thread_id")
+		sessionID := getString(event, "session_id")
+		model := getString(event, "model")
+		status := getString(event, "status")
+		notifMode := getString(event, "notification_mode")
+		if notifMode == "" {
+			notifMode = "live"
 		}
-		status := ""
-		if s, ok := event.Data["status"].(string); ok {
-			status = s
-		}
-		notifMode := "live"
-		if nm, ok := event.Data["notification_mode"].(string); ok {
-			notifMode = nm
-		}
-		cwd := ""
-		if c, ok := event.Data["cwd"].(string); ok {
-			cwd = c
-		}
-		msgCount := 0
-		if mc, ok := event.Data["message_count"].(float64); ok {
-			msgCount = int(mc)
-		}
-		cost := 0.0
-		if c, ok := event.Data["total_cost_usd"].(float64); ok {
-			cost = c
-		}
+		cwd := getString(event, "cwd")
+		msgCount := int(getFloat64(event, "message_count"))
+		cost := getFloat64(event, "total_cost_usd")
 		m.state.UpdateSession(chatID, threadID, sessionID, model, status, notifMode, cwd, msgCount, cost)
+
 	case "session_closed":
-		chatID := int64(event.Data["chat_id"].(float64))
-		threadID := int64(event.Data["thread_id"].(float64))
+		chatID := getInt64(event, "chat_id")
+		threadID := getInt64(event, "thread_id")
 		m.state.RemoveSession(chatID, threadID)
+
 	case "message_received":
-		chatID := int64(event.Data["chat_id"].(float64))
-		threadID := int64(event.Data["thread_id"].(float64))
-		messageID := int64(event.Data["message_id"].(float64))
-		contentType := ""
-		if ct, ok := event.Data["content_type"].(string); ok {
-			contentType = ct
-		}
-		userID := int64(event.Data["user_id"].(float64))
+		chatID := getInt64(event, "chat_id")
+		threadID := getInt64(event, "thread_id")
+		messageID := getInt64(event, "message_id")
+		contentType := getString(event, "content_type")
+		userID := getInt64(event, "user_id")
 		m.state.AddLogEntry(fmt.Sprintf("MSG IN ch=%d th=%d msg=%d type=%s uid=%d", chatID, threadID, messageID, contentType, userID))
 		m.state.IncrementActiveMessageCount()
+
 	case "message_sent":
-		chatID := int64(event.Data["chat_id"].(float64))
-		threadID := int64(event.Data["thread_id"].(float64))
-		messageID := int64(event.Data["message_id"].(float64))
-		purpose := ""
-		if p, ok := event.Data["purpose"].(string); ok {
-			purpose = p
-		}
+		chatID := getInt64(event, "chat_id")
+		threadID := getInt64(event, "thread_id")
+		messageID := getInt64(event, "message_id")
+		purpose := getString(event, "purpose")
 		m.state.AddLogEntry(fmt.Sprintf("MSG OUT ch=%d th=%d msg=%d purp=%s", chatID, threadID, messageID, purpose))
 		m.state.DecrementActiveMessageCount()
+
 	case "command_executed":
-		chatID := int64(event.Data["chat_id"].(float64))
-		command := ""
-		if c, ok := event.Data["command"].(string); ok {
-			command = c
-		}
-		userID := int64(event.Data["user_id"].(float64))
-		success := false
-		if s, ok := event.Data["success"].(bool); ok {
-			success = s
-		}
+		chatID := getInt64(event, "chat_id")
+		command := getString(event, "command")
+		userID := getInt64(event, "user_id")
+		success := getBool(event, "success")
 		m.state.AddCommandEntry(command, userID, success)
 		m.state.AddLogEntry(fmt.Sprintf("CMD ch=%d %s uid=%d ok=%t", chatID, command, userID, success))
+
 	case "cost_recorded":
-		chatID := int64(event.Data["chat_id"].(float64))
-		threadID := int64(event.Data["thread_id"].(float64))
-		costUSD := 0.0
-		if c, ok := event.Data["cost_usd"].(float64); ok {
-			costUSD = c
-		}
-		model := ""
-		if m, ok := event.Data["model"].(string); ok {
-			model = m
-		}
+		chatID := getInt64(event, "chat_id")
+		threadID := getInt64(event, "thread_id")
+		costUSD := getFloat64(event, "cost_usd")
+		model := getString(event, "model")
 		m.state.AddCostEntry(chatID, threadID, costUSD, model)
 		m.state.AddLogEntry(fmt.Sprintf("COST ch=%d th=%d $%.4f %s", chatID, threadID, costUSD, model))
+
 	case "health_check":
-		healthy := false
-		if h, ok := event.Data["healthy"].(bool); ok {
-			healthy = h
-		}
+		healthy := getBool(event, "healthy")
 		checks := []HealthCheck{}
-		if c, ok := event.Data["checks"].([]interface{}); ok {
+		if c, ok := event["checks"].([]interface{}); ok {
 			for _, checkItem := range c {
 				if checkMap, ok := checkItem.(map[string]interface{}); ok {
 					check := HealthCheck{}
 					if name, ok := checkMap["name"].(string); ok {
 						check.Name = name
 					}
-					if healthy, ok := checkMap["healthy"].(bool); ok {
-						check.Healthy = healthy
+					if h, ok := checkMap["healthy"].(bool); ok {
+						check.Healthy = h
 					}
 					if msg, ok := checkMap["message"].(string); ok {
 						check.Message = msg
@@ -535,21 +600,14 @@ func (m *model) handleEvent(event Event) {
 			}
 		}
 		m.state.UpdateHealth(healthy, checks)
+
 	case "system_error":
-		component := ""
-		if c, ok := event.Data["component"].(string); ok {
-			component = c
-		}
-		message := ""
-		if m, ok := event.Data["message"].(string); ok {
-			message = m
-		}
+		component := getString(event, "component")
+		message := getString(event, "message")
 		m.state.AddLogEntry(fmt.Sprintf("ERROR [%s] %s", component, message))
+
 	case "system_info":
-		message := ""
-		if m, ok := event.Data["message"].(string); ok {
-			message = m
-		}
+		message := getString(event, "message")
 		m.state.AddLogEntry(fmt.Sprintf("INFO %s", message))
 	}
 }
