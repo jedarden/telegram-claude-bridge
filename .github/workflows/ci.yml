@@ -29,10 +29,22 @@ jobs:
         run: go test ./...
 
       - name: Build proxy
-        run: CGO_ENABLED=0 go build -o proxy ./cmd/proxy/
+        run: |
+          VERSION=$(git describe --tags --always 2>/dev/null || echo "dev")
+          COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          BUILDDATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          CGO_ENABLED=0 go build \
+            -ldflags "-s -w -X main.Version=${VERSION} -X main.CommitSHA=${COMMIT} -X main.BuildDate=${BUILDDATE}" \
+            -o proxy ./cmd/proxy/
 
       - name: Build bridge
-        run: CGO_ENABLED=0 go build -o bridge ./cmd/bridge/
+        run: |
+          VERSION=$(git describe --tags --always 2>/dev/null || echo "dev")
+          COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          BUILDDATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          CGO_ENABLED=0 go build \
+            -ldflags "-s -w -X main.Version=${VERSION} -X main.CommitSHA=${COMMIT} -X main.BuildDate=${BUILDDATE}" \
+            -o bridge ./cmd/bridge/
 
   docker:
     name: Build & Push Image
