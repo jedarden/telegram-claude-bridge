@@ -1853,8 +1853,12 @@ func (m *SessionManager) invokeClaudeAPI(
 			var start contentBlockStart
 			if err := json.Unmarshal(env.Event, &start); err == nil {
 				if start.Type == "content_block_start" && start.ContentBlock.Type == "tool_use" {
-					// Check for spawn_worker synthetic tool
+					// Check for spawn_worker synthetic tool (only when dispatcher mode is enabled)
 					if start.ContentBlock.Name == "spawn_worker" {
+						if !isDispatcherEnabled(session, group) {
+							log.Printf("[session_mgr] ignoring spawn_worker: dispatcher mode disabled for (%d,%d)", chatID, *threadID)
+							continue
+						}
 						syntheticToolID := fmt.Sprintf("toolu_%d", time.Now().UnixNano())
 
 						// Spawn the worker — it runs in a goroutine and returns immediately
@@ -1889,8 +1893,12 @@ func (m *SessionManager) invokeClaudeAPI(
 						continue
 					}
 
-					// Check for update_progress synthetic tool
+					// Check for update_progress synthetic tool (only when dispatcher mode is enabled)
 					if start.ContentBlock.Name == "update_progress" {
+						if !isDispatcherEnabled(session, group) {
+							log.Printf("[session_mgr] ignoring update_progress: dispatcher mode disabled for (%d,%d)", chatID, *threadID)
+							continue
+						}
 						syntheticToolID := fmt.Sprintf("toolu_%d", time.Now().UnixNano())
 
 						// Parse the input to get the message
