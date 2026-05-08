@@ -62,6 +62,7 @@ type SessionInfo struct {
 	ChatID           int64
 	ThreadID         int64
 	SessionID        string
+	Topic            string
 	Model            string
 	Status           string
 	MessageCount     int
@@ -80,9 +81,12 @@ type HealthCheck struct {
 
 // HealthStatus represents the overall system health.
 type HealthStatus struct {
-	Healthy   bool
-	Checks    []HealthCheck
-	Timestamp time.Time
+	Healthy              bool
+	Checks               []HealthCheck
+	Timestamp            time.Time
+	TGPolling            bool
+	TGLastUpdateID       *int64
+	BridgeUptimeSeconds  int64
 }
 
 // State holds the application state.
@@ -111,6 +115,9 @@ func NewState() *State {
 				{Name: "database", Healthy: false, Message: "unknown"},
 				{Name: "claude_cli", Healthy: false, Message: "unknown"},
 			},
+			TGPolling:           false,
+			TGLastUpdateID:      nil,
+			BridgeUptimeSeconds: 0,
 		},
 		lastUpdate: time.Now(),
 	}
@@ -149,7 +156,7 @@ func (s *State) AddCommandEntry(cmd string, userID int64, success bool) {
 }
 
 // UpdateSession updates a session in the state.
-func (s *State) UpdateSession(chatID, threadID int64, sessionID, model, status, notifMode, cwd string, msgCount int, cost float64) {
+func (s *State) UpdateSession(chatID, threadID int64, sessionID, topic, model, status, notifMode, cwd string, msgCount int, cost float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := fmt.Sprintf("%d:%d", chatID, threadID)
@@ -163,6 +170,7 @@ func (s *State) UpdateSession(chatID, threadID int64, sessionID, model, status, 
 		}
 		s.sessions[key] = session
 	}
+	session.Topic = topic
 	session.Model = model
 	session.Status = status
 	session.NotificationMode = notifMode
@@ -192,13 +200,34 @@ func (s *State) UpdateHealth(healthy bool, checks []HealthCheck) {
 	s.lastUpdate = time.Now()
 }
 
-// GetSessions returns a copy of the current sessions.
+// UpdateHealthFull updates the health status with all Phase 6 fields.
+func (s *State) UpdateHealthFull(healthy bool, checks []HealthCheck, tgPolling bool, tgLastUpdateID *int64, bridgeUptimeSeconds int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.health.Healthy = healthy
+	s.health.Checks = checks
+	s.health.TGPolling = tgPolling
+	s.health.TGLastUpdateID = tgLastUpdateID
+	s.health.BridgeUptimeSeconds = bridgeUptimeSeconds
+	s.health.Timestamp = time.Now()
+	s.lastUpdate = time.Now()
+}
+
+// GetSessions returns a copy of the current sessions, sorted by LastActive (most recent first).
 func (s *State) GetSessions() []*SessionInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	sessions := make([]*SessionInfo, 0, len(s.sessions))
 	for _, sess := range s.sessions {
 		sessions = append(sessions, sess)
+	}
+	// Sort by LastActive (most recent first)
+	for i := 0; i < len(sessions)-1; i++ {
+		for j := i + 1; j < len(sessions); j++ {
+			if sessions[j].LastActive.After(sessions[i].LastActive) {
+				sessions[i], sessions[j] = sessions[j], sessions[i]
+			}
+		}
 	}
 	return sessions
 }
@@ -510,7 +539,7 @@ func (m *model) handleEvent(event Event) {
 		topic := getString(event, "topic")
 		status := getString(event, "status")
 		model := getString(event, "model")
-		m.state.UpdateSession(chatID, threadID, "", model, status, "live", "", 0, 0)
+		m.state.UpdateSession(chatID, threadID, "", topic, model, status, "live", "", 0, 0)
 		m.state.AddLogEntry(fmt.Sprintf("SESSION %s %s: %s (%s)", topic, status, model, status))
 
 	case "health":
@@ -518,18 +547,30 @@ func (m *model) handleEvent(event Event) {
 		dbOK := getBool(event, "db_ok")
 		proxyLatencyMs := getInt64(event, "proxy_latency_ms")
 		dbLatencyMs := getInt64(event, "db_latency_ms")
+		tgPolling := getBool(event, "tg_polling")
+		bridgeUptimeSeconds := getInt64(event, "bridge_uptime_seconds")
+
+		// Get last update ID (may be null)
+		var lastUpdateIDPtr *int64
+		if v, ok := event["tg_last_update_id"]; ok && v != nil {
+			if id, ok := v.(float64); ok {
+				idVal := int64(id)
+				lastUpdateIDPtr = &idVal
+			}
+		}
 
 		checks := []HealthCheck{
 			{Name: "proxy", Healthy: proxyOK, Message: fmt.Sprintf("%dms", proxyLatencyMs)},
 			{Name: "database", Healthy: dbOK, Message: fmt.Sprintf("%dms", dbLatencyMs)},
 		}
-		m.state.UpdateHealth(proxyOK && dbOK, checks)
+		m.state.UpdateHealthFull(proxyOK && dbOK, checks, tgPolling, lastUpdateIDPtr, bridgeUptimeSeconds)
 
 	// Legacy Event Types (for backward compatibility)
 	case "session_created", "session_updated":
 		chatID := getInt64(event, "chat_id")
 		threadID := getInt64(event, "thread_id")
 		sessionID := getString(event, "session_id")
+		topic := getString(event, "topic")
 		model := getString(event, "model")
 		status := getString(event, "status")
 		notifMode := getString(event, "notification_mode")
@@ -539,7 +580,7 @@ func (m *model) handleEvent(event Event) {
 		cwd := getString(event, "cwd")
 		msgCount := int(getFloat64(event, "message_count"))
 		cost := getFloat64(event, "total_cost_usd")
-		m.state.UpdateSession(chatID, threadID, sessionID, model, status, notifMode, cwd, msgCount, cost)
+		m.state.UpdateSession(chatID, threadID, sessionID, topic, model, status, notifMode, cwd, msgCount, cost)
 
 	case "session_closed":
 		chatID := getInt64(event, "chat_id")
@@ -637,6 +678,7 @@ func (m model) View() string {
 	successStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("142")) // Green
 	errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("203"))   // Red
 	warningStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("229")) // Yellow
+	infoStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("39"))    // Blue
 	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("241"))    // Grey
 	statusStyle := lipgloss.NewStyle().Bold(true)                       // Bold for status
 
@@ -670,21 +712,32 @@ func (m model) View() string {
 			if i >= sessionHeight-2 {
 				break
 			}
+			// Color-coded status: green=idle, blue=processing, yellow=streaming, red=error
 			statusColor := successStyle
-			if sess.Status == "blocked" {
+			if sess.Status == "processing" {
+				statusColor = infoStyle
+			} else if sess.Status == "streaming" {
 				statusColor = warningStyle
 			} else if sess.Status == "error" {
 				statusColor = errorStyle
 			}
-			line := fmt.Sprintf("%s ch=%d th=%d %s msgs=%d cost=$%.4f",
-				statusStyle.Render(sess.Status),
-				sess.ChatID, sess.ThreadID,
-				truncateString(sess.Model, 12),
-				sess.MessageCount, sess.TotalCostUSD,
-			)
-			if sess.NotificationMode != "live" {
-				line += dimStyle.Render(fmt.Sprintf(" [%s]", sess.NotificationMode))
+
+			// Calculate idle duration
+			idleDuration := time.Since(sess.LastActive)
+			idleStr := formatDuration(idleDuration)
+
+			// Display topic name, or chat_id/thread_id if no topic
+			topicDisplay := sess.Topic
+			if topicDisplay == "" {
+				topicDisplay = fmt.Sprintf("ch=%d/th=%d", sess.ChatID, sess.ThreadID)
 			}
+
+			line := fmt.Sprintf("%s %-20s %s idle=%s",
+				statusStyle.Render(sess.Status),
+				truncateString(topicDisplay, 20),
+				truncateString(sess.Model, 10),
+				idleStr,
+			)
 			sessionsPanel += statusColor.Render(line) + "\n"
 		}
 		if len(sessions) > sessionHeight-2 {
@@ -695,20 +748,67 @@ func (m model) View() string {
 	// System Health Panel
 	health := m.state.GetHealth()
 	healthPanel := headerStyle.Render("System Health") + "\n"
-	for _, check := range health.Checks {
-		checkStyle := successStyle
-		if !check.Healthy {
-			checkStyle = errorStyle
-		}
-		msg := check.Message
-		if msg == "" {
-			msg = "ok"
-		}
-		healthPanel += fmt.Sprintf("%s %-12s %s\n",
-			checkStyle.Render(statusIcon(check.Healthy)),
-			check.Name+":", checkStyle.Render(msg),
-		)
+
+	// Proxy status with latency
+	proxyCheck := findHealthCheck(health.Checks, "proxy")
+	proxyStyle := successStyle
+	if proxyCheck != nil && !proxyCheck.Healthy {
+		proxyStyle = errorStyle
 	}
+	proxyMsg := "unknown"
+	if proxyCheck != nil {
+		proxyMsg = proxyCheck.Message
+	}
+	healthPanel += fmt.Sprintf("Proxy: %s %s\n",
+		proxyStyle.Render(statusIcon(proxyCheck != nil && proxyCheck.Healthy)),
+		proxyStyle.Render(proxyMsg),
+	)
+
+	// Bridge uptime
+	bridgeUptime := formatDuration(time.Duration(health.BridgeUptimeSeconds) * time.Second)
+	healthPanel += fmt.Sprintf("Bridge Uptime: %s\n", infoStyle.Render(bridgeUptime))
+
+	// DB response time
+	dbCheck := findHealthCheck(health.Checks, "database")
+	dbStyle := successStyle
+	if dbCheck != nil && !dbCheck.Healthy {
+		dbStyle = errorStyle
+	}
+	dbMsg := "unknown"
+	if dbCheck != nil {
+		dbMsg = dbCheck.Message
+	}
+	healthPanel += fmt.Sprintf("DB: %s %s\n",
+		dbStyle.Render(statusIcon(dbCheck != nil && dbCheck.Healthy)),
+		dbStyle.Render(dbMsg),
+	)
+
+	// Claude CLI availability
+	claudeCheck := findHealthCheck(health.Checks, "claude_cli")
+	claudeStyle := successStyle
+	if claudeCheck != nil && !claudeCheck.Healthy {
+		claudeStyle = errorStyle
+	}
+	healthPanel += fmt.Sprintf("Claude CLI: %s\n",
+		claudeStyle.Render(statusIcon(claudeCheck != nil && claudeCheck.Healthy)),
+	)
+
+	// Telegram polling status
+	tgStyle := successStyle
+	if !health.TGPolling {
+		tgStyle = errorStyle
+	}
+	tgStatus := "polling"
+	if !health.TGPolling {
+		tgStatus = "stopped"
+	}
+	if health.TGLastUpdateID != nil {
+		tgStatus += fmt.Sprintf(" (update #%d)", *health.TGLastUpdateID)
+	}
+	healthPanel += fmt.Sprintf("Telegram: %s %s\n",
+		tgStyle.Render(statusIcon(health.TGPolling)),
+		tgStyle.Render(tgStatus),
+	)
 
 	// Messages In Flight Panel
 	logEntries := m.state.GetMessageLog()
@@ -767,12 +867,13 @@ func (m model) View() string {
 	}
 
 	// Layout
+	// Health panel is now in top-right (task 6.4)
 	leftColumn := lipgloss.JoinVertical(lipgloss.Left,
 		panelStyle.Width(leftWidth).Height(sessionHeight).Render(sessionsPanel),
-		panelStyle.Width(leftWidth).Height(healthHeight).Render(healthPanel),
+		panelStyle.Width(leftWidth).Height(logHeight).Render(logPanel),
 	)
 	rightColumn := lipgloss.JoinVertical(lipgloss.Left,
-		panelStyle.Width(rightWidth).Height(logHeight).Render(logPanel),
+		panelStyle.Width(rightWidth).Height(healthHeight).Render(healthPanel),
 		panelStyle.Width(rightWidth).Height(logHeight).Render(cmdPanel),
 		panelStyle.Width(rightWidth).Height(6).Render(costPanel),
 	)
@@ -790,12 +891,46 @@ func statusIcon(healthy bool) string {
 	return "✗"
 }
 
+// findHealthCheck finds a health check by name.
+func findHealthCheck(checks []HealthCheck, name string) *HealthCheck {
+	for i := range checks {
+		if checks[i].Name == name {
+			return &checks[i]
+		}
+	}
+	return nil
+}
+
 // truncateString truncates a string to a maximum length.
 func truncateString(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
 	return s[:maxLen-1] + "…"
+}
+
+// formatDuration formats a duration as a human-readable string (e.g., "5m", "2h30m").
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return "just now"
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	if d < 24*time.Hour {
+		hours := int(d.Hours())
+		mins := int(d.Minutes()) % 60
+		if mins > 0 {
+			return fmt.Sprintf("%dh%dm", hours, mins)
+		}
+		return fmt.Sprintf("%dh", hours)
+	}
+	days := int(d.Hours() / 24)
+	hours := int(d.Hours()) % 24
+	if hours > 0 {
+		return fmt.Sprintf("%dd%dh", days, hours)
+	}
+	return fmt.Sprintf("%dd", days)
 }
 
 // connectCmd attempts to connect to the event socket.

@@ -51,6 +51,7 @@ type Checker struct {
 	lastHealthy bool
 	logger      *slog.Logger
 	eventPublisher any
+	bridgeStartTime time.Time
 }
 
 // HealthCheck represents a single health check result for event publishing.
@@ -63,7 +64,8 @@ type HealthCheck struct {
 // publisher is the minimal interface needed for event publishing.
 type publisher interface {
 	PublishHealthCheck(healthy bool, checks []HealthCheck)
-	PublishHealth(proxyOK, dbOK bool, proxyLatencyMs, dbLatencyMs int64)
+	PublishHealth(proxyOK, dbOK bool, proxyLatencyMs, dbLatencyMs int64,
+		tgPolling bool, tgLastUpdateID *int64, bridgeUptimeSeconds int64)
 }
 
 // NewChecker creates a new health checker.
@@ -71,13 +73,15 @@ func NewChecker(proxyURL string, db *sql.DB) *Checker {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
+	now := time.Now()
 	return &Checker{
-		proxyURL:   proxyURL,
-		db:         db,
-		httpClient: &http.Client{Timeout: 5 * time.Second},
-		startTime:  time.Now(),
-		lastHealthy: true,
-		logger:     logger,
+		proxyURL:        proxyURL,
+		db:              db,
+		httpClient:      &http.Client{Timeout: 5 * time.Second},
+		startTime:       now,
+		bridgeStartTime: now,
+		lastHealthy:     true,
+		logger:          logger,
 	}
 }
 
@@ -176,7 +180,17 @@ func (c *Checker) Check(ctx context.Context) *Result {
 				}
 			}
 
-			pub.PublishHealth(proxyOK, dbOK, proxyLatencyMs, dbLatencyMs)
+			// Fetch Telegram polling info from proxy health endpoint
+			var tgPolling bool
+			var tgLastUpdateID *int64
+			if proxyOK {
+				tgPolling, tgLastUpdateID = c.getTelegramPollingStatus(ctx)
+			}
+
+			// Calculate bridge uptime
+			bridgeUptimeSeconds := int64(time.Since(c.bridgeStartTime).Seconds())
+
+			pub.PublishHealth(proxyOK, dbOK, proxyLatencyMs, dbLatencyMs, tgPolling, tgLastUpdateID, bridgeUptimeSeconds)
 		}
 	}
 
@@ -188,6 +202,43 @@ func (c *Checker) WasHealthy() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.lastHealthy
+}
+
+// proxyHealthResponse represents the health response from the proxy.
+type proxyHealthResponse struct {
+	OK            bool   `json:"ok"`
+	Polling       bool   `json:"polling"`
+	LastUpdateID  *int64 `json:"last_update_id,omitempty"`
+	UptimeSeconds int64  `json:"uptime_seconds"`
+}
+
+// getTelegramPollingStatus fetches the Telegram polling status from the proxy health endpoint.
+func (c *Checker) getTelegramPollingStatus(ctx context.Context) (bool, *int64) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.proxyURL+"/health", nil)
+	if err != nil {
+		c.logger.Debug("proxy_health_fetch_failed", "error", err)
+		return false, nil
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		c.logger.Debug("proxy_health_fetch_failed", "error", err)
+		return false, nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Debug("proxy_health_unhealthy", "status_code", resp.StatusCode)
+		return false, nil
+	}
+
+	var healthResp proxyHealthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&healthResp); err != nil {
+		c.logger.Debug("proxy_health_decode_failed", "error", err)
+		return false, nil
+	}
+
+	return healthResp.Polling, healthResp.LastUpdateID
 }
 
 // checkProxy verifies the proxy is reachable.
@@ -473,4 +524,3 @@ func (s *Server) SendReconnectNotification(ctx context.Context, sender Sender, g
 		}
 	}
 }
-

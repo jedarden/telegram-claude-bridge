@@ -374,17 +374,24 @@ func (p *Publisher) PublishSessionUpdate(chatID, threadID int64, topic, status, 
 }
 
 // PublishHealth publishes a health status event.
-// Schema: {"type":"health","timestamp":"...","proxy_ok":true,"proxy_latency_ms":210,"db_ok":true,"db_latency_ms":6}
-func (p *Publisher) PublishHealth(proxyOK, dbOK bool, proxyLatencyMs, dbLatencyMs int64) {
+// Schema: {"type":"health","timestamp":"...","proxy_ok":true,"proxy_latency_ms":210,"db_ok":true,"db_latency_ms":6,"tg_polling":true,"tg_last_update_id":12345,"bridge_uptime_seconds":3600}
+func (p *Publisher) PublishHealth(proxyOK, dbOK bool, proxyLatencyMs, dbLatencyMs int64,
+	tgPolling bool, tgLastUpdateID *int64, bridgeUptimeSeconds int64) {
 	if p == nil {
 		return
 	}
-	p.Publish(EventHealth, map[string]interface{}{
-		"proxy_ok":          proxyOK,
-		"proxy_latency_ms":  proxyLatencyMs,
-		"db_ok":             dbOK,
-		"db_latency_ms":     dbLatencyMs,
-	})
+	fields := map[string]interface{}{
+		"proxy_ok":              proxyOK,
+		"proxy_latency_ms":      proxyLatencyMs,
+		"db_ok":                 dbOK,
+		"db_latency_ms":         dbLatencyMs,
+		"tg_polling":            tgPolling,
+		"bridge_uptime_seconds": bridgeUptimeSeconds,
+	}
+	if tgLastUpdateID != nil {
+		fields["tg_last_update_id"] = *tgLastUpdateID
+	}
+	p.Publish(EventHealth, fields)
 }
 
 // ============================================================================
@@ -539,7 +546,8 @@ func (p *NullPublisher) PublishMessageOutStreaming(chatID, threadID int64, topic
 func (p *NullPublisher) PublishMessageOutComplete(chatID, threadID int64, topic string, tokens int, costUSD float64, elapsedMs int64) {}
 func (p *NullPublisher) PublishCommand(chatID int64, command, args, topic, user, result string) {}
 func (p *NullPublisher) PublishSessionUpdate(chatID, threadID int64, topic, status, model string) {}
-func (p *NullPublisher) PublishHealth(proxyOK, dbOK bool, proxyLatencyMs, dbLatencyMs int64) {}
+func (p *NullPublisher) PublishHealth(proxyOK, dbOK bool, proxyLatencyMs, dbLatencyMs int64,
+	tgPolling bool, tgLastUpdateID *int64, bridgeUptimeSeconds int64) {}
 
 // Legacy methods for NullPublisher
 func (p *NullPublisher) PublishSessionCreated(sessionData map[string]interface{}) {}
@@ -565,7 +573,8 @@ type Publishable interface {
 	PublishMessageOutComplete(chatID, threadID int64, topic string, tokens int, costUSD float64, elapsedMs int64)
 	PublishCommand(chatID int64, command, args, topic, user, result string)
 	PublishSessionUpdate(chatID, threadID int64, topic, status, model string)
-	PublishHealth(proxyOK, dbOK bool, proxyLatencyMs, dbLatencyMs int64)
+	PublishHealth(proxyOK, dbOK bool, proxyLatencyMs, dbLatencyMs int64,
+		tgPolling bool, tgLastUpdateID *int64, bridgeUptimeSeconds int64)
 
 	// Legacy methods
 	PublishSessionCreated(sessionData map[string]interface{})
