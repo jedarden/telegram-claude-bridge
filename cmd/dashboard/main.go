@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -19,7 +20,8 @@ import (
 )
 
 const (
-	socketPath = "/tmp/telegram-bridge-events.sock"
+	// DefaultSocketPath is the default Unix socket path for event streaming.
+	DefaultSocketPath = "/tmp/telegram-bridge-events.sock"
 	// Maximum number of log entries to keep
 	maxLogEntries = 100
 	maxCmdEntries = 50
@@ -277,6 +279,7 @@ type eventWithConnMsg struct {
 type model struct {
 	state          *State
 	conn           net.Conn
+	socketPath     string
 	reconnectDelay time.Duration
 	width          int
 	height         int
@@ -286,9 +289,10 @@ type model struct {
 }
 
 // initialModel creates the initial model.
-func initialModel() model {
+func initialModel(socketPath string) model {
 	return model{
 		state:          NewState(),
+		socketPath:     socketPath,
 		reconnectDelay: time.Second,
 		width:          80,
 		height:         24,
@@ -299,7 +303,7 @@ func initialModel() model {
 // Init initializes the model.
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
-		connectCmd(),
+		m.connectCmd(),
 		tickCmd(),
 	)
 }
@@ -319,7 +323,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.conn = nil
 			}
 			m.connected = false
-			return m, connectCmd()
+			return m, m.connectCmd()
 		}
 	case connectedMsg:
 		m.connected = true
@@ -352,7 +356,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForNextEvent(msg.Conn)
 	case eventReceivedMsg:
 		m.handleEvent(Event(msg))
-		return m, readEventsCmd()
+		return m, m.readEventsCmd()
 	case tickMsg:
 		return m, tickCmd()
 	case tea.WindowSizeMsg:
@@ -670,9 +674,9 @@ func truncateString(s string, maxLen int) string {
 }
 
 // connectCmd attempts to connect to the event socket.
-func connectCmd() tea.Cmd {
+func (m model) connectCmd() tea.Cmd {
 	return func() tea.Msg {
-		conn, err := net.Dial("unix", socketPath)
+		conn, err := net.Dial("unix", m.socketPath)
 		if err != nil {
 			return disconnectedMsg{err: fmt.Errorf("dial failed: %w", err)}
 		}
@@ -697,9 +701,9 @@ func waitForNextEvent(conn net.Conn) tea.Cmd {
 }
 
 // readEventsCmd reads events from the socket.
-func readEventsCmd() tea.Cmd {
+func (m model) readEventsCmd() tea.Cmd {
 	return func() tea.Msg {
-		conn, err := net.Dial("unix", socketPath)
+		conn, err := net.Dial("unix", m.socketPath)
 		if err != nil {
 			return disconnectedMsg{err: fmt.Errorf("dial failed: %w", err)}
 		}
@@ -726,12 +730,9 @@ func tickCmd() tea.Cmd {
 }
 
 func main() {
-	// Check if socket exists
-	if _, err := os.Stat(socketPath); os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Event socket not found at %s\n", socketPath)
-		fmt.Fprintf(os.Stderr, "Make sure the bridge is running with event publishing enabled.\n")
-		os.Exit(1)
-	}
+	// Parse command-line flags
+	socketPath := flag.String("socket", DefaultSocketPath, "Path to the event socket")
+	flag.Parse()
 
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -739,7 +740,7 @@ func main() {
 
 	// Create and start the Bubble Tea program
 	p := tea.NewProgram(
-		initialModel(),
+		initialModel(*socketPath),
 		tea.WithAltScreen(),       // Use alternate screen buffer
 		tea.WithMouseCellMotion(), // Enable mouse support
 	)

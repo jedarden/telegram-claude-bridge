@@ -1,4 +1,4 @@
-.PHONY: all build proxy bridge clean test vet docker
+.PHONY: all build proxy bridge dashboard clean test vet docker
 
 VERSION := $(shell git describe --tags --always 2>/dev/null || echo "dev")
 COMMITSHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -7,7 +7,10 @@ LDFLAGS := -s -w -X main.Version=$(VERSION) -X main.CommitSHA=$(COMMITSHA) -X ma
 
 all: build
 
-build: proxy bridge
+build: proxy bridge dashboard
+
+dashboard:
+	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/dashboard ./cmd/dashboard/
 
 proxy:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/proxy ./cmd/proxy/
@@ -16,7 +19,7 @@ bridge:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/bridge ./cmd/bridge/
 
 clean:
-	rm -f bin/proxy bin/bridge
+	rm -f bin/proxy bin/bridge bin/dashboard
 
 test:
 	go test ./...
