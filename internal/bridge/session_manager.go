@@ -3110,10 +3110,23 @@ func (m *SessionManager) GetSessionContext(ctx context.Context, chatID, threadID
 
 // GetPinnedSnippetsContext retrieves and formats all pinned snippets for a chat.
 // Returns a formatted string ready to inject into a prompt, or empty string if no pinned snippets exist.
-// TODO: Implement pinned snippets feature (Phase 5.2).
 func (m *SessionManager) GetPinnedSnippetsContext(ctx context.Context, chatID int64) string {
-	// Snippets feature not yet implemented
-	return ""
+	snippets, err := m.db.ListSnippets(ctx, chatID)
+	if err != nil {
+		log.Printf("[session_mgr] list snippets for chat %d: %v", chatID, err)
+		return ""
+	}
+
+	if len(snippets) == 0 {
+		return ""
+	}
+
+	var parts []string
+	for _, s := range snippets {
+		parts = append(parts, fmt.Sprintf("[%s]: %s", s.Name, s.Content))
+	}
+
+	return fmt.Sprintf("[Pinned context snippets]\n%s", strings.Join(parts, "\n"))
 }
 
 // FormatCostResponse returns a formatted cost response for a topic.
