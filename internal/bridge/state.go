@@ -139,7 +139,16 @@ type BackgroundJob struct {
 	StartedAt time.Time // When the job was started
 }
 
-const schemaVersion = 18
+// Snippet represents a reusable context snippet for a chat.
+type Snippet struct {
+	ID        int64     // Auto-increment ID
+	ChatID    int64     // Telegram chat ID
+	Name      string    // Unique snippet name within the chat
+	Content   string    // Snippet content
+	CreatedAt time.Time // When the snippet was created
+}
+
+const schemaVersion = 19
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -298,6 +307,18 @@ var migrations = []string{
 
 			// Version 18 — add from_user_id to cost_events for per-user attribution.
 			`ALTER TABLE cost_events ADD COLUMN from_user_id INTEGER NOT NULL DEFAULT 0;`,
+
+			// Version 19 — add snippets table for context snippet management (Phase 5.2).
+			`CREATE TABLE IF NOT EXISTS snippets (
+				id         INTEGER PRIMARY KEY AUTOINCREMENT,
+				chat_id    INTEGER NOT NULL,
+				name       TEXT NOT NULL,
+				content    TEXT NOT NULL,
+				created_at TEXT NOT NULL DEFAULT (datetime('now')),
+				UNIQUE(chat_id, name)
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_snippets_chat_id ON snippets(chat_id);`,
 	}
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
 // and applies any pending migrations.
@@ -1602,3 +1623,86 @@ func scanWorker(s workerScanner) (*Worker, error) {
 	}
 	return &w, nil
 }
+
+	// ── snippets ─────────────────────────────────────────────────────────────────────
+
+// CreateSnippet inserts a new snippet record.
+func (d *DB) CreateSnippet(ctx context.Context, s *Snippet) error {
+	if s.CreatedAt.IsZero() {
+		s.CreatedAt = time.Now().UTC()
+	}
+	result, err := d.db.ExecContext(ctx,
+		`INSERT INTO snippets (chat_id, name, content, created_at) VALUES (?, ?, ?, ?)`,
+		s.ChatID, s.Name, s.Content, s.CreatedAt.UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		return err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return err
+	}
+	s.ID = id
+	return nil
+}
+
+// GetSnippet retrieves a snippet by chat_id and name.
+// Returns (nil, nil) if not found.
+func (d *DB) GetSnippet(ctx context.Context, chatID int64, name string) (*Snippet, error) {
+	row := d.db.QueryRowContext(ctx,
+		`SELECT id, chat_id, name, content, created_at FROM snippets WHERE chat_id = ? AND name = ?`,
+		chatID, name)
+
+	var s Snippet
+	var createdAt string
+	err := row.Scan(&s.ID, &s.ChatID, &s.Name, &s.Content, &createdAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	s.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+	return &s, nil
+}
+
+// ListSnippets returns all snippets for a chat, ordered by name.
+func (d *DB) ListSnippets(ctx context.Context, chatID int64) ([]*Snippet, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT id, chat_id, name, content, created_at FROM snippets WHERE chat_id = ? ORDER BY name`,
+		chatID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var snippets []*Snippet
+	for rows.Next() {
+		var s Snippet
+		var createdAt string
+		if err := rows.Scan(&s.ID, &s.ChatID, &s.Name, &s.Content, &createdAt); err != nil {
+			return nil, err
+		}
+		s.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		snippets = append(snippets, &s)
+	}
+	return snippets, rows.Err()
+}
+
+// UpdateSnippet updates the content of an existing snippet.
+func (d *DB) UpdateSnippet(ctx context.Context, s *Snippet) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE snippets SET content = ? WHERE chat_id = ? AND name = ?`,
+		s.Content, s.ChatID, s.Name,
+	)
+	return err
+}
+
+// DeleteSnippet removes a snippet by chat_id and name.
+func (d *DB) DeleteSnippet(ctx context.Context, chatID int64, name string) error {
+	_, err := d.db.ExecContext(ctx,
+		`DELETE FROM snippets WHERE chat_id = ? AND name = ?`,
+		chatID, name)
+	return err
+}
+

@@ -29,6 +29,8 @@ User commands:
 /color [name] — set topic icon color (active, complete, blocked, error, review, research)
 /notify [mode] — set notification mode (live, summary, quiet)
 /context <thread_id> — fetch context from another topic and inject it
+/snippet <name> <content> — save a context snippet (use "delete <name>" to remove)
+/snippets — list all context snippets for this chat
 /info — show session info (model, cwd, session_id, messages, notification mode)
 /status — list active sessions in this group
 /sessions — list all sessions across all groups
@@ -201,6 +203,10 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply, err = h.cmdKill(ctx, update, args)
 	case "/dispatch":
 		reply, err = h.cmdDispatch(ctx, update, group, args)
+	case "/snippet":
+		reply, err = h.cmdSnippet(ctx, update, group, args)
+	case "/snippets":
+		reply, err = h.cmdSnippets(ctx, update, group)
 	default:
 		reply = fmt.Sprintf("Unknown command: %s\n\nUse /help for available commands.", cmd)
 	}
@@ -1607,14 +1613,113 @@ func (h *CommandHandler) cmdContext(ctx context.Context, update contract.Update,
 	return fmt.Sprintf("Context from thread %d will be included in your next prompt.", threadID), nil
 }
 
-// cmdSnippet handles /snippet — not implemented yet.
+// cmdSnippet handles /snippet <name> <content> — saves a context snippet.
+// Usage: /snippet <name> <content> — create or update a snippet
+//         /snippet delete <name> — remove a snippet
 func (h *CommandHandler) cmdSnippet(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
-	return "Snippet commands are not yet implemented.", nil
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return "Usage: /snippet <name> <content>\n       /snippet delete <name>\n\nCreates, updates, or deletes context snippets for this chat.\n\nExamples:\n  /snippet api-key sk-12345\n  /snippet project-root /home/user/project\n  /snippet delete old-key", nil
+	}
+
+	// Check if this is a delete command
+	if strings.HasPrefix(strings.ToLower(args), "delete ") {
+		name := strings.TrimSpace(args[7:])
+		if name == "" {
+			return "Usage: /snippet delete <name>", nil
+		}
+
+		// Check if snippet exists
+		existing, err := h.db.GetSnippet(ctx, update.ChatID, name)
+		if err != nil {
+			return "", fmt.Errorf("check snippet: %w", err)
+		}
+		if existing == nil {
+			return fmt.Sprintf("Snippet %q not found.", name), nil
+		}
+
+		// Delete the snippet
+		if err := h.db.DeleteSnippet(ctx, update.ChatID, name); err != nil {
+			return "", fmt.Errorf("delete snippet: %w", err)
+		}
+		return fmt.Sprintf("Deleted snippet: %s", name), nil
+	}
+
+	// Parse name and content
+	// The name is the first word, content is everything after
+	parts := strings.SplitN(args, " ", 2)
+	if len(parts) < 2 {
+		return "Usage: /snippet <name> <content>\n\nExample: /snippet api-key sk-12345", nil
+	}
+
+	name := strings.TrimSpace(parts[0])
+	content := strings.TrimSpace(parts[1])
+
+	if name == "" {
+		return "Snippet name cannot be empty.", nil
+	}
+
+	// Check if snippet already exists
+	existing, err := h.db.GetSnippet(ctx, update.ChatID, name)
+	if err != nil {
+		return "", fmt.Errorf("check snippet: %w", err)
+	}
+
+	var action string
+	if existing == nil {
+		// Create new snippet
+		snippet := &Snippet{
+			ChatID:  update.ChatID,
+			Name:    name,
+			Content: content,
+		}
+		if err := h.db.CreateSnippet(ctx, snippet); err != nil {
+			return "", fmt.Errorf("create snippet: %w", err)
+		}
+		action = "Created"
+	} else {
+		// Update existing snippet
+		existing.Content = content
+		if err := h.db.UpdateSnippet(ctx, existing); err != nil {
+			return "", fmt.Errorf("update snippet: %w", err)
+		}
+		action = "Updated"
+	}
+
+	return fmt.Sprintf("%s snippet: %s", action, name), nil
 }
 
-// cmdSnippets handles /snippets — not implemented yet.
+// cmdSnippets handles /snippets — lists all context snippets for this chat.
 func (h *CommandHandler) cmdSnippets(ctx context.Context, update contract.Update, group *Group) (string, error) {
-	return "Snippet commands are not yet implemented.", nil
+	if group == nil {
+		return "This group is not registered. Use /cwd <path> to register it.", nil
+	}
+
+	snippets, err := h.db.ListSnippets(ctx, update.ChatID)
+	if err != nil {
+		return "", fmt.Errorf("list snippets: %w", err)
+	}
+
+	if len(snippets) == 0 {
+		return "No snippets saved for this chat.\n\nUse /snippet <name> <content> to create one.", nil
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "📝 Context snippets (%d):\n\n", len(snippets))
+	for _, s := range snippets {
+		// Truncate content for display
+		displayContent := s.Content
+		if len(displayContent) > 50 {
+			displayContent = displayContent[:47] + "..."
+		}
+		fmt.Fprintf(&sb, "  • %s: %s\n", s.Name, displayContent)
+	}
+
+	return strings.TrimRight(sb.String(), "\n"), nil
 }
 
 // cmdCancel handles /cancel [thread_id] — cancels the running request in this topic.
