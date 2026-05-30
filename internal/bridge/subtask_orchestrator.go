@@ -166,10 +166,11 @@ func (o *SubtaskOrchestrator) executeSubtask(ctx context.Context, req SubtaskReq
 	if err := ptyMgr.WaitForStartup(paneTarget); err != nil {
 		return &subtaskResult{SubtaskID: subtaskID, Error: fmt.Errorf("startup: %w", err)}
 	}
+	preInjectScreen, _ := ptyMgr.CaptureScreen(paneTarget)
 	if err := ptyMgr.InjectPrompt(paneTarget, prompt); err != nil {
 		return &subtaskResult{SubtaskID: subtaskID, Error: fmt.Errorf("inject prompt: %w", err)}
 	}
-	result, err := ptyMgr.WaitForResponse(subCtx, paneTarget, nil)
+	result, err := ptyMgr.WaitForResponse(subCtx, paneTarget, preInjectScreen, nil)
 	if err != nil {
 		return &subtaskResult{SubtaskID: subtaskID, Error: fmt.Errorf("wait response: %w", err)}
 	}

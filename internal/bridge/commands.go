@@ -625,10 +625,11 @@ func (h *CommandHandler) generateSessionSummary(ctx context.Context, session *Se
 		return "", fmt.Errorf("wait for startup: %w", err)
 	}
 	const summaryPrompt = "Summarize what was accomplished in this session in 2-3 bullet points. Note any unfinished work or open questions."
+	preInjectScreen, _ := ptyMgr.CaptureScreen(paneTarget)
 	if err := ptyMgr.InjectPrompt(paneTarget, summaryPrompt); err != nil {
 		return "", fmt.Errorf("inject prompt: %w", err)
 	}
-	return ptyMgr.WaitForResponse(summCtx, paneTarget, nil)
+	return ptyMgr.WaitForResponse(summCtx, paneTarget, preInjectScreen, nil)
 }
 
 // cmdPing handles /ping — measures round-trip latency to the proxy /health endpoint.
@@ -1781,10 +1782,11 @@ func GenerateSessionSummary(ctx context.Context, session *Session, group *Group,
 		return "", fmt.Errorf("wait for startup: %w", err)
 	}
 	const summaryPrompt = "Summarize what was accomplished in this session in 2-3 bullet points. Note any unfinished work or open questions."
+	preInjectScreen2, _ := ptyMgr.CaptureScreen(paneTarget)
 	if err := ptyMgr.InjectPrompt(paneTarget, summaryPrompt); err != nil {
 		return "", fmt.Errorf("inject prompt: %w", err)
 	}
-	return ptyMgr.WaitForResponse(summCtx, paneTarget, nil)
+	return ptyMgr.WaitForResponse(summCtx, paneTarget, preInjectScreen2, nil)
 }
 
 // cmdParallel handles /parallel — runs up to 5 prompts in parallel.

@@ -122,10 +122,11 @@ func (sc *SessionCloser) generateSessionSummary(ctx context.Context, session *Se
 		return "", fmt.Errorf("wait for startup: %w", err)
 	}
 	const summaryPrompt = "Summarize what was accomplished in this session in 2-3 bullet points. Note any unfinished work or open questions."
+	preInjectScreen, _ := sc.ptyMgr.CaptureScreen(paneTarget)
 	if err := sc.ptyMgr.InjectPrompt(paneTarget, summaryPrompt); err != nil {
 		return "", fmt.Errorf("inject prompt: %w", err)
 	}
-	return sc.ptyMgr.WaitForResponse(summCtx, paneTarget, nil)
+	return sc.ptyMgr.WaitForResponse(summCtx, paneTarget, preInjectScreen, nil)
 }
 
 // postJSON is a helper for POST requests to the proxy.

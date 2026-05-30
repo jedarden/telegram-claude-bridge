@@ -206,16 +206,21 @@ func (p *PTYManager) CaptureScreen(paneTarget string) (string, error) {
 }
 
 // WaitForResponse polls the pane until claude finishes responding.
-// It detects the start of a response by the ● sentinel (responseStartRune) and
-// the end either by the ❯ prompt (promptRune) reappearing after ● or by
-// ptyIdleTimeout seconds of unchanged screen content.
+// preInjectScreen is the screen content captured immediately before the prompt
+// was injected; it is used to determine the baseline bullet count so that
+// pre-existing ● markers (from startup or prior responses) do not trigger a
+// false-positive response-start detection.
 // onChunk is called with accumulating response text for live streaming; may be nil.
-func (p *PTYManager) WaitForResponse(ctx context.Context, paneTarget string, onChunk func(text string)) (string, error) {
+func (p *PTYManager) WaitForResponse(ctx context.Context, paneTarget string, preInjectScreen string, onChunk func(text string)) (string, error) {
 	preRespDeadline := time.Now().Add(preRespTimeout)
 	responseStarted := false
 	lastScreen := ""
 	lastChange := time.Now()
 	var lastText string
+
+	// Count bullets already on screen before our prompt was sent.
+	// A new response starts only when the count increases beyond this baseline.
+	baselineBullets := strings.Count(preInjectScreen, string(responseStartRune))
 
 	for {
 		select {
@@ -235,8 +240,9 @@ func (p *PTYManager) WaitForResponse(ctx context.Context, paneTarget string, onC
 		}
 
 		if !responseStarted {
-			if strings.ContainsRune(screen, responseStartRune) {
+			if strings.Count(screen, string(responseStartRune)) > baselineBullets {
 				responseStarted = true
+				log.Printf("[pty_mgr] response started on %s (baseline=%d)", paneTarget, baselineBullets)
 				lastScreen = screen
 				lastChange = time.Now()
 			} else if time.Now().After(preRespDeadline) {
@@ -261,7 +267,9 @@ func (p *PTYManager) WaitForResponse(ctx context.Context, paneTarget string, onC
 		}
 
 		// Response complete: ❯ appears after the last ●, or idle timeout.
-		if responseComplete(screen) || time.Since(lastChange) >= ptyIdleTimeout {
+		idled := time.Since(lastChange) >= ptyIdleTimeout
+		if responseComplete(screen) || idled {
+			log.Printf("[pty_mgr] WaitForResponse %s complete: text_len=%d idle=%v", paneTarget, len(lastText), idled)
 			return lastText, nil
 		}
 
@@ -290,8 +298,10 @@ func responseComplete(screen string) bool {
 	return false
 }
 
-// extractResponseText finds the last ● in the screen and returns the text after it,
-// stopping before any trailing ❯ line.
+// extractResponseText finds the last ● in the screen and returns the text
+// associated with it, stopping before any trailing ❯ line.
+// Text on the same line as ● (after the ● character) is included, which covers
+// Claude's compact rendering where the response starts inline with the sentinel.
 func extractResponseText(screen string) string {
 	lines := strings.Split(screen, "\n")
 
@@ -306,6 +316,14 @@ func extractResponseText(screen string) string {
 	}
 
 	var result []string
+	// Include any text on the ● line itself (after the ● character).
+	bulletLine := lines[bulletIdx]
+	if idx := strings.IndexRune(bulletLine, responseStartRune); idx >= 0 {
+		afterBullet := strings.TrimSpace(bulletLine[idx+len(string(responseStartRune)):])
+		if afterBullet != "" {
+			result = append(result, afterBullet)
+		}
+	}
 	for i := bulletIdx + 1; i < len(lines); i++ {
 		line := lines[i]
 		// Stop at the ❯ prompt line.

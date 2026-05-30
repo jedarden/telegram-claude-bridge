@@ -148,12 +148,13 @@ func (wp *WorkerPool) runWorker(
 		wp.finishWorker(worker, index, "", fmt.Sprintf("startup: %v", err))
 		return
 	}
+	preInjectScreen, _ := ptyMgr.CaptureScreen(paneTarget)
 	if err := ptyMgr.InjectPrompt(paneTarget, prompt); err != nil {
 		wp.finishWorker(worker, index, "", fmt.Sprintf("inject prompt: %v", err))
 		return
 	}
 
-	result, err := ptyMgr.WaitForResponse(ctx, paneTarget, nil)
+	result, err := ptyMgr.WaitForResponse(ctx, paneTarget, preInjectScreen, nil)
 	if err != nil {
 		wp.finishWorker(worker, index, "", fmt.Sprintf("wait response: %v", err))
 		return

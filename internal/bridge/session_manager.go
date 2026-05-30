@@ -1364,7 +1364,10 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 
 	text := out.Result
 	if text == "" && out.StreamMsgID != 0 {
-		// Streaming happened but result is empty — leave the last streamed update as-is.
+		// result is empty; replace the streaming message (still showing "⏳ Thinking…")
+		// rather than silently abandoning it.
+		log.Printf("[session_mgr] empty result for (%d,%d), editing placeholder", key.chatID, key.threadID)
+		_ = m.sender.EditMessage(ctx, key.chatID, out.StreamMsgID, "(no response)")
 		return
 	}
 	if text == "" {
@@ -1550,6 +1553,10 @@ func (m *SessionManager) invokeClaudeAPI(
 		}
 	}
 
+	// Capture screen before injecting so WaitForResponse can distinguish
+	// pre-existing ● markers (from startup or prior responses) from the new one.
+	preInjectScreen, _ := m.ptyMgr.CaptureScreen(paneTarget)
+
 	// Inject the prompt via bracketed paste.
 	if err := m.ptyMgr.InjectPrompt(paneTarget, prompt); err != nil {
 		return nil, fmt.Errorf("inject prompt: %w", err)
@@ -1577,7 +1584,7 @@ func (m *SessionManager) invokeClaudeAPI(
 		}
 	}
 
-	result, waitErr := m.ptyMgr.WaitForResponse(subprocCtx, paneTarget, onChunk)
+	result, waitErr := m.ptyMgr.WaitForResponse(subprocCtx, paneTarget, preInjectScreen, onChunk)
 	if waitErr != nil {
 		m.ptyMgr.KillPane(paneTarget)
 		m.mu.Lock()
@@ -2975,10 +2982,11 @@ func (m *SessionManager) createClaudeSession(ctx context.Context, group *Group, 
 	if err := m.ptyMgr.WaitForStartup(paneTarget); err != nil {
 		return "", fmt.Errorf("wait for startup: %w", err)
 	}
+	preInjectScreen, _ := m.ptyMgr.CaptureScreen(paneTarget)
 	if err := m.ptyMgr.InjectPrompt(paneTarget, prompt); err != nil {
 		return "", fmt.Errorf("inject prompt: %w", err)
 	}
-	if _, err := m.ptyMgr.WaitForResponse(ctx, paneTarget, nil); err != nil {
+	if _, err := m.ptyMgr.WaitForResponse(ctx, paneTarget, preInjectScreen, nil); err != nil {
 		return "", fmt.Errorf("wait for response: %w", err)
 	}
 
