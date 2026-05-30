@@ -10,23 +10,25 @@ import (
 // SessionCleanup manages periodic cleanup of stale sessions.
 // It marks inactive sessions and optionally closes their Telegram topics.
 type SessionCleanup struct {
-	db                   *DB
-	sender               *Sender
-	interval             time.Duration
-	ttl                  time.Duration
-	closeTopics          bool
-	cancel               context.CancelFunc
-	done                 chan struct{}
+	db          *DB
+	sender      *Sender
+	ptyMgr      *PTYManager
+	interval    time.Duration
+	ttl         time.Duration
+	closeTopics bool
+	cancel      context.CancelFunc
+	done        chan struct{}
 }
 
 // NewSessionCleanup creates a new SessionCleanup instance.
 // interval is how often to run cleanup (e.g., 1 hour).
 // ttl is the time after which a session is considered stale (e.g., 7 days).
 // closeTopics controls whether to close Telegram topics for inactive sessions.
-func NewSessionCleanup(db *DB, sender *Sender, interval, ttl time.Duration, closeTopics bool) *SessionCleanup {
+func NewSessionCleanup(db *DB, sender *Sender, ptyMgr *PTYManager, interval, ttl time.Duration, closeTopics bool) *SessionCleanup {
 	return &SessionCleanup{
 		db:          db,
 		sender:      sender,
+		ptyMgr:      ptyMgr,
 		interval:    interval,
 		ttl:         ttl,
 		closeTopics: closeTopics,
@@ -99,7 +101,7 @@ func (sc *SessionCleanup) runCleanup(ctx context.Context) {
 
 		// Generate summary if we have a valid group
 		if group != nil {
-			summary, summaryErr := GenerateSessionSummary(ctx, sess, group, "")
+			summary, summaryErr := GenerateSessionSummary(ctx, sess, group, sc.ptyMgr)
 			if summaryErr != nil {
 				log.Printf("[cleanup] generate summary failed for (%d,%d): %v",
 					sess.ChatID, sess.ThreadID, summaryErr)

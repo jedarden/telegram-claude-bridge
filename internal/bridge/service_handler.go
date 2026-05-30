@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os/exec"
-	"strings"
 	"time"
 
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
@@ -22,15 +20,17 @@ type SessionCloser struct {
 	sender   *Sender
 	proxyURL string
 	client   *http.Client
+	ptyMgr   *PTYManager
 }
 
 // NewSessionCloser creates a SessionCloser with the given dependencies.
-func NewSessionCloser(db *DB, sender *Sender, proxyURL string, client *http.Client) *SessionCloser {
+func NewSessionCloser(db *DB, sender *Sender, proxyURL string, client *http.Client, ptyMgr *PTYManager) *SessionCloser {
 	return &SessionCloser{
 		db:       db,
 		sender:   sender,
 		proxyURL: proxyURL,
 		client:   client,
+		ptyMgr:   ptyMgr,
 	}
 }
 
@@ -98,45 +98,34 @@ func (sc *SessionCloser) CloseSessionWithSummary(ctx context.Context, chatID, th
 	return nil
 }
 
-// generateSessionSummary sends a summary prompt to Claude and returns the result.
-// Uses Haiku (the cheapest model) regardless of the session's model setting.
+// generateSessionSummary asks Claude to summarize the session via a transient PTY pane.
 func (sc *SessionCloser) generateSessionSummary(ctx context.Context, session *Session, group *Group) (string, error) {
-	// Use a timeout context for summary generation
-	summCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	summCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
+	paneName := fmt.Sprintf("sum-%d", time.Now().UnixNano())
 	args := []string{
-		"-p",
-		"--output-format", "json",
-		"--model", "claude-haiku-4-5", // Always use the cheapest model for summaries
 		"--dangerously-skip-permissions",
+		"--model", "claude-haiku-4-5",
 	}
 	if session.SessionID != "" {
 		args = append(args, "--resume", session.SessionID)
 	}
 
-	cmd := exec.CommandContext(summCtx, "claude", args...)
-	cmd.Dir = group.CWD
-	cmd.Stdin = strings.NewReader("Summarize what was accomplished in this session in 2-3 bullet points. Note any unfinished work or open questions.")
-
-	output, err := cmd.Output()
+	paneTarget, err := sc.ptyMgr.SpawnPane(paneName, group.CWD, args)
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("claude exited %d: %s", exitErr.ExitCode(), string(exitErr.Stderr))
-		}
-		return "", fmt.Errorf("run claude: %w", err)
+		return "", fmt.Errorf("spawn summary pane: %w", err)
 	}
+	defer sc.ptyMgr.KillPane(paneTarget)
 
-	// Parse JSON output
-	var out claudeOutput
-	if err := json.Unmarshal(output, &out); err != nil {
-		return "", fmt.Errorf("parse claude output: %w", err)
+	if err := sc.ptyMgr.WaitForStartup(paneTarget); err != nil {
+		return "", fmt.Errorf("wait for startup: %w", err)
 	}
-	if out.IsError {
-		return "", fmt.Errorf("claude error: %s", out.Result)
+	const summaryPrompt = "Summarize what was accomplished in this session in 2-3 bullet points. Note any unfinished work or open questions."
+	if err := sc.ptyMgr.InjectPrompt(paneTarget, summaryPrompt); err != nil {
+		return "", fmt.Errorf("inject prompt: %w", err)
 	}
-
-	return out.Result, nil
+	return sc.ptyMgr.WaitForResponse(summCtx, paneTarget, nil)
 }
 
 // postJSON is a helper for POST requests to the proxy.
@@ -205,8 +194,8 @@ type ServiceHandler struct {
 }
 
 // NewServiceHandler creates a ServiceHandler with the given dependencies.
-func NewServiceHandler(db *DB, sender *Sender, proxyURL string, client *http.Client) *ServiceHandler {
-	sessionCloser := NewSessionCloser(db, sender, proxyURL, client)
+func NewServiceHandler(db *DB, sender *Sender, proxyURL string, client *http.Client, ptyMgr *PTYManager) *ServiceHandler {
+	sessionCloser := NewSessionCloser(db, sender, proxyURL, client, ptyMgr)
 	return &ServiceHandler{
 		db:            db,
 		sender:        sender,

@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -597,45 +596,39 @@ func (h *CommandHandler) cmdClose(ctx context.Context, update contract.Update, g
 	return fmt.Sprintf("Session closed and marked complete (thread %d).", threadID), nil
 }
 
-// generateSessionSummary sends a summary prompt to Claude and returns the result.
+// generateSessionSummary asks Claude to summarize the session via a transient PTY pane.
 // Uses Haiku (the cheapest model) regardless of the session's model setting.
 func (h *CommandHandler) generateSessionSummary(ctx context.Context, session *Session, group *Group) (string, error) {
-	// Use a timeout context for summary generation
-	summCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	if h.sessionMgr == nil {
+		return "", fmt.Errorf("session manager not available")
+	}
+	summCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
+	ptyMgr := h.sessionMgr.PTYManager()
+	paneName := fmt.Sprintf("sum-%d", time.Now().UnixNano())
 	args := []string{
-		"-p",
-		"--output-format", "json",
-		"--model", "claude-haiku-4-5", // Always use the cheapest model for summaries
 		"--dangerously-skip-permissions",
+		"--model", "claude-haiku-4-5",
 	}
 	if session.SessionID != "" {
 		args = append(args, "--resume", session.SessionID)
 	}
 
-	cmd := exec.CommandContext(summCtx, "claude", args...)
-	cmd.Dir = group.CWD
-	cmd.Stdin = strings.NewReader("Summarize what was accomplished in this session in 2-3 bullet points. Note any unfinished work or open questions.")
-
-	output, err := cmd.Output()
+	paneTarget, err := ptyMgr.SpawnPane(paneName, group.CWD, args)
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("claude exited %d: %s", exitErr.ExitCode(), string(exitErr.Stderr))
-		}
-		return "", fmt.Errorf("run claude: %w", err)
+		return "", fmt.Errorf("spawn summary pane: %w", err)
 	}
+	defer ptyMgr.KillPane(paneTarget)
 
-	// Parse JSON output
-	var out claudeOutput
-	if err := json.Unmarshal(output, &out); err != nil {
-		return "", fmt.Errorf("parse claude output: %w", err)
+	if err := ptyMgr.WaitForStartup(paneTarget); err != nil {
+		return "", fmt.Errorf("wait for startup: %w", err)
 	}
-	if out.IsError {
-		return "", fmt.Errorf("claude error: %s", out.Result)
+	const summaryPrompt = "Summarize what was accomplished in this session in 2-3 bullet points. Note any unfinished work or open questions."
+	if err := ptyMgr.InjectPrompt(paneTarget, summaryPrompt); err != nil {
+		return "", fmt.Errorf("inject prompt: %w", err)
 	}
-
-	return out.Result, nil
+	return ptyMgr.WaitForResponse(summCtx, paneTarget, nil)
 }
 
 // cmdPing handles /ping — measures round-trip latency to the proxy /health endpoint.
@@ -988,20 +981,12 @@ func (h *CommandHandler) cmdNew(ctx context.Context, update contract.Update, gro
 	}
 	threadID := createResp.ThreadID
 
-	// Step 2: Run claude -p to create a session and get session_id
-	prompt := fmt.Sprintf("New task: %s. How can I help?", topicName)
-	sessionID, err := h.createClaudeSession(ctx, group, prompt)
-	if err != nil {
-		// Best-effort: try to close the topic we just created
-		_ = h.closeTopic(ctx, update.ChatID, threadID)
-		return "", fmt.Errorf("create Claude session: %w", err)
-	}
-
-	// Step 3: Create the session record in the database
+	// Step 2: Create the session record in the database.
+	// The session_id will be captured from ~/.claude/projects/ on the first message.
 	session := &Session{
 		ChatID:    update.ChatID,
 		ThreadID:  threadID,
-		SessionID: sessionID,
+		SessionID: "",
 		CWD:       group.CWD,
 		Model:     resolveSessionModel(nil, group),
 		Status:    "active",
@@ -1010,11 +995,11 @@ func (h *CommandHandler) cmdNew(ctx context.Context, update contract.Update, gro
 		return "", fmt.Errorf("create session record: %w", err)
 	}
 
-	// Step 4: Send the metadata message to the new topic
+	// Step 3: Send the metadata message to the new topic
 	tidPtr := &threadID
 	startTime := time.Now().Format("2006-01-02 15:04:05")
-	metadata := fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: 0\nCost: $0.00",
-		sessionID, group.CWD, session.Model, startTime)
+	metadata := fmt.Sprintf("Session: (pending first message)\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: 0\nCost: $0.00",
+		group.CWD, session.Model, startTime)
 	var sendReq contract.SendRequest
 	sendReq.ChatID = update.ChatID
 	sendReq.ThreadID = tidPtr
@@ -1024,13 +1009,13 @@ func (h *CommandHandler) cmdNew(ctx context.Context, update contract.Update, gro
 		return "", fmt.Errorf("send metadata message: %w", err)
 	}
 
-	// Step 5: Pin the metadata message
+	// Step 4: Pin the metadata message
 	if err := h.pinMessage(ctx, update.ChatID, sendResp.MessageID); err != nil {
 		log.Printf("[bridge/commands] pin message failed: %v", err)
 		// Non-fatal: continue anyway
 	}
 
-	// Step 6: Store the pinned message ID in the session
+	// Step 5: Store the pinned message ID in the session
 	session.PinnedMessageID = sendResp.MessageID
 	if err := h.db.UpdateSession(ctx, session); err != nil {
 		log.Printf("[bridge/commands] update session with pinned message id: %v", err)
@@ -1042,47 +1027,6 @@ func (h *CommandHandler) cmdNew(ctx context.Context, update contract.Update, gro
 		userStr, update.ChatID, threadID, topicName)
 
 	return fmt.Sprintf("Created topic: %s (thread_id: %d)", topicName, threadID), nil
-}
-
-// createClaudeSession runs claude -p with the given prompt and returns the session_id.
-func (h *CommandHandler) createClaudeSession(ctx context.Context, group *Group, prompt string) (string, error) {
-	args := []string{
-		"-p",
-		"--output-format", "json",
-		"--dangerously-skip-permissions",
-		"--model", resolveSessionModel(nil, group),
-	}
-
-	// Add tool restrictions if configured
-	allowed, disallowed := resolveToolRestrictions(group)
-	if allowed != "" {
-		args = append(args, "--allowed-tools", allowed)
-	}
-	if disallowed != "" {
-		args = append(args, "--disallowed-tools", disallowed)
-	}
-
-	cmd := exec.CommandContext(ctx, "claude", args...)
-	cmd.Dir = group.CWD
-	cmd.Stdin = strings.NewReader(prompt)
-
-	output, err := cmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("claude exited %d: %s", exitErr.ExitCode(), string(exitErr.Stderr))
-		}
-		return "", fmt.Errorf("run claude: %w", err)
-	}
-
-	// Parse JSON output to get session_id
-	var out claudeOutput
-	if err := json.Unmarshal(output, &out); err != nil {
-		return "", fmt.Errorf("parse claude output: %w", err)
-	}
-	if out.SessionID == "" {
-		return "", fmt.Errorf("claude returned empty session_id")
-	}
-	return out.SessionID, nil
 }
 
 // pinMessage calls POST /pin_message on the proxy.
@@ -1811,47 +1755,37 @@ func (h *CommandHandler) cmdTimeout(ctx context.Context, update contract.Update,
 	return fmt.Sprintf("Topic timeout set to: %d seconds", newTimeout), nil
 }
 
-	// GenerateSessionSummary generates a summary for a session using Haiku.
-	// This is a standalone helper that can be used by both CommandHandler and SessionCleanup.
-	// Returns (summary, error) — summary is empty if generation fails.
-	func GenerateSessionSummary(ctx context.Context, session *Session, group *Group, proxyURL string) (string, error) {
-		// Use a timeout context for summary generation
-		summCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		defer cancel()
+// GenerateSessionSummary generates a summary for a session via a transient PTY pane.
+// This is a standalone helper that can be used by both CommandHandler and SessionCleanup.
+// Returns (summary, error) — summary is empty if generation fails.
+func GenerateSessionSummary(ctx context.Context, session *Session, group *Group, ptyMgr *PTYManager) (string, error) {
+	summCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
 
-		args := []string{
-			"-p",
-			"--output-format", "json",
-			"--model", "claude-haiku-4-5", // Always use the cheapest model for summaries
-			"--dangerously-skip-permissions",
-		}
-		if session.SessionID != "" {
-			args = append(args, "--resume", session.SessionID)
-		}
-
-		cmd := exec.CommandContext(summCtx, "claude", args...)
-		cmd.Dir = group.CWD
-		cmd.Stdin = strings.NewReader("Summarize what was accomplished in this session in 2-3 bullet points. Note any unfinished work or open questions.")
-
-		output, err := cmd.Output()
-		if err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				return "", fmt.Errorf("claude exited %d: %s", exitErr.ExitCode(), string(exitErr.Stderr))
-			}
-			return "", fmt.Errorf("run claude: %w", err)
-		}
-
-		// Parse JSON output
-		var out claudeOutput
-		if err := json.Unmarshal(output, &out); err != nil {
-			return "", fmt.Errorf("parse claude output: %w", err)
-		}
-		if out.IsError {
-			return "", fmt.Errorf("claude error: %s", out.Result)
-		}
-
-		return out.Result, nil
+	paneName := fmt.Sprintf("sum-%d", time.Now().UnixNano())
+	args := []string{
+		"--dangerously-skip-permissions",
+		"--model", "claude-haiku-4-5",
 	}
+	if session.SessionID != "" {
+		args = append(args, "--resume", session.SessionID)
+	}
+
+	paneTarget, err := ptyMgr.SpawnPane(paneName, group.CWD, args)
+	if err != nil {
+		return "", fmt.Errorf("spawn summary pane: %w", err)
+	}
+	defer ptyMgr.KillPane(paneTarget)
+
+	if err := ptyMgr.WaitForStartup(paneTarget); err != nil {
+		return "", fmt.Errorf("wait for startup: %w", err)
+	}
+	const summaryPrompt = "Summarize what was accomplished in this session in 2-3 bullet points. Note any unfinished work or open questions."
+	if err := ptyMgr.InjectPrompt(paneTarget, summaryPrompt); err != nil {
+		return "", fmt.Errorf("inject prompt: %w", err)
+	}
+	return ptyMgr.WaitForResponse(summCtx, paneTarget, nil)
+}
 
 // cmdParallel handles /parallel — runs up to 5 prompts in parallel.
 // Prompts are delimited by --- on its own line.

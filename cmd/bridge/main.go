@@ -89,6 +89,8 @@ func main() {
 	defer sessionMgr.Shutdown()
 	cmdHandler.SetSessionManager(sessionMgr)
 
+	ptyMgr := sessionMgr.PTYManager()
+
 	// Create subtask orchestrator and wire it to command handler
 	subtaskOrchestrator := bridge.NewSubtaskOrchestrator(db, sender, sessionMgr)
 	cmdHandler.SetSubtaskOrchestrator(subtaskOrchestrator)
@@ -98,11 +100,11 @@ func main() {
 	cmdHandler.SetBackgroundJobManager(bgJobMgr)
 
 	// Create session cleanup (disabled if interval is 0)
-	cleanup := bridge.NewSessionCleanup(db, sender, cfg.SessionCleanupInterval, cfg.SessionTTL, cfg.CloseInactiveTopics)
+	cleanup := bridge.NewSessionCleanup(db, sender, ptyMgr, cfg.SessionCleanupInterval, cfg.SessionTTL, cfg.CloseInactiveTopics)
 	cleanup.Start()
 	defer cleanup.Stop()
 
-	serviceHandler := bridge.NewServiceHandler(db, sender, cfg.ProxyURL, &http.Client{Timeout: 10 * time.Second})
+	serviceHandler := bridge.NewServiceHandler(db, sender, cfg.ProxyURL, &http.Client{Timeout: 10 * time.Second}, ptyMgr)
 
 	// Create callback handler for inline keyboard interactions
 	callbackHandler := bridge.NewCallbackHandler(db, sender, cfg.ProxyURL, &http.Client{Timeout: 10 * time.Second}, sessionMgr)

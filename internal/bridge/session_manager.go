@@ -1,15 +1,11 @@
 package bridge
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -27,10 +23,6 @@ const (
 
 	// noTimeout is the sentinel value for timeout_sec meaning "run indefinitely".
 	noTimeout = 0
-
-	// scannerMaxBuf is the max line size for the bufio.Scanner reading stream-json
-	// output. Claude responses can exceed the 64KB default.
-	scannerMaxBuf = 1 << 20 // 1MB
 
 	// streamDebounce is the minimum interval between progressive Telegram edits.
 	streamDebounce = 1 * time.Second
@@ -402,6 +394,7 @@ type SessionManager struct {
 	proxyURL       string
 	workerPool     *WorkerPool
 	eventPublisher events.Publishable
+	ptyMgr         *PTYManager
 
 	mu                    sync.Mutex
 	topics                map[topicKey]*topicWorker
@@ -410,6 +403,7 @@ type SessionManager struct {
 	pendingWorkerResults  map[topicKey][]WorkerResult    // completed worker results to inject into next prompt
 	activeInvocations     map[topicKey]*activeInvocation // tracks running commands for cancellation
 	approvalChans         map[topicKey]chan toolApproval // tool approval channels for plan mode
+	paneNames             map[topicKey]string            // topicKey → active tmux pane target
 }
 
 type topicKey struct {
@@ -417,11 +411,10 @@ type topicKey struct {
 	threadID int64
 }
 
-// activeInvocation tracks a running Claude subprocess for cancellation.
+// activeInvocation tracks a running Claude invocation for cancellation.
 type activeInvocation struct {
-	cmd           *exec.Cmd
 	placeholderID int64
-	mu            sync.Mutex // guards cmd
+	mu            sync.Mutex
 }
 
 // topicWorker owns the channel and goroutine for a single forum topic.
@@ -612,15 +605,22 @@ func NewSessionManager(db *DB, sender *Sender, proxyURL string, eventPublisher e
 		sender:               sender,
 		proxyURL:             proxyURL,
 		eventPublisher:       eventPublisher,
+		ptyMgr:               NewPTYManager(),
 		topics:               make(map[topicKey]*topicWorker),
 		pinnedUpdateLastSeen: make(map[topicKey]time.Time),
 		pendingContext:       make(map[topicKey]string),
 		pendingWorkerResults: make(map[topicKey][]WorkerResult),
 		activeInvocations:    make(map[topicKey]*activeInvocation),
 		approvalChans:        make(map[topicKey]chan toolApproval),
+		paneNames:            make(map[topicKey]string),
 	}
 	m.workerPool = NewWorkerPool(db, sender, m)
 	return m
+}
+
+// PTYManager returns the shared PTYManager for use by other bridge components.
+func (m *SessionManager) PTYManager() *PTYManager {
+	return m.ptyMgr
 }
 
 // Handle implements SessionHandlerFunc and is registered as router.OnSession.
@@ -1330,14 +1330,21 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 			_ = m.updateTopicColor(ctx, key.chatID, key.threadID, ColorError)
 		}
 
+		var errText string
 		if callCtx.Err() == context.DeadlineExceeded {
 			log.Printf("[session_mgr] timeout for (%d,%d) after %ds", key.chatID, key.threadID, timeoutSec)
-			_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID,
-				"⚠️ Request timed out. The session is intact — you can try again.")
+			errText = "⚠️ Request timed out. The session is intact — you can try again."
 		} else {
 			log.Printf("[session_mgr] claude error for (%d,%d): %v", key.chatID, key.threadID, err)
-			_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID,
-				fmt.Sprintf("⚠️ Error: %v", err))
+			errText = fmt.Sprintf("⚠️ Error: %v", err)
+		}
+		// Replace the placeholder with the error rather than leaving "Thinking…" orphaned.
+		if placeholderID != 0 {
+			if editErr := m.sender.EditMessage(ctx, key.chatID, placeholderID, errText); editErr != nil {
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, errText)
+			}
+		} else {
+			_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, errText)
 		}
 		return
 	}
@@ -1442,15 +1449,11 @@ func (m *SessionManager) resolveSessionGroup(ctx context.Context, key topicKey, 
 	return session, group, nil
 }
 
-// invokeClaudeAPI runs the claude subprocess with --output-format stream-json,
-// reads NDJSON lines via bufio.Scanner, accumulates text_delta events into
-// progressive Telegram edits, and returns the final parsed output.
-//
-// subprocCtx controls the claude subprocess lifetime (may have a deadline).
-// sendCtx is used for all Telegram API sends and must not have a deadline tied
-// to the subprocess timeout — this ensures the final streamed update always
-// reaches Telegram even when the subprocess is killed by a deadline.
-// notificationMode controls streaming behavior: "live" (stream), "summary" (no stream), "quiet" (no stream, minimal output).
+// invokeClaudeAPI runs claude interactively via a tmux pane (PTY mode).
+// Session continuity is maintained via --resume when a session_id exists.
+// Panes are kept warm for pane_idle_ttl seconds after each response and
+// culled (killed) on expiry; the next message triggers a cold resume.
+// Billing uses subscription (not API credits) because claude runs in a real TTY.
 func (m *SessionManager) invokeClaudeAPI(
 	subprocCtx context.Context,
 	sendCtx context.Context,
@@ -1464,569 +1467,184 @@ func (m *SessionManager) invokeClaudeAPI(
 	placeholderID int64,
 	notificationMode string,
 ) (*claudeOutput, error) {
-	args := []string{
-		"-p",
-		"--output-format", "stream-json",
-		"--verbose",
-		"--permission-mode", resolvePermissionMode(group),
-		"--model", resolveSessionModel(session, group),
+	// Pane name: "t<absChatID>-<threadID>" (short, tmux-safe).
+	absChatID := chatID
+	if absChatID < 0 {
+		absChatID = -absChatID
 	}
-
-	// Add tool restrictions if configured
-	allowed, disallowed := resolveToolRestrictions(group)
-	if allowed != "" {
-		args = append(args, "--allowed-tools", allowed)
+	var paneName string
+	if threadID != nil {
+		paneName = fmt.Sprintf("t%d-%d", absChatID, *threadID)
+	} else {
+		paneName = fmt.Sprintf("t%d-0", absChatID)
 	}
-	if disallowed != "" {
-		args = append(args, "--disallowed-tools", disallowed)
-	}
+	paneTarget := fmt.Sprintf("%s:%s", tmuxSessionName, paneName)
 
-	if session != nil && session.SessionID != "" {
-		args = append(args, "--resume", session.SessionID)
-	}
+	// Cancel any pending idle timer — we're active now.
+	m.ptyMgr.CancelIdleTimer(paneTarget)
 
-	// Inject dispatcher system prompt when dispatcher mode is enabled.
-	if isDispatcherEnabled(session, group) {
-		args = append(args, "--append-system-prompt", dispatcherSystemPrompt)
-	}
+	warm := m.ptyMgr.PaneAlive(paneTarget)
+	startTime := time.Now()
 
-	cmd := exec.CommandContext(subprocCtx, "claude", args...)
-	cmd.Dir = group.CWD
+	// Snapshot existing session files before spawning so FindNewSession can identify
+	// which file was created by the bridge's Claude process (not another concurrent
+	// Claude session on the same machine).
+	sessionSnapshot := SnapshotSessionFiles(group.CWD)
 
-	// Use io.Pipe for stdin so we can write tool results back for synthetic tools
-	stdinR, stdinW := io.Pipe()
-	cmd.Stdin = stdinR
-	defer stdinW.Close()
-
-	// Write the initial prompt in a goroutine to avoid blocking
-	go func() {
-		defer stdinW.Close()
-		if _, err := io.WriteString(stdinW, prompt); err != nil {
-			log.Printf("[session_mgr] write prompt to stdin: %v", err)
+	if !warm {
+		// Cold path: spawn a new pane.
+		args := []string{
+			"--dangerously-skip-permissions",
+			"--model", resolveSessionModel(session, group),
 		}
-	}()
+		allowed, disallowed := resolveToolRestrictions(group)
+		if allowed != "" {
+			args = append(args, "--allowed-tools", allowed)
+		}
+		if disallowed != "" {
+			args = append(args, "--disallowed-tools", disallowed)
+		}
+		if session != nil && session.SessionID != "" {
+			args = append(args, "--resume", session.SessionID)
+		}
 
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-	// Use stderrPipe for approval prompt detection in plan mode
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stderr pipe: %w", err)
-	}
-	var stderrBuf bytes.Buffer
-	stderrReader := io.TeeReader(stderrPipe, &stderrBuf)
+		var spawnErr error
+		paneTarget, spawnErr = m.ptyMgr.SpawnPane(paneName, group.CWD, args)
+		if spawnErr != nil {
+			return nil, fmt.Errorf("spawn pane: %w", spawnErr)
+		}
+		if err := m.ptyMgr.WaitForStartup(paneTarget); err != nil {
+			m.ptyMgr.KillPane(paneTarget) // don't leave a broken pane alive for the warm path
+			return nil, fmt.Errorf("wait for startup: %w", err)
+		}
 
-	// Register the active command for cancellation before starting
-	active := &activeInvocation{
-		cmd:           cmd,
-		placeholderID: placeholderID,
+		m.mu.Lock()
+		m.paneNames[key] = paneTarget
+		m.mu.Unlock()
 	}
+
+	// Register for cancellation.
+	active := &activeInvocation{placeholderID: placeholderID}
 	m.mu.Lock()
 	m.activeInvocations[key] = active
 	m.mu.Unlock()
-
-	// Ensure cleanup on all exit paths
 	defer func() {
 		m.mu.Lock()
 		delete(m.activeInvocations, key)
 		m.mu.Unlock()
 	}()
 
-	// Capture start time before subprocess begins for media detection
-	startTime := time.Now()
+	enableStreaming := notificationMode == "live"
+	var streamMsgID int64
 
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start claude: %w", err)
-	}
-
-	// Set up approval channel for this topic (plan mode)
-	approvalChan := make(chan toolApproval, 1)
-	m.mu.Lock()
-	m.approvalChans[key] = approvalChan
-	m.mu.Unlock()
-	defer func() {
-		m.mu.Lock()
-		delete(m.approvalChans, key)
-		m.mu.Unlock()
-		close(approvalChan)
-	}()
-
-	// Start stderr scanner goroutine to detect approval prompts
-	go func() {
-		scanner := bufio.NewScanner(stderrReader)
-		var toolCounter int64 // Incrementing counter for tool approval indexes
-		for scanner.Scan() {
-			line := scanner.Text()
-			log.Printf("[session_mgr] stderr: %s", line)
-
-			// Check for approval prompt pattern: "Allow use of tool: X with input: Y? (y/n)"
-			if strings.Contains(line, "Allow use of tool:") && strings.Contains(line, "? (y/n)") {
-				// Parse tool name and input from the prompt
-				// Format: "Allow use of tool: <tool_name> with input: <input_json>? (y/n)"
-				toolName := ""
-				toolInput := "{}"
-
-				// Extract tool name
-				if idx := strings.Index(line, "tool: "); idx != -1 {
-					remaining := line[idx+6:]
-					if endIdx := strings.Index(remaining, " with input:"); endIdx != -1 {
-						toolName = strings.TrimSpace(remaining[:endIdx])
-					}
-				}
-
-				// Extract tool input
-				if idx := strings.Index(line, "input: "); idx != -1 {
-					remaining := line[idx+7:]
-					if endIdx := strings.Index(remaining, "? (y/n)"); endIdx != -1 {
-						toolInput = strings.TrimSpace(remaining[:endIdx])
-					}
-				}
-
-				log.Printf("[session_mgr] approval prompt: tool=%s input=%s", toolName, toolInput)
-
-				// Send inline keyboard to Telegram
-				toolCounter++
-				toolIndex := toolCounter
-				if _, err := m.sender.SendToolApprovalPrompt(sendCtx, chatID, threadID, toolName, toolInput, toolIndex); err != nil {
-					log.Printf("[session_mgr] send approval prompt: %v", err)
-				}
-
-				// Wait for user approval/denial with matching toolIndex
-				// Loop until we receive an approval for this specific tool (ignore stale approvals)
-				for {
-					select {
-					case approval := <-approvalChan:
-						if approval.toolIndex == toolIndex {
-							// Write the user's response to stdin
-							response := approval.response + "\n"
-							if _, err := io.WriteString(stdinW, response); err != nil {
-								log.Printf("[session_mgr] write approval response to stdin: %v", err)
-							}
-							log.Printf("[session_mgr] sent approval response: %s", approval.response)
-							// Break out of the wait loop and continue processing
-							goto approvalDone
-						}
-						// Ignore approval for a different tool (stale button press)
-						log.Printf("[session_mgr] ignoring stale approval for tool %d, waiting for %d", approval.toolIndex, toolIndex)
-					case <-subprocCtx.Done():
-						log.Printf("[session_mgr] approval wait cancelled for (%d,%d)", chatID, *threadID)
-						return
-					}
-				}
-				approvalDone:
-			}
-		}
-	}()
-
-	scanner := bufio.NewScanner(stdoutPipe)
-	scanner.Buffer(make([]byte, scannerMaxBuf), scannerMaxBuf)
-
-	var (
-		textBuf           strings.Builder
-		lastEdit          time.Time
-		lastToolEdit      time.Time // separate timer for tool status updates
-		streamMsgID       int64
-		out               claudeOutput
-		activeTool        string // name of the currently running tool
-		toolInput         string // input for the currently running tool (truncated)
-		toolCompleted     bool   // true when the current tool has completed
-	)
-
-	// Determine streaming behavior based on notification mode
-	// live: stream every update (default)
-	// summary: collect all text, send final result only
-	// quiet: collect all text, send minimal output only
-	enableStreaming := (notificationMode == "live")
-
-	// Progress ticker: if no Telegram message has been sent for progress_interval_sec
-	// (default 120s), the bridge posts 'Still working... (Xm elapsed)' to the thread.
-	progressInterval := time.Duration(group.ProgressIntervalSec) * time.Second
-	lastSent := time.Now() // Track last time a message was sent to Telegram
-	progressDone := make(chan struct{})
-	defer close(progressDone) // Ensure ticker goroutine exits when scanner loop exits
-	if progressInterval > 0 && enableStreaming {
-		// Start ticker goroutine for progress heartbeat
-		go func() {
-			ticker := time.NewTicker(30 * time.Second)
-			defer ticker.Stop()
-			startTime := time.Now()
-			for {
-				select {
-				case <-ticker.C:
-					if time.Since(lastSent) >= progressInterval {
-						elapsed := time.Since(startTime)
-						var elapsedStr string
-						if elapsed < time.Minute {
-							elapsedStr = fmt.Sprintf("%ds", int(elapsed.Seconds()))
-						} else {
-							elapsedStr = fmt.Sprintf("%dm", int(elapsed.Minutes()))
-						}
-						msg := fmt.Sprintf("Still working... (%s elapsed)", elapsedStr)
-
-						// Use placeholder if available
-						msgID := placeholderID
-						if msgID == 0 && streamMsgID != 0 {
-							msgID = streamMsgID
-						}
-						if msgID != 0 {
-							if err := m.sender.EditMessage(sendCtx, chatID, msgID, msg); err != nil {
-								log.Printf("[session_mgr] progress ticker (%d,%d): %v", chatID, *threadID, err)
-							}
-						}
-						lastSent = time.Now() // Reset after sending heartbeat
-					}
-				case <-progressDone:
-					return
-				}
-			}
-		}()
-	}
-
-	// flushEdit sends the current accumulated text as an initial message or an
-	// edit of the streaming placeholder. Skipped if the debounce interval hasn't
-	// elapsed yet (unless force=true). Returns true if text was sent, false if
-	// skipped due to debounce.
-	flushEdit := func(force bool) bool {
-		// In summary/quiet mode, don't send progressive edits
-		if !enableStreaming {
-			return false
-		}
-		text := textBuf.String()
-		if text == "" {
-			return false
-		}
-		if !force && time.Since(lastEdit) < streamDebounce {
-			return false
-		}
-
-		// When text exceeds 4096 chars, we stop editing the current message and
-		// send a new one for overflow. The current message is finalized with a
-		// truncated preview, and the rest of the text is sent to a new message.
-		if runeLen(text) > maxMessageLen {
-			// Split the text at the boundary
-			splitAt := runeByteLen(text, maxMessageLen)
-			currentChunk := text[:splitAt]
-
-			// Send/edit the current message with the truncated content
-			if streamMsgID == 0 {
-				// First message - use placeholder or send new
-				if placeholderID != 0 {
-					if err := m.sender.EditMessage(sendCtx, chatID, placeholderID, currentChunk); err != nil {
-						log.Printf("[session_mgr] edit placeholder (%d,%d): %v", chatID, *threadID, err)
-						return false
-					}
-					streamMsgID = placeholderID
-				} else {
-					id, err := m.sender.sendInitialStream(sendCtx, chatID, threadID, origMsgID, currentChunk)
-					if err != nil {
-						log.Printf("[session_mgr] send initial stream (%d,%d): %v", chatID, *threadID, err)
-						return false
-					}
-					streamMsgID = id
-				}
-			} else {
-				// Edit the current streaming message with truncated content
-				if err := m.sender.EditMessage(sendCtx, chatID, streamMsgID, currentChunk); err != nil {
-					log.Printf("[session_mgr] edit stream (%d,%d): %v", chatID, *threadID, err)
-					return false
-				}
-			}
-
-			// Send the overflow as a new message and continue streaming into it
-			overflowText := text[splitAt:]
-			newMsgID, err := m.sender.SendStreamOverflow(sendCtx, chatID, threadID, overflowText)
-			if err != nil {
-				log.Printf("[session_mgr] send overflow (%d,%d): %v", chatID, *threadID, err)
-				// Keep streaming into the old message on error
-			} else {
-				streamMsgID = newMsgID
-				// Continue streaming into the new message - set buffer to overflow content
-				textBuf.Reset()
-				textBuf.WriteString(overflowText)
-			}
-			lastEdit = time.Now()
-			return true
-		}
-
-		// Normal path - text fits in one message
-		if streamMsgID == 0 {
-			// Use placeholder if available, otherwise send new message
-			if placeholderID != 0 {
-				if err := m.sender.EditMessage(sendCtx, chatID, placeholderID, text); err != nil {
-					log.Printf("[session_mgr] edit placeholder (%d,%d): %v", chatID, *threadID, err)
-					return false
-				}
-				streamMsgID = placeholderID
-			} else {
-				id, err := m.sender.sendInitialStream(sendCtx, chatID, threadID, origMsgID, text)
-				if err != nil {
-					log.Printf("[session_mgr] send initial stream (%d,%d): %v", chatID, *threadID, err)
-					return false
-				}
+	if enableStreaming {
+		msgText := "⏳ Thinking…"
+		if placeholderID != 0 {
+			_ = m.sender.EditMessage(sendCtx, chatID, placeholderID, msgText)
+			streamMsgID = placeholderID
+		} else {
+			id, err := m.sender.sendInitialStream(sendCtx, chatID, threadID, origMsgID, msgText)
+			if err == nil {
 				streamMsgID = id
 			}
-		} else {
-			if err := m.sender.EditMessage(sendCtx, chatID, streamMsgID, text); err != nil {
-				// Telegram returns 400 "message is not modified" if text hasn't changed.
-				// Treat this as a no-op rather than an error.
-				if apiErr, ok := err.(*contract.ErrorResponse); !ok || apiErr.ErrorCode != 400 {
-					log.Printf("[session_mgr] edit stream (%d,%d): %v", chatID, *threadID, err)
-				}
-			}
 		}
-		// Publish Phase 6 streaming event
-		if m.eventPublisher != nil {
-			elapsedMs := time.Since(startTime).Milliseconds()
-			topic := events.FormatTopicID(*threadID)
-			// Use 0 for tokens during streaming - we don't have intermediate counts
-			m.eventPublisher.PublishMessageOutStreaming(chatID, *threadID, topic, 0, elapsedMs)
+	}
+
+	// Inject the prompt via bracketed paste.
+	if err := m.ptyMgr.InjectPrompt(paneTarget, prompt); err != nil {
+		return nil, fmt.Errorf("inject prompt: %w", err)
+	}
+
+	// Poll for response with live streaming updates.
+	lastChunk := ""
+	lastEdit := time.Now()
+
+	onChunk := func(text string) {
+		if !enableStreaming || text == "" || text == lastChunk {
+			return
 		}
+		if time.Since(lastEdit) < streamDebounce {
+			return
+		}
+		lastChunk = text
 		lastEdit = time.Now()
-		lastSent = time.Now() // Reset progress ticker on every successful Telegram edit
-		return true
-	}
-
-	// flushToolEdit sends a tool status update. Skipped in quiet/summary mode or if
-	// the debounce interval hasn't elapsed (unless force=true).
-	flushToolEdit := func(force bool, status string) {
-		// Skip in quiet or summary mode (only live mode gets tool updates)
-		if notificationMode != "live" {
-			return
-		}
-		// Skip if not enough time has elapsed (unless forced)
-		if !force && time.Since(lastToolEdit) < toolDebounce {
-			return
-		}
-
-		// Use placeholder for tool status updates
-		msgID := placeholderID
-		if msgID == 0 && streamMsgID != 0 {
-			msgID = streamMsgID
-		}
-		if msgID == 0 {
-			return
-		}
-
-		if err := m.sender.EditMessage(sendCtx, chatID, msgID, status); err != nil {
-			log.Printf("[session_mgr] edit tool status (%d,%d): %v", chatID, *threadID, err)
-		}
-		lastToolEdit = time.Now()
-	}
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var env streamLine
-		if err := json.Unmarshal(line, &env); err != nil {
-			log.Printf("[session_mgr] parse stream line: %v (%.100s)", err, line)
-			continue
-		}
-		switch env.Type {
-		case "system":
-			// Init event — capture session_id early (result event overwrites later).
-			if env.SessionID != "" {
-				out.SessionID = env.SessionID
+		if streamMsgID != 0 {
+			_ = m.sender.EditMessage(sendCtx, chatID, streamMsgID, text)
+			if m.eventPublisher != nil && threadID != nil {
+				topic := events.FormatTopicID(*threadID)
+				m.eventPublisher.PublishMessageOutStreaming(chatID, *threadID, topic, 0, time.Since(startTime).Milliseconds())
 			}
-		case "assistant":
-			// Complete assistant message block; text is accumulated via stream_events.
-		case "stream_event":
-			// Try to parse as content_block_delta first (for text streaming)
-			var delta contentBlockDelta
-			if err := json.Unmarshal(env.Event, &delta); err == nil {
-				if delta.Type == "content_block_delta" && delta.Delta.Type == "text_delta" {
-					textBuf.WriteString(delta.Delta.Text)
-					flushEdit(false)
-					// Text delta after a tool_use block means the tool succeeded
-					if activeTool != "" && toolCompleted {
-						activeTool = ""
-						toolInput = ""
-					}
-				}
-				continue
-			}
-
-			// Try to parse as content_block_start (for tool_use start)
-			var start contentBlockStart
-			if err := json.Unmarshal(env.Event, &start); err == nil {
-				if start.Type == "content_block_start" && start.ContentBlock.Type == "tool_use" {
-					// Check for spawn_worker synthetic tool (only when dispatcher mode is enabled)
-					if start.ContentBlock.Name == "spawn_worker" {
-						if !isDispatcherEnabled(session, group) {
-							log.Printf("[session_mgr] ignoring spawn_worker: dispatcher mode disabled for (%d,%d)", chatID, *threadID)
-							continue
-						}
-						syntheticToolID := fmt.Sprintf("toolu_%d", time.Now().UnixNano())
-
-						// Spawn the worker — it runs in a goroutine and returns immediately
-						workerID, workerIndex, spawnErr := m.workerPool.SpawnWorker(
-							subprocCtx, chatID, *threadID, origMsgID, group, start.ContentBlock.Input.Raw,
-						)
-
-						var toolContent any
-						if spawnErr != nil {
-							toolContent = map[string]any{"error": spawnErr.Error()}
-							log.Printf("[session_mgr] spawn_worker failed: %v", spawnErr)
-						} else {
-							toolContent = map[string]any{
-								"worker_id": workerID,
-								"index":     workerIndex,
-								"status":    "dispatched",
-							}
-							log.Printf("[session_mgr] spawned worker %d (%s) for (%d,%d)", workerIndex, workerID, chatID, *threadID)
-						}
-
-						// Write tool_result back to stdin so the orchestrator can continue
-						toolResult := map[string]any{
-							"tool_use_id": syntheticToolID,
-							"content":     toolContent,
-							"is_error":    spawnErr != nil,
-						}
-						resultJSON, _ := json.Marshal(toolResult)
-						if _, err := fmt.Fprintf(stdinW, "%s\n", resultJSON); err != nil {
-							log.Printf("[session_mgr] write tool_result for spawn_worker: %v", err)
-						}
-
-						continue
-					}
-
-					// Check for update_progress synthetic tool (only when dispatcher mode is enabled)
-					if start.ContentBlock.Name == "update_progress" {
-						if !isDispatcherEnabled(session, group) {
-							log.Printf("[session_mgr] ignoring update_progress: dispatcher mode disabled for (%d,%d)", chatID, *threadID)
-							continue
-						}
-						syntheticToolID := fmt.Sprintf("toolu_%d", time.Now().UnixNano())
-
-						// Parse the input to get the message
-						var input updateProgressInput
-						if err := json.Unmarshal(start.ContentBlock.Input.Raw, &input); err == nil && input.Message != "" {
-							// Only send update_progress messages in live mode
-							if notificationMode == "live" {
-								// Send a new message to the Telegram thread (not an edit)
-								if err := m.sender.SendResponse(sendCtx, chatID, threadID, 0, input.Message); err != nil {
-									log.Printf("[session_mgr] send update_progress message: %v", err)
-								} else {
-									// Reset the progress ticker timer
-									lastSent = time.Now()
-								}
-							}
-						}
-
-						// Write tool_result back to stdin so the orchestrator can continue
-						toolResult := map[string]any{
-							"tool_use_id": syntheticToolID,
-							"content":     map[string]any{"ok": true},
-							"is_error":    false,
-						}
-						resultJSON, _ := json.Marshal(toolResult)
-						if _, err := fmt.Fprintf(stdinW, "%s\n", resultJSON); err != nil {
-							log.Printf("[session_mgr] write tool_result for update_progress: %v", err)
-						}
-
-						continue
-					}
-
-					// Regular tool handling - send status update
-					activeTool = start.ContentBlock.Name
-					toolInput = start.ContentBlock.Input.String()
-					toolCompleted = false
-					status := fmt.Sprintf("⚙️ Running %s: `%s`", activeTool, toolInput)
-					flushToolEdit(true, status) // force immediate update
-				}
-				continue
-			}
-
-			// Try to parse as content_block_stop (for tool_use completion)
-			var stop contentBlockStop
-			if err := json.Unmarshal(env.Event, &stop); err == nil {
-				if stop.Type == "content_block_stop" {
-					// Tool is completing - send status update
-					if activeTool != "" && !toolCompleted {
-						status := fmt.Sprintf("✓ %s done", activeTool)
-						flushToolEdit(false, status) // debounce
-						toolCompleted = true
-					}
-				}
-				continue
-			}
-
-			// Try to parse as tool_result_delta (actual tool result streaming)
-			var trDelta toolResultDelta
-			if err := json.Unmarshal(env.Event, &trDelta); err == nil {
-				if trDelta.Type == "tool_result_delta" {
-					// Tool result is streaming - tool has executed
-					if activeTool != "" && !toolCompleted {
-						status := fmt.Sprintf("✓ %s done", activeTool)
-						flushToolEdit(false, status) // debounce
-						toolCompleted = true
-					}
-				}
-				continue
-			}
-		case "result":
-			// Canonical final event — overwrite session_id with the authoritative value.
-			out.Type = env.Type
-			out.SessionID = env.SessionID
-			out.Result = env.Result
-			out.IsError = env.IsError
-			out.TotalCostUSD = env.TotalCostUSD
-			out.Usage = env.Usage
 		}
 	}
 
-	// Final flush to ensure all accumulated text is sent
-	flushEdit(true)
-
-	if err := scanner.Err(); err != nil {
-		_ = cmd.Process.Kill()
-		return nil, fmt.Errorf("read stdout: %w", err)
-	}
-
-	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderrStr := strings.TrimSpace(stderrBuf.String())
-			if stderrStr != "" {
-				return nil, fmt.Errorf("claude exited %d: %s", exitErr.ExitCode(), stderrStr)
-			}
-			return nil, fmt.Errorf("claude exited %d", exitErr.ExitCode())
+	result, waitErr := m.ptyMgr.WaitForResponse(subprocCtx, paneTarget, onChunk)
+	if waitErr != nil {
+		m.ptyMgr.KillPane(paneTarget)
+		m.mu.Lock()
+		delete(m.paneNames, key)
+		m.mu.Unlock()
+		errMsg := "❌ Error: " + waitErr.Error()
+		if streamMsgID != 0 {
+			_ = m.sender.EditMessage(sendCtx, chatID, streamMsgID, errMsg)
 		}
-		return nil, fmt.Errorf("wait claude: %w", err)
+		return nil, waitErr
 	}
 
-	if out.IsError {
-		return nil, fmt.Errorf("claude error: %s", out.Result)
+	// For fresh sessions (no session_id yet) capture it from ~/.claude/projects/.
+	// Use snapshot-diff to avoid stealing a concurrent Claude Code session's ID.
+	sessionID := ""
+	if session != nil {
+		sessionID = session.SessionID
+	}
+	if sessionID == "" {
+		tid64 := int64(0)
+		if threadID != nil {
+			tid64 = *threadID
+		}
+		if sid, err := FindNewSession(sessionSnapshot, group.CWD); err != nil {
+			log.Printf("[session_mgr] capture session_id (%d,%d): %v", chatID, tid64, err)
+		} else {
+			sessionID = sid
+		}
 	}
 
-	// Detect generated media files in the working directory
-	// Look for audio/video files created during this invocation
-	if err := m.detectGeneratedMedia(group.CWD, startTime, &out); err != nil {
-		log.Printf("[session_mgr] detect generated media: %v", err)
-		// Non-fatal: continue without media attachments
+	// Schedule idle pane kill.
+	idleTTL := 300 * time.Second
+	m.ptyMgr.ScheduleIdleKill(paneTarget, idleTTL, func() {
+		m.mu.Lock()
+		delete(m.paneNames, key)
+		m.mu.Unlock()
+	})
+
+	out := &claudeOutput{
+		Type:      "result",
+		SessionID: sessionID,
+		Result:    result,
+		IsError:   false,
+	}
+	if err := m.detectGeneratedMedia(group.CWD, startTime, out); err != nil {
+		log.Printf("[session_mgr] detect media: %v", err)
 	}
 
-	// Handle notification modes for final output
-	if notificationMode == "summary" {
-		// Summary mode: replace placeholder with full result
-		// streamMsgID will be 0 since we didn't stream, so use placeholderID
+	// Final Telegram edit with complete response.
+	switch notificationMode {
+	case "quiet":
+		out.Result = "Done ✓"
+		out.StreamMsgID = 0
+	case "summary":
 		if streamMsgID == 0 && placeholderID != 0 {
 			out.StreamMsgID = placeholderID
 		} else {
 			out.StreamMsgID = streamMsgID
 		}
-	} else if notificationMode == "quiet" {
-		// Quiet mode: replace result with minimal confirmation
-		out.Result = "Done ✓"
-		out.StreamMsgID = 0 // No streaming happened
-	} else {
-		// Live mode: normal streaming behavior
+	default: // live
+		if enableStreaming && result != lastChunk && streamMsgID != 0 {
+			_ = m.sender.EditMessage(sendCtx, chatID, streamMsgID, result)
+		}
 		out.StreamMsgID = streamMsgID
 	}
 	out.PlaceholderID = placeholderID
-	return &out, nil
+	return out, nil
 }
 
 // persistSession writes a new session record or updates the existing one.
@@ -3224,32 +2842,27 @@ func (m *SessionManager) CancelTopic(ctx context.Context, chatID, threadID int64
 		return false
 	}
 
-	// Send SIGINT to gracefully terminate the subprocess
-	active.mu.Lock()
-	defer active.mu.Unlock()
-	if active.cmd != nil && active.cmd.Process != nil {
-		if err := active.cmd.Process.Signal(os.Interrupt); err != nil {
-			log.Printf("[session_mgr] cancel (%d,%d): signal failed: %v", chatID, threadID, err)
-			return false
-		}
+	// Send Ctrl-C to the active pane.
+	m.mu.Lock()
+	paneTarget, hasPane := m.paneNames[key]
+	m.mu.Unlock()
 
-		// Edit the placeholder to show cancellation
-		msgID := placeholderID
-		if msgID == 0 {
-			msgID = active.placeholderID
+	if hasPane {
+		if err := m.ptyMgr.SendInterrupt(paneTarget); err != nil {
+			log.Printf("[session_mgr] cancel (%d,%d): interrupt failed: %v", chatID, threadID, err)
 		}
-		if msgID != 0 {
-			_ = m.sender.EditMessage(ctx, chatID, msgID, "⚠️ Cancelled")
-		}
-
-		// Update topic color to red
-		_ = m.updateTopicColor(ctx, chatID, threadID, ColorError)
-
-		log.Printf("[session_mgr] cancelled (%d,%d)", chatID, threadID)
-		return true
 	}
 
-	return false
+	msgID := placeholderID
+	if msgID == 0 {
+		msgID = active.placeholderID
+	}
+	if msgID != 0 {
+		_ = m.sender.EditMessage(ctx, chatID, msgID, "⚠️ Cancelled")
+	}
+	_ = m.updateTopicColor(ctx, chatID, threadID, ColorError)
+	log.Printf("[session_mgr] cancelled (%d,%d)", chatID, threadID)
+	return true
 }
 
 // SubmitToolApproval sends a tool approval/denial to the appropriate session's approval channel.
@@ -3290,7 +2903,7 @@ func (m *SessionManager) createNewSession(ctx context.Context, chatID int64, gro
 		return 0, fmt.Errorf("create topic: %w", err)
 	}
 
-	// Step 2: Run claude -p to create a session and get session_id
+	// Step 2: Seed the session with an initial prompt via a transient PTY pane.
 	var prompt string
 	if firstMessage != "" {
 		prompt = fmt.Sprintf("New task: %s\n\nFirst message: %s\n\nHow can I help?", topicName, firstMessage)
@@ -3343,45 +2956,37 @@ func (m *SessionManager) createNewSession(ctx context.Context, chatID int64, gro
 	return threadID, nil
 }
 
-// createClaudeSession runs claude -p with the given prompt and returns the session_id.
+// createClaudeSession starts a fresh interactive claude session with a seed prompt
+// and returns the captured session_id by scanning ~/.claude/projects/.
 func (m *SessionManager) createClaudeSession(ctx context.Context, group *Group, prompt string) (string, error) {
+	paneName := fmt.Sprintf("init-%d", time.Now().UnixNano())
 	args := []string{
-		"-p",
-		"--output-format", "json",
-		"--permission-mode", resolvePermissionMode(group),
+		"--dangerously-skip-permissions",
 		"--model", resolveSessionModel(nil, group),
 	}
 
-	// Add tool restrictions if configured
-	allowed, disallowed := resolveToolRestrictions(group)
-	if allowed != "" {
-		args = append(args, "--allowed-tools", allowed)
-	}
-	if disallowed != "" {
-		args = append(args, "--disallowed-tools", disallowed)
-	}
-
-	cmd := exec.CommandContext(ctx, "claude", args...)
-	cmd.Dir = group.CWD
-	cmd.Stdin = strings.NewReader(prompt)
-
-	output, err := cmd.Output()
+	snapshot := SnapshotSessionFiles(group.CWD)
+	paneTarget, err := m.ptyMgr.SpawnPane(paneName, group.CWD, args)
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("claude exited %d: %s", exitErr.ExitCode(), string(exitErr.Stderr))
-		}
-		return "", fmt.Errorf("run claude: %w", err)
+		return "", fmt.Errorf("spawn init pane: %w", err)
+	}
+	defer m.ptyMgr.KillPane(paneTarget)
+
+	if err := m.ptyMgr.WaitForStartup(paneTarget); err != nil {
+		return "", fmt.Errorf("wait for startup: %w", err)
+	}
+	if err := m.ptyMgr.InjectPrompt(paneTarget, prompt); err != nil {
+		return "", fmt.Errorf("inject prompt: %w", err)
+	}
+	if _, err := m.ptyMgr.WaitForResponse(ctx, paneTarget, nil); err != nil {
+		return "", fmt.Errorf("wait for response: %w", err)
 	}
 
-	// Parse JSON output to get session_id
-	var out claudeOutput
-	if err := json.Unmarshal(output, &out); err != nil {
-		return "", fmt.Errorf("parse claude output: %w", err)
+	sid, err := FindNewSession(snapshot, group.CWD)
+	if err != nil {
+		return "", fmt.Errorf("capture session_id: %w", err)
 	}
-	if out.SessionID == "" {
-		return "", fmt.Errorf("claude returned empty session_id")
-	}
-	return out.SessionID, nil
+	return sid, nil
 }
 
 // detectGeneratedMedia scans the working directory for audio and video files

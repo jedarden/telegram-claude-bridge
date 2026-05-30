@@ -3,11 +3,8 @@ package bridge
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
-	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -16,12 +13,12 @@ import (
 
 // SubtaskRequest contains parameters for spawning parallel subtasks.
 type SubtaskRequest struct {
-	ChatID    int64   // Parent chat ID
-	ThreadID  int64   // Parent thread ID
-	MsgID     int64   // Parent message ID (for replies)
-	Prompts   []string // Prompts to execute in parallel (max 5)
-	Group     *Group  // Group configuration
-	Session   *Session // Optional parent session to resume
+	ChatID   int64    // Parent chat ID
+	ThreadID int64    // Parent thread ID
+	MsgID    int64    // Parent message ID (for replies)
+	Prompts  []string // Prompts to execute in parallel (max 5)
+	Group    *Group   // Group configuration
+	Session  *Session // Optional parent session to resume
 }
 
 // SubtaskOrchestrator manages fan-out/fan-in of parallel Claude invocations.
@@ -30,7 +27,7 @@ type SubtaskRequest struct {
 type SubtaskOrchestrator struct {
 	db         *DB
 	sender     *Sender
-	sessionMgr *SessionManager // For injecting worker results into next prompt
+	sessionMgr *SessionManager // For PTYManager access and injecting worker results
 }
 
 // NewSubtaskOrchestrator creates a new SubtaskOrchestrator.
@@ -134,12 +131,12 @@ type subtaskResult struct {
 	Error     error
 }
 
-// executeSubtask runs a single Claude invocation for a subtask.
+// executeSubtask runs a single Claude invocation for a subtask via an ephemeral tmux pane.
 func (o *SubtaskOrchestrator) executeSubtask(ctx context.Context, req SubtaskRequest, subtaskID, prompt string) *subtaskResult {
-	// Build args for a fresh Claude invocation (no session resume)
+	ptyMgr := o.sessionMgr.PTYManager()
+	paneName := fmt.Sprintf("st-%s-%d", subtaskID[:8], time.Now().UnixNano())
+
 	args := []string{
-		"-p",
-		"--output-format", "json",
 		"--dangerously-skip-permissions",
 		"--model", resolveSessionModel(req.Session, req.Group),
 	}
@@ -153,7 +150,6 @@ func (o *SubtaskOrchestrator) executeSubtask(ctx context.Context, req SubtaskReq
 		args = append(args, "--disallowed-tools", disallowed)
 	}
 
-	// Create command with timeout from group config
 	timeoutSec := req.Group.TimeoutSec
 	if timeoutSec <= 0 {
 		timeoutSec = 1800 // Default 30 minutes
@@ -161,43 +157,24 @@ func (o *SubtaskOrchestrator) executeSubtask(ctx context.Context, req SubtaskReq
 	subCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(subCtx, "claude", args...)
-	cmd.Dir = req.Group.CWD
-	cmd.Stdin = strings.NewReader(prompt)
-
-	output, err := cmd.Output()
+	paneTarget, err := ptyMgr.SpawnPane(paneName, req.Group.CWD, args)
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return &subtaskResult{
-				SubtaskID: subtaskID,
-				Error:     fmt.Errorf("claude exited %d: %s", exitErr.ExitCode(), string(exitErr.Stderr)),
-			}
-		}
-		return &subtaskResult{
-			SubtaskID: subtaskID,
-			Error:     fmt.Errorf("run claude: %w", err),
-		}
+		return &subtaskResult{SubtaskID: subtaskID, Error: fmt.Errorf("spawn pane: %w", err)}
+	}
+	defer ptyMgr.KillPane(paneTarget)
+
+	if err := ptyMgr.WaitForStartup(paneTarget); err != nil {
+		return &subtaskResult{SubtaskID: subtaskID, Error: fmt.Errorf("startup: %w", err)}
+	}
+	if err := ptyMgr.InjectPrompt(paneTarget, prompt); err != nil {
+		return &subtaskResult{SubtaskID: subtaskID, Error: fmt.Errorf("inject prompt: %w", err)}
+	}
+	result, err := ptyMgr.WaitForResponse(subCtx, paneTarget, nil)
+	if err != nil {
+		return &subtaskResult{SubtaskID: subtaskID, Error: fmt.Errorf("wait response: %w", err)}
 	}
 
-	// Parse JSON output
-	var out claudeOutput
-	if err := json.Unmarshal(output, &out); err != nil {
-		return &subtaskResult{
-			SubtaskID: subtaskID,
-			Error:     fmt.Errorf("parse claude output: %w", err),
-		}
-	}
-	if out.IsError {
-		return &subtaskResult{
-			SubtaskID: subtaskID,
-			Error:     fmt.Errorf("claude error: %s", out.Result),
-		}
-	}
-
-	return &subtaskResult{
-		SubtaskID: subtaskID,
-		Output:    out.Result,
-	}
+	return &subtaskResult{SubtaskID: subtaskID, Output: result}
 }
 
 // postResult sends a single subtask result to the topic and stores it for injection.

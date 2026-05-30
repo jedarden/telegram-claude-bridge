@@ -1,13 +1,10 @@
 package bridge
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
-	"os/exec"
-	"strings"
 	"sync"
 	"time"
 )
@@ -19,7 +16,7 @@ import (
 type WorkerPool struct {
 	db         *DB
 	sender     *Sender
-	sessionMgr *SessionManager // For injecting worker results into next prompt
+	sessionMgr *SessionManager // For PTYManager access and injecting worker results
 
 	mu        sync.Mutex
 	nextIndex map[topicKey]int // monotonically increasing worker index per topic
@@ -112,151 +109,57 @@ func (wp *WorkerPool) SpawnWorker(
 	return workerID, index, nil
 }
 
-// runWorker executes a fresh claude -p subprocess and handles completion.
+// runWorker executes a fresh Claude session via an ephemeral tmux pane.
 func (wp *WorkerPool) runWorker(
 	worker *Worker,
 	prompt, model string,
 	group *Group,
 	index int,
 ) {
-	cwd := group.CWD
+	ctx := context.Background()
+	ptyMgr := wp.sessionMgr.PTYManager()
 
-	// Build args — fresh session, no --resume, depth-1 limit via --disallowed-tools
+	paneName := fmt.Sprintf("w-%s-%d", worker.ID[:8], time.Now().UnixNano())
 	args := []string{
-		"-p",
-		"--output-format", "stream-json",
-		"--verbose",
 		"--dangerously-skip-permissions",
 		"--model", model,
 	}
 
-	// Add tool restrictions, always disallowing spawn_worker (depth limit = 1)
+	// Add tool restrictions; always disallow spawn_worker (depth limit = 1)
 	allowed, disallowed := resolveToolRestrictions(group)
 	if allowed != "" {
 		args = append(args, "--allowed-tools", allowed)
 	}
 	if disallowed != "" {
-		disallowed = disallowed + ",spawn_worker"
+		disallowed += ",spawn_worker"
 	} else {
 		disallowed = "spawn_worker"
 	}
 	args = append(args, "--disallowed-tools", disallowed)
 
-	ctx := context.Background()
-
-	cmd := exec.CommandContext(ctx, "claude", args...)
-	cmd.Dir = cwd
-
-	// Pipe prompt to stdin
-	stdin, err := cmd.StdinPipe()
+	paneTarget, err := ptyMgr.SpawnPane(paneName, group.CWD, args)
 	if err != nil {
-		wp.finishWorker(worker, index, "", fmt.Sprintf("stdin pipe: %v", err))
+		wp.finishWorker(worker, index, "", fmt.Sprintf("spawn pane: %v", err))
+		return
+	}
+	defer ptyMgr.KillPane(paneTarget)
+
+	if err := ptyMgr.WaitForStartup(paneTarget); err != nil {
+		wp.finishWorker(worker, index, "", fmt.Sprintf("startup: %v", err))
+		return
+	}
+	if err := ptyMgr.InjectPrompt(paneTarget, prompt); err != nil {
+		wp.finishWorker(worker, index, "", fmt.Sprintf("inject prompt: %v", err))
 		return
 	}
 
-	stdoutPipe, err := cmd.StdoutPipe()
+	result, err := ptyMgr.WaitForResponse(ctx, paneTarget, nil)
 	if err != nil {
-		wp.finishWorker(worker, index, "", fmt.Sprintf("stdout pipe: %v", err))
+		wp.finishWorker(worker, index, "", fmt.Sprintf("wait response: %v", err))
 		return
 	}
 
-	var stderrBuf strings.Builder
-	cmd.Stderr = &stderrBuf
-
-	if err := cmd.Start(); err != nil {
-		wp.finishWorker(worker, index, "", fmt.Sprintf("start claude: %v", err))
-		return
-	}
-
-	// Write prompt and close stdin
-	go func() {
-		stdin.Write([]byte(prompt))
-		stdin.Close()
-	}()
-
-	// Read stream-json output, accumulate final result
-	scanner := bufio.NewScanner(stdoutPipe)
-	scanner.Buffer(make([]byte, scannerMaxBuf), scannerMaxBuf)
-
-	var textBuf strings.Builder
-	var capturedResult string
-	var isError bool
-
-	for scanner.Scan() {
-		var line struct {
-			Type    string          `json:"type"`
-			Session string          `json:"session_id"`
-			Event   json.RawMessage `json:"event"`
-			Result  string          `json:"result"`
-			IsError bool            `json:"is_error"`
-		}
-		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
-			continue
-		}
-
-		switch line.Type {
-		case "system":
-			// Capture session_id
-			if line.Session != "" {
-				_ = wp.db.UpdateWorkerSessionID(ctx, worker.ID, line.Session)
-			}
-
-		case "stream_event":
-			// Parse nested event
-			var env struct {
-				Event json.RawMessage `json:"event"`
-			}
-			if err := json.Unmarshal(scanner.Bytes(), &env); err != nil {
-				continue
-			}
-			var delta struct {
-				Type  string `json:"type"`
-				Delta struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"delta"`
-			}
-			if err := json.Unmarshal(env.Event, &delta); err == nil {
-				if delta.Type == "content_block_delta" && delta.Delta.Type == "text_delta" {
-					textBuf.WriteString(delta.Delta.Text)
-				}
-			}
-
-		case "result":
-			// Final canonical result overrides accumulated text
-			if line.Result != "" {
-				capturedResult = line.Result
-			}
-			isError = line.IsError
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		wp.finishWorker(worker, index, "", fmt.Sprintf("scanner error: %v", err))
-		cmd.Wait()
-		return
-	}
-
-	if err := cmd.Wait(); err != nil {
-		errMsg := strings.TrimSpace(stderrBuf.String())
-		if errMsg == "" {
-			errMsg = err.Error()
-		}
-		wp.finishWorker(worker, index, "", fmt.Sprintf("exit error: %s", errMsg))
-		return
-	}
-
-	// Use captured result if available, otherwise use accumulated text
-	finalResult := capturedResult
-	if finalResult == "" {
-		finalResult = textBuf.String()
-	}
-	if isError {
-		wp.finishWorker(worker, index, "", finalResult)
-		return
-	}
-
-	wp.finishWorker(worker, index, finalResult, "")
+	wp.finishWorker(worker, index, result, "")
 }
 
 // finishWorker updates the worker record, posts result to Telegram, and
