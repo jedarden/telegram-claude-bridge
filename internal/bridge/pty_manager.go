@@ -162,6 +162,8 @@ func (p *PTYManager) WaitForStartup(paneTarget string) error {
 
 // InjectPrompt writes a multi-line prompt to the pane's PTY via bracketed paste mode.
 // Bracketed paste prevents the shell/REPL from treating newlines as submissions.
+// The actual Enter/submit is sent separately via tmux send-keys on the master end;
+// the trailing \r written to the slave PTY is no longer reliable for submission.
 func (p *PTYManager) InjectPrompt(paneTarget, prompt string) error {
 	ttyPath, err := p.PaneTTY(paneTarget)
 	if err != nil {
@@ -171,12 +173,19 @@ func (p *PTYManager) InjectPrompt(paneTarget, prompt string) error {
 	if err != nil {
 		return fmt.Errorf("open tty for inject: %w", err)
 	}
-	defer f.Close()
 
-	// Bracketed paste: ESC[200~ + text + ESC[201~ + CR (submit)
-	payload := "\x1b[200~" + prompt + "\x1b[201~\r"
-	if _, err := f.WriteString(payload); err != nil {
-		return fmt.Errorf("write prompt to tty: %w", err)
+	// Bracketed paste: ESC[200~ + text + ESC[201~  (no trailing \r — see below)
+	payload := "\x1b[200~" + prompt + "\x1b[201~"
+	_, writeErr := f.WriteString(payload)
+	f.Close()
+	if writeErr != nil {
+		return fmt.Errorf("write prompt to tty: %w", writeErr)
+	}
+
+	// Submit via tmux master end. Writing \r to the slave PTY is not reliable for
+	// submission in Claude's TUI; tmux send-keys goes through the master and works.
+	if out, err := exec.Command("tmux", "send-keys", "-t", paneTarget, "Enter").CombinedOutput(); err != nil {
+		return fmt.Errorf("send-keys enter: %w: %s", err, out)
 	}
 	return nil
 }
@@ -330,10 +339,29 @@ func extractResponseText(screen string) string {
 		if strings.ContainsRune(line, promptRune) {
 			break
 		}
+		// Strip Claude UI chrome: "✻ Cogitated for Ns" timing lines and ─── separators.
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "✻") || isUIChrome(trimmed) {
+			continue
+		}
 		result = append(result, line)
 	}
 
 	return strings.TrimSpace(strings.Join(result, "\n"))
+}
+
+// isUIChrome returns true for lines that are Claude TUI decorations rather than
+// response content: separator lines made entirely of box-drawing characters (─, ═, etc.).
+func isUIChrome(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r != '─' && r != '═' && r != '━' && r != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // ScheduleIdleKill sets a timer to kill the pane after ttl with no new activity.

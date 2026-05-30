@@ -237,8 +237,9 @@ func (u *Updater) fetchAndCompare(ctx context.Context) (string, bool, error) {
 
 	// If the running binary was built from a different commit than HEAD, we need
 	// to rebuild even though local == remote (happens when pushing from this machine).
+	// runningCommit may be a short SHA (7 chars) from ldflags; use prefix match.
 	if localSHA == remoteSHA {
-		if u.runningCommit != "" && u.runningCommit != "unknown" && u.runningCommit != localSHA {
+		if u.runningCommit != "" && u.runningCommit != "unknown" && !strings.HasPrefix(localSHA, u.runningCommit) {
 			return localSHA, true, nil
 		}
 		return "", false, nil
@@ -266,8 +267,17 @@ func (u *Updater) buildNewBinary(ctx context.Context) error {
 	newPath := oldPath + newBinarySuffix
 	goBin, err := exec.LookPath("go")
 	if err != nil {
-		// Fallback to known install location when go is not in PATH
-		goBin = filepath.Join(os.Getenv("HOME"), "go", "bin", "go")
+		// Fallback to known install locations when go is not in PATH.
+		for _, candidate := range []string{
+			"/usr/local/go/bin/go",
+			filepath.Join(os.Getenv("HOME"), "go", "bin", "go"),
+			filepath.Join(os.Getenv("HOME"), ".local", "bin", "go"),
+		} {
+			if _, statErr := os.Stat(candidate); statErr == nil {
+				goBin = candidate
+				break
+			}
+		}
 	}
 	buildCmd := exec.CommandContext(ctx, goBin, "build",
 		"-ldflags", ldflags,
