@@ -197,6 +197,14 @@ func (u *Updater) hasUncommittedChanges(ctx context.Context) bool {
 		if line[:2] == "??" || line[:2] == "!!" {
 			continue
 		}
+		// Skip runtime/meta files that change during normal operation and don't
+		// affect the build: beads task database and NEEDLE predispatch marker.
+		if len(line) > 3 {
+			filename := strings.TrimSpace(line[3:])
+			if strings.HasPrefix(filename, ".beads/") || filename == ".needle-predispatch-sha" {
+				continue
+			}
+		}
 		return true // Any other status means modified/staged/conflicted
 	}
 	return false

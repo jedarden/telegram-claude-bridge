@@ -4,7 +4,7 @@
 
 A two-component system where the bridge acts as a **dispatcher** — routing Telegram conversations to headless Claude Code CLI instances and coordinating their results back to the thread. The bridge is not a pipe; it is an orchestrator of Claude processes.
 
-Each Telegram forum topic maps to an **orchestrator** Claude session: a persistent, resumed `claude -p` process that understands the user's intent, delegates parallelisable sub-tasks to **worker** instances, and synthesises responses. Workers are short-lived, fresh-session Claude processes spawned by the orchestrator and managed by the bridge. The bridge routes worker results back to both the Telegram thread and the orchestrator's context.
+Each Telegram forum topic maps to an **orchestrator** Claude session: a persistent, resumed `claude` interactive process that understands the user's intent, delegates parallelisable sub-tasks to **worker** instances, and synthesises responses. Workers are short-lived, fresh-session Claude processes spawned by the orchestrator and managed by the bridge. The bridge routes worker results back to both the Telegram thread and the orchestrator's context.
 
 A lightweight proxy on ardenone-cluster isolates the Telegram bot token. The bridge on Hetzner EX44 handles all dispatch logic, session management, worker lifecycle, media processing, and state persistence.
 
@@ -174,7 +174,7 @@ The bridge is the dispatcher and message bus. It routes Telegram messages to the
 
 - **Language:** Go
 - **HTTP:** stdlib `net/http` for client to proxy
-- **Claude integration:** Headless Claude Code CLI via `os/exec`. Invoked with `-p` (print mode), `--output-format stream-json` for streaming, `--resume` for session continuity. Stdout piped through `bufio.Scanner` for NDJSON line parsing.
+- **Claude integration:** Interactive Claude CLI via PTY, one tmux pane per active topic. Each session runs `claude --resume <session_id>` in a persistent tmux pane within the `telegram-bridge` session. Prompts are injected via PTY write (bracketed paste mode); responses are extracted by reading PTY output and scraping the VT100 screen via a pyte emulator. Billing uses subscription (not API credits) because `claude` runs in a real TTY context, not headless `-p` mode.
 - **Media processing:** `whisper` CLI for audio transcription, `ffmpeg` CLI for video frame/audio extraction (both invoked as subprocesses)
 - **State:** SQLite via `modernc.org/sqlite` (pure Go, no CGo)
 - **Runtime:** single static binary, systemd unit on EX44
@@ -189,19 +189,20 @@ The bridge is the dispatcher and message bus. It routes Telegram messages to the
 │  │  Poller   │→│   Router     │→│         Session Manager          │ │
 │  │ /updates  │  │ chat/thread  │  │                                 │ │
 │  └──────────┘  └──────────────┘  │  TopicWorker (per topic)        │ │
-│                                  │  ├─ startInvocation() goroutine  │ │
-│                                  │  │    Orchestrator claude -p     │ │
-│                                  │  │    --resume session_id        │ │
+│                                  │  ├─ PTY goroutine                │ │
+│                                  │  │    tmux pane (1 per topic)    │ │
+│                                  │  │    claude --resume session_id │ │
 │                                  │  │    --append-system-prompt     │ │
-│                                  │  │    streams NDJSON             │ │
+│                                  │  │    PTY write (bracketed paste)│ │
+│                                  │  │    pyte screen scrape         │ │
 │                                  │  │                               │ │
 │                                  │  │  Intercepts synthetic tools:  │ │
 │                                  │  │  ├─ spawn_worker → WorkerPool │ │
 │                                  │  │  └─ update_progress → Sender  │ │
 │                                  │  │                               │ │
 │                                  │  └─ WorkerPool                   │ │
-│                                  │       Worker goroutine(s)        │ │
-│                                  │       claude -p (fresh session)  │ │
+│                                  │       Worker pane (per worker)   │ │
+│                                  │       claude (fresh session)     │ │
 │                                  │       result → thread + context  │ │
 │                                  └─────────────────────────────────┘ │
 │                                                                      │
@@ -257,46 +258,66 @@ Looks up `(chat_id, thread_id)` in the SQLite routing table:
 
 The Session Manager implements the dispatcher pattern. It manages two categories of Claude CLI process per topic:
 
-**Orchestrator** — the long-lived, resumed session for a topic. Understands user intent, decides what to delegate, posts progress updates, and synthesises the final response. One active orchestrator per topic at a time.
+**Orchestrator** — the on-demand, resumed session for a topic. Spawns a tmux pane within the `telegram-bridge` session only when a message arrives. After the response is complete, a short idle timer (`pane_idle_ttl`, default 5 min) keeps the pane warm for follow-up messages. When the timer expires the pane is killed; the `session_id` persists in SQLite so the next message resumes the conversation via `--resume`. Understands user intent, decides what to delegate, posts progress updates, and synthesises the final response.
 
-**Worker** — a short-lived, fresh-session process dispatched by the orchestrator via the `spawn_worker` synthetic tool. Executes one concrete sub-task (research, code generation, analysis, etc.). Multiple workers can run in parallel. Results are posted to the thread immediately and injected back into the orchestrator's context on the next invocation.
+**Worker** — a short-lived, fresh-session process dispatched by the orchestrator via the `spawn_worker` synthetic tool. Also runs in its own tmux pane, torn down immediately on completion. Executes one concrete sub-task (research, code generation, analysis, etc.). Multiple workers can run in parallel across panes. Results are posted to the thread immediately and injected back into the orchestrator's context on the next turn.
 
-**Orchestrator invocation:**
-
-```
-claude -p \
-  --output-format stream-json \
-  --verbose \
-  --dangerously-skip-permissions \
-  --resume <session_id> \
-  --model <topic_model> \
-  --cwd <project_dir> \
-  --append-system-prompt "<dispatcher context>" \
-  [--allowed-tools ...] [--disallowed-tools ...]
-```
-
-**Worker invocation (spawned by bridge on spawn_worker tool call):**
+**Pane lifecycle (dynamic load/unload):**
 
 ```
-claude -p \
-  --output-format stream-json \
-  --verbose \
-  --dangerously-skip-permissions \
-  --model <worker_model_or_default> \
-  --cwd <project_dir> \
-  --disallowed-tools spawn_worker
+Message arrives for topic
+        │
+        ▼
+Pane alive for topic?
+   ├── Yes (warm)  → inject prompt via PTY write immediately
+   └── No  (cold) → spawn pane:
+                     tmux new-window -t telegram-bridge -n "topic-<thread_id>"
+                       "claude --resume <session_id>   # or no --resume on first ever message
+                               --dangerously-skip-permissions
+                               --model <topic_model>
+                               --cwd <project_dir>
+                               --append-system-prompt '<dispatcher context>'"
+                     wait for startup handshake (~3s: DA query + trust dismiss + ready)
+                     inject prompt via bracketed paste
+
+Response scraped
+        │
+        ▼
+Reset idle timer (pane_idle_ttl = 5 min)
+        │
+        ▼  (timer fires with no new message)
+tmux kill-pane  →  pane_state = idle  (session_id kept in SQLite)
+```
+
+Cold-start latency is ~3–4s (claude startup + PTY handshake). Warm injection is near-instant. The `pane_idle_ttl` is configurable per group — set higher for active development sessions, lower for rarely-used topics.
+
+**Worker invocation (transient tmux pane, spawned on spawn_worker tool call):**
+
+```
+# Fresh pane per worker, torn down on completion
+tmux new-window -t telegram-bridge -n "worker-<worker_id>" \
+  "claude --dangerously-skip-permissions \
+          --model <worker_model_or_default> \
+          --cwd <project_dir> \
+          --disallowed-tools spawn_worker"
+
+# Prompt injected via bracketed paste; result extracted via pyte scrape
+# Pane closed after result captured
 ```
 
 Workers do not get `--resume` (fresh session each time) and cannot call `spawn_worker` (depth limit = 1).
 
-**Key CLI flags:**
-- `-p` — print mode, exits after one response
-- `--output-format stream-json` — NDJSON streaming for live Telegram edits
-- `--resume <session_id>` — orchestrator only; restores full conversation context
+**Key CLI flags and PTY mechanics:**
+- Interactive mode (no `-p`) — claude runs in REPL mode, billing via subscription
+- `--resume <session_id>` — orchestrator only; restores full conversation context across pane restarts
 - `--append-system-prompt` — injects dispatcher context into orchestrator (see Phase 9)
 - `--disallowed-tools spawn_worker` — workers cannot recursively spawn
 - `--model` — per-session or per-worker model override
 - `--allowed-tools` / `--disallowed-tools` — tool restrictions per group
+- Bracketed paste mode (`\x1b[200~` … `\x1b[201~`) — injects multi-line prompts without triggering premature submission
+- pyte VT100 screen emulator — extracts response text from PTY byte stream; watches for response-start sentinel (`●`) and end-of-response separators (`────`)
+- `PRE_RESP_TIMEOUT = 120s` — wait for first `●` after prompt injection
+- `IDLE_TIMEOUT = 30s` — session considered done after 30s silence past last response chunk
 
 **Synthetic tools intercepted by the bridge** (not real Anthropic tools — described via system prompt):
 
@@ -307,11 +328,13 @@ Workers do not get `--resume` (fresh session each time) and cannot call `spawn_w
 
 The scanner loop in `invokeClaudeAPI` intercepts `tool_use` blocks with these names before they reach the `result` event, handles them synchronously (DB write + goroutine spawn), and writes the `tool_result` back to the subprocess stdin so the orchestrator continues without stalling.
 
-**Stream-json NDJSON event types handled:**
-- `system` — capture `session_id` early
-- `stream_event` → `content_block_delta` → `text_delta` — progressive text streaming to Telegram
-- `stream_event` → `content_block_start` → `tool_use` — intercept synthetic tools; display tool name as progress notification for real tools
-- `result` — final metadata: `session_id`, `result`, `is_error`, `total_cost_usd`, `usage`
+**PTY output parsing (replacing NDJSON stream):**
+- Response start detected by `●` (U+25CF) sentinel in PTY byte stream
+- Tool use detected by watching for known tool-start patterns in the VT100 screen buffer
+- Response end detected by `────` separator bars and subsequent idle gap
+- Full response extracted by pyte `_SCREEN_ROWS=2000` screen emulator after end-of-response detected
+- Session ID captured from the initial pane startup output (claude prints it on attach/resume)
+- Cost/usage not available in interactive mode (subscription billing — no per-call token counts)
 
 **Worker goroutine on completion:**
 1. Update `workers` row: `status=done`, `result=...`, `finished_at=now`
@@ -331,9 +354,11 @@ Worker 2 (<model>): error — <error>
 The `pendingWorkerResults` map is drained atomically at the start of each `processBatch`.
 
 **Orchestrator session lifecycle:**
-- **Create:** First message to a new topic — `claude -p` without `--resume`, capture `session_id`, store in SQLite
-- **Resume:** All subsequent messages — `claude -p --resume <session_id>`
-- **Close:** `/close`, topic deletion, or natural language close intent — mark `status=closed` in SQLite
+- **Create:** First message to a new topic — launch pane (no `--resume`), capture `session_id` from startup output, store in SQLite, start idle timer
+- **Warm resume:** Message arrives while pane is alive — inject prompt directly, reset idle timer
+- **Cold resume:** Message arrives after pane was culled — relaunch with `--resume <session_id>`, wait for startup handshake, inject prompt, start idle timer
+- **Idle cull:** `pane_idle_ttl` expires — `tmux kill-pane`, set `pane_state=idle`; `session_id` retained in SQLite
+- **Close:** `/close`, topic deletion, or natural language close intent — `tmux kill-pane`, mark `status=closed` in SQLite; session permanently ended
 
 **Concurrency model:**
 - One orchestrator goroutine per topic (non-blocking worker, messages buffer in `pending` slice)
@@ -346,14 +371,13 @@ The `pendingWorkerResults` map is drained atomically at the start of each `proce
 - Bridge-side progress ticker fires every `groups.progress_interval_sec` (default 120s) if no output sent
 
 ```go
-ctx, cancel := context.WithTimeout(context.Background(), timeout)
-defer cancel()
-
-cmd := exec.CommandContext(ctx, "claude", "-p", ...)
-// CommandContext kills the process when ctx expires
-err := cmd.Wait()
-if ctx.Err() == context.DeadlineExceeded {
-    // notify user in Telegram
+// PTY read loop with timeout
+select {
+case resp := <-ptyResponseCh:
+    // response extracted from pyte screen
+case <-time.After(timeout):
+    // kill the pane, notify user in Telegram
+    tmuxKillPane(paneID)
 }
 ```
 
@@ -494,13 +518,14 @@ Thin async HTTP client that posts to the proxy's outbound endpoints. Handles:
 ```sql
 -- Which groups are registered and their default settings
 CREATE TABLE groups (
-    chat_id       INTEGER PRIMARY KEY,
-    name          TEXT,
-    cwd           TEXT NOT NULL,
-    default_model TEXT DEFAULT 'claude-sonnet-4-6',
-    max_budget    REAL DEFAULT 5.0,
-    timeout_sec   INTEGER DEFAULT 300,
-    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    chat_id         INTEGER PRIMARY KEY,
+    name            TEXT,
+    cwd             TEXT NOT NULL,
+    default_model   TEXT DEFAULT 'claude-sonnet-4-6',
+    max_budget      REAL DEFAULT 5.0,
+    timeout_sec     INTEGER DEFAULT 300,
+    pane_idle_ttl   INTEGER DEFAULT 300,  -- seconds to keep pane alive after last response (0 = kill immediately)
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- Maps each topic to a Claude Code session
@@ -511,6 +536,8 @@ CREATE TABLE sessions (
     cwd           TEXT NOT NULL,
     model         TEXT,
     status        TEXT NOT NULL DEFAULT 'active',  -- active, closed, error
+    pane_state    TEXT NOT NULL DEFAULT 'idle',    -- idle (no pane), warm (pane alive), processing
+    tmux_pane_id  TEXT,                            -- tmux pane target (e.g. "telegram-bridge:topic-42"), null when idle
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
     last_active   TEXT NOT NULL DEFAULT (datetime('now')),
     message_count INTEGER NOT NULL DEFAULT 0,
@@ -628,10 +655,10 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 - Poller → Router → Session Manager → Sender pipeline
 - SQLite state with `groups` and `sessions` tables (`modernc.org/sqlite`)
 - General topic: `/cwd` command to register a group
-- Non-General topics: create session on first message, `--resume` on subsequent
-- Claude CLI invoked via `os/exec`, stdout parsed line-by-line with `bufio.Scanner`
+- Non-General topics: create tmux pane + session on first message, inject into existing pane on subsequent
+- PTY manager component: launches/tracks tmux panes in the `telegram-bridge` session (one pane per active topic), injects prompts via bracketed paste, scrapes responses via pyte VT100 emulator
 - Text-only (no media processing)
-- No streaming — use `--output-format json`, wait for full response, send as single message (chunked if >4096)
+- No streaming initially — wait for full response from PTY, send as single message (chunked if >4096)
 - Single static binary, systemd unit on EX44
 - Verify: send message in topic, receive Claude response
 
@@ -647,9 +674,9 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 ## Phase 2: Streaming and Formatting
 
 ### 2.1 — Progressive Streaming
-- Use `--output-format stream-json --include-partial-messages` to get text deltas
-- Parse NDJSON lines from stdout, extract `text_delta` from `stream_event` objects
-- Send placeholder message, edit in-place as text streams
+- Poll pyte screen buffer while PTY output is arriving (after `●` sentinel, before end-of-response separator)
+- Extract incrementally-growing response text from screen on each poll tick (~500ms)
+- Send placeholder message, edit in-place as new text appears
 - Debounce edits to 1/second
 - Handle overflow (>4096 chars) by sending new messages
 
@@ -660,8 +687,8 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 
 ### 2.3 — Permission Handling
 - Default `--permission-mode plan` means Claude proposes before executing
-- The CLI blocks on stdin waiting for approval — the bridge can detect tool approval prompts in the stream and send inline keyboards to Telegram
-- Callback query response writes approval/denial to the subprocess stdin
+- The interactive CLI shows a permission prompt in the pane — the bridge detects this pattern in PTY output and sends inline keyboards to Telegram
+- Callback query response writes approval/denial via PTY write to the pane
 - Alternative: use `--permission-mode acceptEdits` or `--permission-mode dontAsk` for trusted groups to skip interactive approval
 
 **Deliverable:** Streamed responses with proper formatting and interactive tool approval.
@@ -859,25 +886,25 @@ The dashboard is optional — the bridge functions identically without it. It's 
 
 Prerequisite pieces that the Phase 9 dispatcher architecture depends on. The bridge must support long-running invocations, cancellation, and non-blocking operation before the orchestrator/worker model can work reliably. Phases 7 and 9 are designed together — Phase 7 is the infrastructure layer, Phase 9 is the dispatch layer built on top of it.
 
-**Status of 7.1–7.2:** Implemented. Non-blocking worker (background goroutine per invocation), timeout raised to 1800s, `timeout_sec=0` for no deadline, subprocess context decoupled from Telegram send context.
+**Status of 7.1–7.2:** Implemented (under `claude -p` model). These need revisiting under the interactive PTY model — cancellation now means writing `\x03` (Ctrl-C) to the pane's PTY rather than sending SIGTERM to a subprocess, and timeout means abandoning the PTY read loop and killing the pane.
 
 ### 7.1 — In-flight cancellation
 
-**Problem:** A stuck or long-running invocation holds the topic worker goroutine with no escape.
+**Problem:** A stuck or long-running invocation holds the topic PTY read loop with no escape.
 
-**Solution:** Track the active `*exec.Cmd` in `topicWorker`. A `/cancel` command (general topic or in-topic) sends `SIGTERM` to the running process.
+**Solution:** Track the active pane ID in `topicWorker`. A `/cancel` command writes `\x03` (Ctrl-C) to the pane's PTY to interrupt the running Claude turn.
 
 ```go
 type topicWorker struct {
-    ch        chan sessionMsg
-    cancel    context.CancelFunc
-    activeCmd *exec.Cmd   // guarded by activeMu
-    activeMu  sync.Mutex
+    ch          chan sessionMsg
+    cancel      context.CancelFunc
+    activePaneID string   // guarded by activeMu
+    activeMu    sync.Mutex
 }
 ```
 
-- Set `activeCmd` when `cmd.Start()` succeeds; clear it after `cmd.Wait()` returns.
-- `/cancel [thread_id]` command: acquire `activeMu`, call `activeCmd.Process.Signal(os.Interrupt)`.
+- Set `activePaneID` when pane is launched; clear it after PTY read loop exits.
+- `/cancel [thread_id]` command: acquire `activeMu`, write `\x03` to the pane PTY via `tmux send-keys -t <paneID> C-c`.
 - Edit the "Thinking…" placeholder to "⚠️ Cancelled" on cancellation.
 - Topic color → red on cancel.
 
@@ -917,7 +944,7 @@ Behavior:
 
 ### 7.4 — Sub-task orchestrator (multi-instance fan-out/fan-in)
 
-**Core feature:** Allow Claude or the user to dispatch multiple parallel `claude -p` instances from a single topic, with results funneled back to that topic.
+**Core feature:** Allow Claude or the user to dispatch multiple parallel interactive Claude instances (each in its own tmux pane) from a single topic, with results funneled back to that topic.
 
 #### SQLite schema addition
 
@@ -942,8 +969,9 @@ CREATE TABLE subtasks (
 
 ```go
 type SubtaskOrchestrator struct {
-    db     *DB
-    sender *Sender
+    db      *DB
+    sender  *Sender
+    ptyMgr  *PTYManager  // manages tmux panes for subtask workers
 }
 
 type SubtaskRequest struct {
@@ -952,7 +980,7 @@ type SubtaskRequest struct {
     MsgID    int64
     Prompts  []string  // one per parallel instance
     Group    *Group
-    Session  *Session  // parent session; each subtask gets its own session or inherits
+    Session  *Session  // parent session; each subtask gets its own pane
 }
 
 func (o *SubtaskOrchestrator) Run(ctx context.Context, req SubtaskRequest)
@@ -960,7 +988,7 @@ func (o *SubtaskOrchestrator) Run(ctx context.Context, req SubtaskRequest)
 
 Behavior:
 1. For each prompt, insert a `subtasks` row with `status=running`.
-2. Spawn a goroutine per prompt running `invokeClaudeAPI` (fresh session, same CWD).
+2. Spawn a goroutine per prompt; each goroutine launches a fresh tmux pane running `claude` (no `--resume`), injects the prompt via bracketed paste, and scrapes the response via pyte.
 3. As each goroutine completes, update the `subtasks` row and post the result to the originating topic.
 4. Post results as they arrive (fan-in is non-blocking).
 5. A final "All N sub-tasks complete" summary is sent when all goroutines exit.
@@ -1057,9 +1085,9 @@ CREATE TABLE background_jobs (
 │  │  Poller   │→│   Router     │→│      Session Manager          │   │
 │  └──────────┘  └──────────────┘  │                              │   │
 │                                  │  TopicWorker (per topic)     │   │
-│                                  │  ├─ Single invoke (current)  │   │
+│                                  │  ├─ PTY pane (current)       │   │
 │                                  │  └─ SubtaskOrchestrator      │   │
-│                                  │       ├─ claude -p (x1..N)   │   │
+│                                  │       ├─ pane per prompt     │   │
 │                                  │       └─ fan-in → sender     │   │
 │                                  └──────────────────────────────┘   │
 │                                                                      │
@@ -1094,10 +1122,10 @@ Bridge (dispatcher)
     │                                │  calls spawn_worker tool N times
     │                                ▼
     │         ┌──────────────────────────────────────┐
-    │         │  Worker pool (bridge-managed)         │
-    │         │  Worker 1: claude -p (fresh session)  │
-    │         │  Worker 2: claude -p (fresh session)  │
-    │         │  Worker N: claude -p (fresh session)  │
+    │         │  Worker pool (bridge-managed)              │
+    │         │  Worker 1: tmux pane, claude (fresh)       │
+    │         │  Worker 2: tmux pane, claude (fresh)       │
+    │         │  Worker N: tmux pane, claude (fresh)       │
     │         └──────────────────────────────────────┘
     │                                │
     │         worker completes       │
@@ -1154,13 +1182,13 @@ The bridge intercepts `tool_use` blocks with `name="spawn_worker"` from the orch
 **Bridge handling:**
 1. Parse `tool_use` block: `{name: "spawn_worker", input: {prompt, model?}}`
 2. Insert row into `workers` table (`status=running`)
-3. Spawn goroutine: fresh `claude -p` subprocess with the given prompt, inherit CWD, use specified model or orchestrator default
+3. Spawn goroutine: launch fresh tmux pane running `claude` (no `--resume`) with the given prompt, inherit CWD, use specified model or orchestrator default
 4. Return `tool_result` immediately: `{worker_id: "uuid", status: "dispatched"}` — orchestrator continues without waiting
 5. Worker goroutine on completion:
    - Updates `workers` row to `status=done`
    - Posts worker result to Telegram thread: `⚙️ Worker [N] complete: <truncated result>`
    - Writes worker result into a pending-injection buffer for the orchestrator
-6. Next time the orchestrator's `claude -p` subprocess exits and a new invocation begins (user sends follow-up, or orchestrator posts an update_progress that triggers re-entry), the worker results are injected as additional context into the new prompt
+6. Next time the user sends a follow-up (or orchestrator posts an update_progress that triggers re-entry), the worker results are injected as additional context prepended to the new prompt
 
 **Schema:**
 ```sql
@@ -1335,7 +1363,7 @@ The bridge queries the proxy's `/health` endpoint (which returns `contract_versi
 |---|---|---|---|
 | Proxy language | Go | **Decided: Go** | Same language as bridge, single binary, minimal container |
 | Bridge language | Go | **Decided: Go** | See language evaluation below |
-| Claude integration | Headless CLI | **Decided: CLI** | `claude -p` with `--output-format stream-json`, `--resume` for sessions. Subprocess per prompt. |
+| Claude integration | Interactive CLI via PTY | **Decided: Interactive CLI** | `claude` in interactive mode (no `-p`), one persistent tmux pane per topic within the `telegram-bridge` session. Prompt injection via bracketed paste, response extraction via pyte VT100 emulator. Subscription billing (not API credits). `--resume` for session continuity on pane restart. |
 | Message format proxy→bridge | Normalized envelope vs raw Telegram JSON | Normalized | Keeps bridge decoupled from Telegram API specifics, proxy handles schema changes |
 | Media transfer proxy→bridge | Inline in update vs separate `/file` endpoint | Separate `/file` | Keeps update payloads small, avoids large base64 blobs |
 | Whisper model | turbo vs base vs small | turbo | Best accuracy-to-speed ratio |
@@ -1450,3 +1478,6 @@ The bridge and proxy share a Go module (monorepo with `cmd/proxy/` and `cmd/brid
 | SQLite corruption on EX44 | Lost routing state | WAL mode, regular backups, sessions recoverable from Claude Code's own session storage |
 | Proxy unreachable (Tailscale disruption) | Bridge can't send/receive | Exponential backoff retry, notification on recovery, messages queued locally |
 | Token leak via Claude Code output | Bot token exposed | Impossible by design — token never reaches EX44 |
+| PTY screen scraping fragility | Response extraction breaks on claude UI changes | Pin sentinel characters (`●`, `────`) and test on each claude update; fall back to full screen dump if partial extraction fails |
+| tmux session missing on bridge restart | All warm panes lost | Expected and safe — dynamic model means panes are ephemeral; on next message the bridge does a cold resume via `--resume <session_id>`; no manual recovery needed |
+| claude interactive mode UI changes | Bracketed paste or startup behavior changes break injection | Keep PTY integration logic isolated in PTYManager; sentinel + timing constants are the fragile surface — document and test them |

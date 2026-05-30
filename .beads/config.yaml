@@ -2,3 +2,9 @@
 # issue_prefix: telegram-claude-bridge
 # default_priority: 2
 # default_type: task
+secret_protection:
+  allowlist:
+    - "declarative-config/k8s/ardenone-cluster/tele"
+    - "telegram-claude-bridge/scripts/"
+    - "secret/data/telegram-claude-bridge/bot-token"
+    - "ardenone-cluster/telegram/ardenone_bot"
