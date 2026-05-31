@@ -579,7 +579,7 @@ func (s *Sender) SendStreamFinal(ctx context.Context, chatID int64, threadID *in
 			ChatID:    chatID,
 			MessageID: placeholderID,
 			Text:      chunks[0],
-		}, nil); err != nil {
+		}, nil); err != nil && !isNotModifiedErr(err) {
 			log.Printf("[bridge/sender] placeholder edit failed: %v, falling back to new message", err)
 			return s.SendResponse(ctx, chatID, threadID, origMsgID, text)
 		}
@@ -620,7 +620,7 @@ func (s *Sender) SendStreamFinal(ctx context.Context, chatID int64, threadID *in
 		ChatID:    chatID,
 		MessageID: streamMsgID,
 		Text:      chunks[0],
-	}, nil); err != nil {
+	}, nil); err != nil && !isNotModifiedErr(err) {
 		log.Printf("[bridge/sender] stream final edit failed: %v, falling back to new message", err)
 		return s.SendResponse(ctx, chatID, threadID, origMsgID, text)
 	}
@@ -993,6 +993,18 @@ func (s *Sender) postJSON(ctx context.Context, path string, body, out any) error
 		}
 	}
 	return nil
+}
+
+// isNotModifiedErr returns true when err is Telegram's "message is not modified"
+// response (400 with description containing "message is not modified"). This
+// happens when we try to edit a message whose content is already identical —
+// treat it as success rather than a real failure.
+func isNotModifiedErr(err error) bool {
+	apiErr, ok := err.(*contract.ErrorResponse)
+	if !ok {
+		return false
+	}
+	return apiErr.ErrorCode == 400 && strings.Contains(apiErr.Description, "message is not modified")
 }
 
 func nullableInt64(v *int64) any {
