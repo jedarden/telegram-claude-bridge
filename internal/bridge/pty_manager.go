@@ -161,29 +161,23 @@ func (p *PTYManager) WaitForStartup(paneTarget string) error {
 }
 
 // InjectPrompt writes a multi-line prompt to the pane's PTY via bracketed paste mode.
-// Bracketed paste prevents the shell/REPL from treating newlines as submissions.
-// The actual Enter/submit is sent separately via tmux send-keys on the master end;
-// the trailing \r written to the slave PTY is no longer reliable for submission.
+// Uses `tmux paste-buffer -p` which wraps the content in bracketed-paste markers
+// (ESC[200~ … ESC[201~) and sends it via the master PTY — the only reliable path in
+// Claude Code v2.1.158+. The old slave-write approach (open /dev/pts/N, write ESC[200~)
+// no longer injects keyboard input; the bytes render on screen but the app's input
+// buffer stays empty, so the subsequent Enter submits nothing.
 func (p *PTYManager) InjectPrompt(paneTarget, prompt string) error {
-	ttyPath, err := p.PaneTTY(paneTarget)
-	if err != nil {
-		return fmt.Errorf("get tty for inject: %w", err)
-	}
-	f, err := os.OpenFile(ttyPath, os.O_WRONLY, 0)
-	if err != nil {
-		return fmt.Errorf("open tty for inject: %w", err)
-	}
+	// Use pane target as buffer name to avoid collisions between concurrent panes.
+	// tmux buffer names allow colons and hyphens.
+	bufName := "inj-" + strings.ReplaceAll(paneTarget, ":", "-")
 
-	// Bracketed paste: ESC[200~ + text + ESC[201~  (no trailing \r — see below)
-	payload := "\x1b[200~" + prompt + "\x1b[201~"
-	_, writeErr := f.WriteString(payload)
-	f.Close()
-	if writeErr != nil {
-		return fmt.Errorf("write prompt to tty: %w", writeErr)
+	if out, err := exec.Command("tmux", "set-buffer", "-b", bufName, prompt).CombinedOutput(); err != nil {
+		return fmt.Errorf("set-buffer: %w: %s", err, out)
 	}
-
-	// Submit via tmux master end. Writing \r to the slave PTY is not reliable for
-	// submission in Claude's TUI; tmux send-keys goes through the master and works.
+	// -p wraps content in ESC[200~ … ESC[201~ bracketed-paste markers.
+	if out, err := exec.Command("tmux", "paste-buffer", "-t", paneTarget, "-b", bufName, "-p").CombinedOutput(); err != nil {
+		return fmt.Errorf("paste-buffer: %w: %s", err, out)
+	}
 	if out, err := exec.Command("tmux", "send-keys", "-t", paneTarget, "Enter").CombinedOutput(); err != nil {
 		return fmt.Errorf("send-keys enter: %w: %s", err, out)
 	}
