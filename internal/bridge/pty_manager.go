@@ -333,9 +333,20 @@ func extractResponseText(screen string) string {
 		if strings.ContainsRune(line, promptRune) {
 			break
 		}
-		// Strip Claude UI chrome: "✻ Cogitated for Ns" timing lines and ─── separators.
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "✻") || isUIChrome(trimmed) {
+		// Strip timing/thinking indicators: "✻ Brewed for Ns", "✢ Contemplating…"
+		// In some pane/font configurations ✻ (U+273B) is captured as "*", so also
+		// filter "* Word… (…)" which is the only asterisk-prefixed form Claude emits.
+		if strings.HasPrefix(trimmed, "✻") || strings.HasPrefix(trimmed, "✢") || isTimingLine(trimmed) || isUIChrome(trimmed) {
+			continue
+		}
+		// Strip tool call lines: "Bash(cmd)", "Read(path)", "Edit(path)", etc.
+		// These are Claude Code tool invocations that aren't part of the prose response.
+		if isToolCallLine(trimmed) {
+			continue
+		}
+		// Strip tool result lines prefixed with ⎿ (tool output indentation).
+		if strings.HasPrefix(trimmed, "⎿") {
 			continue
 		}
 		result = append(result, line)
@@ -352,6 +363,41 @@ func isUIChrome(s string) bool {
 	}
 	for _, r := range s {
 		if r != '─' && r != '═' && r != '━' && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// isTimingLine returns true for Claude Code timing/status lines that appear after
+// a response: "✻ Brewed for 5s", "✢ Contemplating…", and also the asterisk form
+// "* Word… (Ns · …)" emitted when ✻ (U+273B) is captured as ASCII '*' in some panes.
+func isTimingLine(s string) bool {
+	if strings.HasPrefix(s, "✻") || strings.HasPrefix(s, "✢") {
+		return true
+	}
+	// "* Verb… (Ns ·" pattern — only asterisk-prefixed lines Claude emits.
+	if len(s) > 2 && s[0] == '*' && s[1] == ' ' {
+		rest := s[2:]
+		return strings.Contains(rest, "…") || strings.Contains(rest, "...") || strings.Contains(rest, "(")
+	}
+	return false
+}
+
+// isToolCallLine returns true for Claude Code tool invocation lines:
+// "Bash(cmd)", "Read(path)", "Edit(path)", "WebSearch(query)", etc.
+// These start with an uppercase word immediately followed by '('.
+func isToolCallLine(s string) bool {
+	if len(s) == 0 || s[0] < 'A' || s[0] > 'Z' {
+		return false
+	}
+	parenIdx := strings.IndexByte(s, '(')
+	if parenIdx <= 0 {
+		return false
+	}
+	for i := 0; i < parenIdx; i++ {
+		c := s[i]
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
 			return false
 		}
 	}
