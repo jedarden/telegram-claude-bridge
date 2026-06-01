@@ -17,14 +17,17 @@ const (
 	preRespTimeout  = 120 * time.Second
 	ptyIdleTimeout  = 45 * time.Second
 	ptyPollInterval = 300 * time.Millisecond
-	// Startup polling timeouts
-	trustDialogTimeout = 30 * time.Second
-	promptReadyTimeout = 30 * time.Second
+	// Startup polling timeouts — generous to accommodate large --resume sessions.
+	trustDialogTimeout = 60 * time.Second
+	promptReadyTimeout = 120 * time.Second
 	// Unicode sentinels from claude's interactive UI.
 	responseStartRune = '●' // U+25CF — appears at start of each claude response
 	promptRune        = '❯' // U+276F — appears when claude is ready for next input
-	// Trust dialog indicator
+	// Trust/confirm dialog indicator (permissions, updates, etc.)
 	trustDialogText = "Enter to confirm"
+	// Resume-size dialog added in Claude Code v2.1.159 — appears when --resume
+	// loads a session large enough to impact usage limits.
+	resumeSizeDialogText = "Resuming the full session"
 )
 
 // PTYManager manages interactive Claude CLI processes via tmux panes.
@@ -116,11 +119,15 @@ func (p *PTYManager) KillPane(paneTarget string) {
 }
 
 // WaitForStartup polls the pane until claude is ready for input.
-// Handles trust dialogs and resume-session dialogs (both show "Enter to confirm")
-// by sending Enter via tmux send-keys. Returns only when ❯ is visible with no
-// dialog AND the screen has been stable for screenIdleWindow — this prevents a
-// false-positive from ❯ appearing in old session history before the resume dialog
-// finishes rendering.
+// Handles several startup dialogs:
+//   - Trust/permissions dialogs: "Enter to confirm" → send Enter
+//   - Large-session resume dialog (v2.1.159+): "Resuming the full session" →
+//     send Down+Enter to select "Resume full session as-is" (option 2), avoiding
+//     summary generation which re-reads all referenced files and keeps the screen
+//     active for minutes, preventing the stability window from closing.
+//
+// Returns only when ❯ is visible with no dialog AND the screen has been stable
+// for screenIdleWindow — preventing false-positives from ❯ in old session history.
 func (p *PTYManager) WaitForStartup(paneTarget string) error {
 	const screenIdleWindow = 3 * time.Second
 
@@ -137,19 +144,28 @@ func (p *PTYManager) WaitForStartup(paneTarget string) error {
 				lastChange = time.Now()
 			}
 
+			hasResumeDialog := strings.Contains(screen, resumeSizeDialogText)
 			hasDismissDialog := strings.Contains(screen, trustDialogText)
 			hasPrompt := strings.ContainsRune(screen, promptRune)
 
-			if hasDismissDialog {
-				// Dismiss any "Enter to confirm" dialog via tmux master end.
+			if hasResumeDialog {
+				// Select "Resume full session as-is" (option 2) to avoid summary
+				// generation which causes prolonged screen activity.
+				if time.Since(lastDismiss) > 600*time.Millisecond {
+					exec.Command("tmux", "send-keys", "-t", paneTarget, "Down").Run()
+					exec.Command("tmux", "send-keys", "-t", paneTarget, "Enter").Run()
+					lastDismiss = time.Now()
+					lastChange = time.Now()
+				}
+			} else if hasDismissDialog {
+				// Dismiss trust/permission/update dialogs.
 				if time.Since(lastDismiss) > 600*time.Millisecond {
 					exec.Command("tmux", "send-keys", "-t", paneTarget, "Enter").Run()
 					lastDismiss = time.Now()
-					lastChange = time.Now() // reset idle timer — screen is about to change
+					lastChange = time.Now()
 				}
 			} else if hasPrompt && time.Since(lastChange) >= screenIdleWindow {
-				// ❯ visible, no dialog, and screen has been stable for screenIdleWindow.
-				// The idle window ensures any resume dialog has had time to render.
+				// ❯ visible, no dialog, screen stable for screenIdleWindow.
 				return nil
 			}
 		}
