@@ -148,7 +148,20 @@ type Snippet struct {
 	CreatedAt time.Time // When the snippet was created
 }
 
-const schemaVersion = 19
+// ConversationMessage is a stored Telegram exchange — one user turn or one
+// assistant turn. The bridge writes these independently of Claude sessions so
+// conversation history survives session loss, restarts, or --resume failures.
+type ConversationMessage struct {
+	ID        int64
+	ChatID    int64
+	ThreadID  int64
+	Role      string    // "user" or "assistant"
+	Content   string
+	TgMsgID   int64     // Telegram message ID (user messages only; 0 for assistant)
+	CreatedAt time.Time
+}
+
+const schemaVersion = 20
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -319,6 +332,22 @@ var migrations = []string{
 			);
 
 			CREATE INDEX IF NOT EXISTS idx_snippets_chat_id ON snippets(chat_id);`,
+
+			// Version 20 — conversation history table, independent of Claude sessions.
+			// Stores every user message and assistant response so history survives
+			// session loss, binary restarts, or --resume failures.
+			`CREATE TABLE IF NOT EXISTS conversation_messages (
+				id         INTEGER PRIMARY KEY AUTOINCREMENT,
+				chat_id    INTEGER NOT NULL,
+				thread_id  INTEGER NOT NULL,
+				role       TEXT NOT NULL,
+				content    TEXT NOT NULL,
+				tg_msg_id  INTEGER NOT NULL DEFAULT 0,
+				created_at TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_conv_msgs_topic
+				ON conversation_messages (chat_id, thread_id, created_at);`,
 	}
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
 // and applies any pending migrations.
@@ -1703,6 +1732,59 @@ func (d *DB) DeleteSnippet(ctx context.Context, chatID int64, name string) error
 	_, err := d.db.ExecContext(ctx,
 		`DELETE FROM snippets WHERE chat_id = ? AND name = ?`,
 		chatID, name)
+	return err
+}
+
+// ── conversation history ──────────────────────────────────────────────────────
+
+// AddConversationMessage appends a user or assistant turn to the stored history
+// for a topic. tgMsgID should be the Telegram message ID for user turns (0 for
+// assistant turns).
+func (d *DB) AddConversationMessage(ctx context.Context, chatID, threadID int64, role, content string, tgMsgID int64) error {
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO conversation_messages (chat_id, thread_id, role, content, tg_msg_id)
+		 VALUES (?, ?, ?, ?, ?)`,
+		chatID, threadID, role, content, tgMsgID)
+	return err
+}
+
+// GetConversationHistory returns up to limit messages for a topic, ordered
+// oldest-first (ready to prepend as context).
+func (d *DB) GetConversationHistory(ctx context.Context, chatID, threadID int64, limit int) ([]*ConversationMessage, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT id, chat_id, thread_id, role, content, tg_msg_id, created_at
+		 FROM conversation_messages
+		 WHERE chat_id = ? AND thread_id = ?
+		 ORDER BY created_at DESC
+		 LIMIT ?`,
+		chatID, threadID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []*ConversationMessage
+	for rows.Next() {
+		m := &ConversationMessage{}
+		var createdAt string
+		if err := rows.Scan(&m.ID, &m.ChatID, &m.ThreadID, &m.Role, &m.Content, &m.TgMsgID, &createdAt); err != nil {
+			return nil, err
+		}
+		m.CreatedAt, _ = time.Parse("2006-01-02T15:04:05Z", createdAt)
+		msgs = append(msgs, m)
+	}
+	// Reverse to oldest-first order.
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	return msgs, rows.Err()
+}
+
+// DeleteConversationHistory removes all stored messages for a topic (e.g. on /reset).
+func (d *DB) DeleteConversationHistory(ctx context.Context, chatID, threadID int64) error {
+	_, err := d.db.ExecContext(ctx,
+		`DELETE FROM conversation_messages WHERE chat_id = ? AND thread_id = ?`,
+		chatID, threadID)
 	return err
 }
 

@@ -1208,6 +1208,16 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		return // no content to process
 	}
 
+	// Persist the user's message to conversation history (independent of Claude sessions).
+	// We store the raw user text extracted from the batch — without auto-injected
+	// prefixes (snippets, worker results, history) — so the stored history is clean.
+	userText := buildRawUserText(batch, extras)
+	if userText != "" {
+		if err := m.db.AddConversationMessage(ctx, key.chatID, key.threadID, "user", userText, origMsgID); err != nil {
+			log.Printf("[session_mgr] store user message (%d,%d): %v", key.chatID, key.threadID, err)
+		}
+	}
+
 	// Check budget enforcement before invoking Claude API
 	if err := m.checkBudgetEnforcement(ctx, key.chatID, group); err != nil {
 		// Budget exceeded - send error and don't proceed
@@ -1354,6 +1364,13 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	if err := m.persistSession(ctx, key, session, group, out, fromUserID); err != nil {
 		log.Printf("[session_mgr] persist session (%d,%d): %v", key.chatID, key.threadID, err)
 		// Non-fatal: still deliver the response.
+	}
+
+	// Persist the assistant response to conversation history.
+	if out.Result != "" {
+		if err := m.db.AddConversationMessage(ctx, key.chatID, key.threadID, "assistant", out.Result, 0); err != nil {
+			log.Printf("[session_mgr] store assistant message (%d,%d): %v", key.chatID, key.threadID, err)
+		}
 	}
 
 	// Re-fetch the session to get the latest data (including MessageCount and TotalCostUSD)
@@ -1524,6 +1541,14 @@ func (m *SessionManager) invokeClaudeAPI(
 		m.mu.Lock()
 		m.paneNames[key] = paneTarget
 		m.mu.Unlock()
+
+		// When starting fresh (no session to resume), prepend stored conversation
+		// history so Claude has context even after a session loss or restart.
+		if session == nil || session.SessionID == "" {
+			if history, err := m.db.GetConversationHistory(subprocCtx, key.chatID, key.threadID, 40); err == nil && len(history) > 0 {
+				prompt = prependConversationHistory(history, prompt)
+			}
+		}
 	}
 
 	// Register for cancellation.
@@ -3101,4 +3126,54 @@ func (m *SessionManager) detectGeneratedMedia(cwd string, startTime time.Time, o
 	})
 
 	return err
+}
+
+// buildRawUserText extracts the raw user-facing text from a message batch without
+// any auto-injected prefixes (snippets, worker results, history). This is the
+// content stored in conversation_messages for future history injection.
+func buildRawUserText(batch []sessionMsg, extras []msgExtra) string {
+	texts := make([]string, 0, len(batch))
+	for i, msg := range batch {
+		var ex msgExtra
+		if i < len(extras) {
+			ex = extras[i]
+		}
+		if t := sessionMsgText(msg.update, ex); t != "" {
+			texts = append(texts, t)
+		}
+	}
+	switch len(texts) {
+	case 0:
+		return ""
+	case 1:
+		return texts[0]
+	default:
+		return strings.Join(texts, "\n\n")
+	}
+}
+
+// prependConversationHistory formats stored history as a context block and
+// prepends it to the prompt. Only called on fresh sessions (no --resume).
+func prependConversationHistory(history []*ConversationMessage, prompt string) string {
+	const maxContentLen = 800 // per-message truncation to keep total context manageable
+
+	var sb strings.Builder
+	sb.WriteString("[Conversation history — prior exchanges in this topic]\n\n")
+	for _, m := range history {
+		content := m.Content
+		if len(content) > maxContentLen {
+			content = content[:maxContentLen] + "…"
+		}
+		switch m.Role {
+		case "user":
+			sb.WriteString("User: ")
+		case "assistant":
+			sb.WriteString("Assistant: ")
+		}
+		sb.WriteString(content)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("---\n\n")
+	sb.WriteString(prompt)
+	return sb.String()
 }
