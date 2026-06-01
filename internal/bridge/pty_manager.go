@@ -298,6 +298,9 @@ func (p *PTYManager) WaitForResponse(ctx context.Context, paneTarget string, pre
 
 // responseComplete returns true when ❯ appears after the last ● in the screen,
 // indicating claude has returned to the input prompt.
+// It returns false when active-processing indicators (✽ Cooking…, Reading N file…)
+// are still visible after the last ● — these appear while Claude runs tools and
+// can co-exist with a transient ❯ prompt, causing premature termination.
 func responseComplete(screen string) bool {
 	lines := strings.Split(screen, "\n")
 	bulletIdx := -1
@@ -309,12 +312,27 @@ func responseComplete(screen string) bool {
 	if bulletIdx < 0 {
 		return false
 	}
+	// Guard: if active processing indicators are still visible, Claude is mid-tool-call.
+	// A transient ❯ can appear while a tool runs; don't treat that as completion.
+	for i := bulletIdx + 1; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if isTimingLine(trimmed) || isActiveProgressLine(trimmed) {
+			return false
+		}
+	}
 	for i := bulletIdx + 1; i < len(lines); i++ {
 		if strings.ContainsRune(lines[i], promptRune) {
 			return true
 		}
 	}
 	return false
+}
+
+// isActiveProgressLine returns true for Claude Code lines that indicate active
+// in-flight processing: file-reading progress shown while tools are running.
+func isActiveProgressLine(s string) bool {
+	// "Reading 1 file… (ctrl+o to expand)" — appears while Claude reads files mid-tool-call.
+	return strings.HasPrefix(s, "Reading ") && strings.Contains(s, "file")
 }
 
 // extractResponseText finds the last ● in the screen and returns the text
@@ -365,6 +383,10 @@ func extractResponseText(screen string) string {
 		if strings.HasPrefix(trimmed, "⎿") {
 			continue
 		}
+		// Strip active-progress lines: "Reading N file(s)…" shown during tool execution.
+		if isActiveProgressLine(trimmed) {
+			continue
+		}
 		result = append(result, line)
 	}
 
@@ -386,10 +408,11 @@ func isUIChrome(s string) bool {
 }
 
 // isTimingLine returns true for Claude Code timing/status lines that appear after
-// a response: "✻ Brewed for 5s", "✢ Contemplating…", and also the asterisk form
-// "* Word… (Ns · …)" emitted when ✻ (U+273B) is captured as ASCII '*' in some panes.
+// a response: "✻ Brewed for 5s", "✢ Contemplating…", "✽ Cooking… (5s · ↑ N tokens)",
+// and the asterisk form "* Word… (Ns · …)" emitted when ✻/✽ is captured as '*'.
 func isTimingLine(s string) bool {
-	if strings.HasPrefix(s, "✻") || strings.HasPrefix(s, "✢") {
+	// ✻ U+273B, ✢ U+2762, ✽ U+273D — all used by different Claude Code versions.
+	if strings.HasPrefix(s, "✻") || strings.HasPrefix(s, "✢") || strings.HasPrefix(s, "✽") {
 		return true
 	}
 	// "* Verb… (Ns ·" pattern — only asterisk-prefixed lines Claude emits.
