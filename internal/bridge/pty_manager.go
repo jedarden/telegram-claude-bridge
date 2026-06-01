@@ -12,6 +12,32 @@ import (
 	"time"
 )
 
+// bridgeRespDir returns the directory used to hold stop-hook response files.
+func bridgeRespDir() string {
+	return filepath.Join(os.TempDir(), "telegram-bridge-resp")
+}
+
+// bridgeRespFile returns the path of the stop-hook response file for a pane.
+// paneName is the bare window name (e.g., "t1003602927203-120").
+func bridgeRespFile(paneName string) string {
+	return filepath.Join(bridgeRespDir(), paneName+".resp")
+}
+
+// prepareRespFile removes any stale stop-hook files for paneName and ensures
+// the parent directory exists, returning the file path.
+func prepareRespFile(paneName string) (string, error) {
+	dir := bridgeRespDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("mkdir resp dir: %w", err)
+	}
+	path := bridgeRespFile(paneName)
+	// Remove stale files from a previous invocation.
+	os.Remove(path)
+	os.Remove(path + ".ready")
+	os.Remove(path + ".tmp")
+	return path, nil
+}
+
 const (
 	tmuxSessionName = "telegram-bridge"
 	preRespTimeout  = 120 * time.Second
@@ -70,6 +96,13 @@ func (p *PTYManager) SpawnPane(paneName, cwd string, claudeArgs []string) (strin
 	// Kill any existing window with the same name.
 	exec.Command("tmux", "kill-window", "-t", paneTarget).Run()
 
+	// Prepare the stop-hook response file path for this pane.
+	respFile, err := prepareRespFile(paneName)
+	if err != nil {
+		log.Printf("[pty_mgr] warning: could not prepare resp file for %s: %v", paneName, err)
+		respFile = "" // non-fatal — fall back to PTY extraction only
+	}
+
 	// Build shell command string.
 	parts := append([]string{"claude"}, claudeArgs...)
 	quoted := make([]string, len(parts))
@@ -78,12 +111,18 @@ func (p *PTYManager) SpawnPane(paneName, cwd string, claudeArgs []string) (strin
 	}
 	shellCmd := strings.Join(quoted, " ")
 
-	cmd := exec.Command("tmux", "new-window",
+	args := []string{
+		"new-window",
 		"-t", tmuxSessionName,
 		"-n", paneName,
 		"-c", cwd,
-		shellCmd,
-	)
+	}
+	if respFile != "" {
+		args = append(args, "-e", "BRIDGE_RESPONSE_FILE="+respFile)
+	}
+	args = append(args, shellCmd)
+
+	cmd := exec.Command("tmux", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("spawn pane %s: %w: %s", paneName, err, out)
 	}
@@ -230,7 +269,22 @@ func (p *PTYManager) CaptureScreen(paneTarget string) (string, error) {
 // pre-existing ● markers (from startup or prior responses) do not trigger a
 // false-positive response-start detection.
 // onChunk is called with accumulating response text for live streaming; may be nil.
+//
+// When a stop-hook response file exists for this pane (written by bridge-stop-hook.sh),
+// its content is used as the authoritative final result in place of PTY extraction.
 func (p *PTYManager) WaitForResponse(ctx context.Context, paneTarget string, preInjectScreen string, onChunk func(text string)) (string, error) {
+	// Derive the pane name from the pane target ("telegram-bridge:t…" → "t…").
+	paneName := paneTarget
+	if idx := strings.LastIndex(paneTarget, ":"); idx >= 0 {
+		paneName = paneTarget[idx+1:]
+	}
+	respFile := bridgeRespFile(paneName)
+	readyFile := respFile + ".ready"
+
+	// Clear any stale ready/response files left from a prior invocation on this pane.
+	os.Remove(readyFile)
+	os.Remove(respFile)
+
 	preRespDeadline := time.Now().Add(preRespTimeout)
 	responseStarted := false
 	lastScreen := ""
@@ -271,7 +325,7 @@ func (p *PTYManager) WaitForResponse(ctx context.Context, paneTarget string, pre
 			continue
 		}
 
-		// Response started — extract current text and check for completion.
+		// Response started — extract current text for streaming chunks.
 		text := extractResponseText(screen)
 		if text != lastText {
 			lastText = text
@@ -288,12 +342,34 @@ func (p *PTYManager) WaitForResponse(ctx context.Context, paneTarget string, pre
 		// Response complete: ❯ appears after the last ●, or idle timeout.
 		idled := time.Since(lastChange) >= ptyIdleTimeout
 		if responseComplete(screen) || idled {
-			log.Printf("[pty_mgr] WaitForResponse %s complete: text_len=%d idle=%v", paneTarget, len(lastText), idled)
+			// Check for authoritative text from the stop hook.
+			if hookText, ok := readStopHookResponse(respFile, readyFile); ok {
+				log.Printf("[pty_mgr] WaitForResponse %s complete (stop-hook): text_len=%d idle=%v", paneTarget, len(hookText), idled)
+				return hookText, nil
+			}
+			log.Printf("[pty_mgr] WaitForResponse %s complete (pty): text_len=%d idle=%v", paneTarget, len(lastText), idled)
 			return lastText, nil
 		}
 
 		time.Sleep(ptyPollInterval)
 	}
+}
+
+// readStopHookResponse checks whether the stop hook has written a ready signal
+// and, if so, reads the response file. Returns (text, true) on success, or
+// ("", false) if the hook hasn't fired yet or if the file is missing.
+func readStopHookResponse(respFile, readyFile string) (string, bool) {
+	if _, err := os.Stat(readyFile); err != nil {
+		return "", false // hook hasn't fired yet
+	}
+	data, err := os.ReadFile(respFile)
+	if err != nil {
+		return "", false
+	}
+	// Clean up so the next invocation starts fresh.
+	os.Remove(readyFile)
+	os.Remove(respFile)
+	return strings.TrimRight(string(data), "\n"), true
 }
 
 // responseComplete returns true when ❯ appears after the last ● in the screen,
