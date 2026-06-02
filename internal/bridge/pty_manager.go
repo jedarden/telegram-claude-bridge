@@ -501,8 +501,17 @@ func isTimingLine(s string) bool {
 
 // isToolCallLine returns true for Claude Code tool invocation lines:
 // "Bash(cmd)", "Read(path)", "Edit(path)", "WebSearch(query)", etc.
-// These start with an uppercase word immediately followed by '('.
+// Also handles spinner-prefixed forms like "⠋ Bash(cmd)" where a non-ASCII
+// braille spinner character is prepended during active tool execution.
 func isToolCallLine(s string) bool {
+	// Strip a leading non-ASCII spinner character (braille: U+2800–U+28FF) and space.
+	if len(s) > 0 && s[0] > 127 {
+		i := 0
+		for i < len(s) && s[i] > 127 {
+			i++
+		}
+		s = strings.TrimLeft(s[i:], " ")
+	}
 	if len(s) == 0 || s[0] < 'A' || s[0] > 'Z' {
 		return false
 	}

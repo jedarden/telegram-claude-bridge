@@ -268,16 +268,21 @@ func (u *Updater) buildNewBinary(ctx context.Context) error {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
 		// Fallback to known install locations when go is not in PATH.
+		home := os.Getenv("HOME")
 		for _, candidate := range []string{
 			"/usr/local/go/bin/go",
-			filepath.Join(os.Getenv("HOME"), "go", "bin", "go"),
-			filepath.Join(os.Getenv("HOME"), ".local", "bin", "go"),
+			filepath.Join(home, "local", "go", "bin", "go"), // e.g. ~/local/go/bin/go
+			filepath.Join(home, "go", "bin", "go"),
+			filepath.Join(home, ".local", "bin", "go"),
 		} {
 			if _, statErr := os.Stat(candidate); statErr == nil {
 				goBin = candidate
 				break
 			}
 		}
+	}
+	if goBin == "" {
+		return fmt.Errorf("go binary not found in PATH or fallback locations")
 	}
 	buildCmd := exec.CommandContext(ctx, goBin, "build",
 		"-ldflags", ldflags,
@@ -324,6 +329,33 @@ func (u *Updater) getBuildInfo(ctx context.Context) (version, commit, buildDate 
 	return version, commit, buildDate
 }
 
+// notifyGroup sends msg to the most recently active thread in group, or to the
+// chat root if no sessions exist. Falls back to nil thread on send failure.
+func (u *Updater) notifyGroup(ctx context.Context, chatID int64, msg string) {
+	threadPtr := u.bestNotifyThread(ctx, chatID)
+	if err := u.sender.SendResponse(ctx, chatID, threadPtr, 0, msg); err != nil {
+		if threadPtr != nil {
+			// Retry without a thread in case the thread was deleted.
+			if err2 := u.sender.SendResponse(ctx, chatID, nil, 0, msg); err2 != nil {
+				log.Printf("[updater] send notification to %d: %v (no-thread retry: %v)", chatID, err, err2)
+			}
+		} else {
+			log.Printf("[updater] send notification to %d: %v", chatID, err)
+		}
+	}
+}
+
+// bestNotifyThread returns a pointer to the thread_id of the most recently
+// active session in chatID, or nil if no sessions exist.
+func (u *Updater) bestNotifyThread(ctx context.Context, chatID int64) *int64 {
+	sessions, err := u.db.ListSessions(ctx, chatID)
+	if err != nil || len(sessions) == 0 {
+		return nil
+	}
+	tid := sessions[0].ThreadID
+	return &tid
+}
+
 // notifyBuildFailure sends a Telegram message about the build failure.
 func (u *Updater) notifyBuildFailure(ctx context.Context, buildErr error) {
 	if u.sender == nil || u.db == nil {
@@ -337,12 +369,8 @@ func (u *Updater) notifyBuildFailure(ctx context.Context, buildErr error) {
 	}
 
 	msg := fmt.Sprintf("⚠️ Bridge update failed: %v\n\nContinuing with current binary.", buildErr)
-	generalTopic := int64(1)
-
 	for _, group := range groups {
-		if sendErr := u.sender.SendResponse(ctx, group.ChatID, &generalTopic, 0, msg); sendErr != nil {
-			log.Printf("[updater] send build failure notification to %d: %v", group.ChatID, sendErr)
-		}
+		u.notifyGroup(ctx, group.ChatID, msg)
 	}
 }
 
@@ -359,12 +387,8 @@ func (u *Updater) notifyRestarting(ctx context.Context) {
 	}
 
 	msg := "🔄 Bridge restarting for update..."
-	generalTopic := int64(1)
-
 	for _, group := range groups {
-		if sendErr := u.sender.SendResponse(ctx, group.ChatID, &generalTopic, 0, msg); sendErr != nil {
-			log.Printf("[updater] send restart notification to %d: %v", group.ChatID, sendErr)
-		}
+		u.notifyGroup(ctx, group.ChatID, msg)
 	}
 }
 
