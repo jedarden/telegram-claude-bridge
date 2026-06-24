@@ -26,7 +26,7 @@ User commands:
 /sonnet — quick switch to claude-sonnet-4-6
 /opus — quick switch to claude-opus-4-6
 /color [name] — set topic icon color (active, complete, blocked, error, review, research)
-/notify [mode] — set notification mode (live, summary, quiet)
+/notify [mode] — set notification mode (streaming, summary, quiet)
 /context <thread_id|topic_name> — fetch context from another topic and inject it
 /snippet <name> <content> — save a context snippet (use "delete <name>" to remove)
 /snippets — list all context snippets for this chat
@@ -837,7 +837,7 @@ func colorToName(color int) string {
 }
 
 // cmdNotify handles /notify [mode] — sets the notification mode for this topic.
-// Valid modes: live (stream every update), summary (final response only), quiet (only notify on completion/error).
+// Valid modes: streaming (stream every update), summary (final response only), quiet (only notify on completion/error).
 func (h *CommandHandler) cmdNotify(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
 	if update.ThreadID == nil {
 		return "Notification mode commands only work within a topic session. Use /new to create a topic first.", nil
@@ -858,25 +858,36 @@ func (h *CommandHandler) cmdNotify(ctx context.Context, update contract.Update, 
 	// If no args, show current mode
 	if args == "" {
 		currentMode := session.NotificationMode
-		if currentMode == "" {
-			currentMode = "live"
+		if currentMode == "" || currentMode == "live" {
+			currentMode = "streaming"
 		}
-		return fmt.Sprintf("Notification mode: %s\n\nAvailable modes:\n  • live — stream every update with progressive editing\n  • summary — only send the final response (no streaming)\n  • quiet — only notify on completion or error", currentMode), nil
+		return fmt.Sprintf("Notification mode: %s\n\nAvailable modes:\n  • streaming — stream every update with progressive editing\n  • summary — only send the final response (no streaming)\n  • quiet — only notify on completion or error", currentMode), nil
 	}
 
 	// Validate and set the new mode
 	newMode := strings.ToLower(strings.TrimSpace(args))
 	var valid bool
 	switch newMode {
-	case "live", "summary", "quiet":
+	case "streaming", "live", "summary", "quiet":
 		valid = true
 	}
 
 	if !valid {
-		return fmt.Sprintf("Invalid notification mode %q.\n\nAvailable modes: live, summary, quiet", args), nil
+		return fmt.Sprintf("Invalid notification mode %q.\n\nAvailable modes: streaming, summary, quiet", args), nil
 	}
 
-	session.NotificationMode = newMode
+	// Normalize "live" to "streaming" for storage
+	if newMode == "live" {
+		newMode = "streaming"
+	}
+
+	// Store as "live" internally for compatibility with existing code
+	internalMode := "live"
+	if newMode != "streaming" {
+		internalMode = newMode
+	}
+
+	session.NotificationMode = internalMode
 	if err := h.db.UpdateSession(ctx, session); err != nil {
 		return "", fmt.Errorf("update session notification mode: %w", err)
 	}
@@ -1169,8 +1180,8 @@ func (h *CommandHandler) cmdInfo(ctx context.Context, update contract.Update, gr
 	fmt.Fprintf(&sb, "Cost: $%.4f\n", session.TotalCostUSD)
 	fmt.Fprintf(&sb, "Status: %s\n", session.Status)
 	notifyMode := session.NotificationMode
-	if notifyMode == "" {
-		notifyMode = "live"
+	if notifyMode == "" || notifyMode == "live" {
+		notifyMode = "streaming"
 	}
 	fmt.Fprintf(&sb, "Notification mode: %s\n", notifyMode)
 	fmt.Fprintf(&sb, "Thread ID: %d\n", session.ThreadID)
@@ -1203,8 +1214,8 @@ func (h *CommandHandler) updatePinnedMetadata(ctx context.Context, chatID, threa
 
 	// Build the new metadata text with consistent format
 	notifyMode := session.NotificationMode
-	if notifyMode == "" {
-		notifyMode = "live"
+	if notifyMode == "" || notifyMode == "live" {
+		notifyMode = "streaming"
 	}
 	metadata := fmt.Sprintf("Session: %s\nProject: %s\nModel: %s\nStarted: %s UTC\nMessages: %d\nCost: $%.2f\nNotify: %s",
 		session.SessionID,
