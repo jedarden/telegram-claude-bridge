@@ -245,3 +245,34 @@ func TestPoller_ContextCancel(t *testing.T) {
 		t.Error("poller did not stop within 2 seconds after context cancel")
 	}
 }
+
+// TestPoller_AllowedUpdates verifies that the poller includes allowed_updates in the request.
+func TestPoller_AllowedUpdates(t *testing.T) {
+	var gotAllowedUpdates string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAllowedUpdates = r.URL.Query().Get("allowed_updates")
+		resp := GetUpdatesResponse{OK: true, Result: []Update{}}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	p := NewPoller("test-token", srv.URL, "test-version", "test-sha", "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	go p.Start(ctx)
+
+	// Let the poller make at least one request
+	time.Sleep(200 * time.Millisecond)
+
+	if gotAllowedUpdates == "" {
+		t.Error("allowed_updates parameter was not sent in request")
+	}
+	// Verify it contains the expected update types
+	expected := `["message","edited_message","callback_query"]`
+	if gotAllowedUpdates != expected {
+		t.Errorf("allowed_updates = %s, want %s", gotAllowedUpdates, expected)
+	}
+}
