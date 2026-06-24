@@ -149,7 +149,7 @@ For responding to inline keyboard button presses.
 
 Token fetched from OpenBao at pod startup, held only in memory. Never written to disk, never in the pod spec or environment variable literals in manifests.
 
-OpenBao path: `secret/data/telegram-claude-bridge/bot-token`
+OpenBao path: `ardenone-cluster/telegram/ardenone_bot` (key in ExternalSecret: `remoteRef.key`)
 
 Fallback: Kubernetes Secret object referenced via `secretKeyRef` in the Deployment env, with the Secret managed by sealed-secrets.
 
