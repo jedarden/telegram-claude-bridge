@@ -101,6 +101,10 @@ type Service struct {
 
 	// left_chat_member
 	Member *FromUser `json:"member,omitempty"`
+
+	// my_chat_member
+	OldStatus *string `json:"old_status,omitempty"`
+	NewStatus *string `json:"new_status,omitempty"`
 }
 
 // ServiceType constants for Service.Type.
@@ -111,6 +115,7 @@ const (
 	ServiceTypeForumTopicReopened = "forum_topic_reopened"
 	ServiceTypeNewChatMembers     = "new_chat_members"
 	ServiceTypeLeftChatMember     = "left_chat_member"
+	ServiceTypeMyChatMember        = "my_chat_member"
 )
 
 // UpdatesResponse is the body of GET /updates.

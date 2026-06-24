@@ -271,7 +271,7 @@ func TestPoller_AllowedUpdates(t *testing.T) {
 		t.Error("allowed_updates parameter was not sent in request")
 	}
 	// Verify it contains the expected update types
-	expected := `["message","edited_message","callback_query"]`
+	expected := `["message","edited_message","callback_query","my_chat_member"]`
 	if gotAllowedUpdates != expected {
 		t.Errorf("allowed_updates = %s, want %s", gotAllowedUpdates, expected)
 	}

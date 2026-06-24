@@ -16,6 +16,8 @@ func NormalizeUpdate(raw Update) (*contract.Update, error) {
 		return normalizeMessage(raw.UpdateID, "edited_message", raw.EditedMessage)
 	case raw.CallbackQuery != nil:
 		return normalizeCallbackQuery(raw.UpdateID, raw.CallbackQuery)
+	case raw.MyChatMember != nil:
+		return normalizeMyChatMember(raw.UpdateID, raw.MyChatMember)
 	default:
 		return nil, nil
 	}
@@ -279,4 +281,22 @@ func normalizeEntities(entities []MessageEntity) []contract.Entity {
 		}
 	}
 	return result
+}
+
+func normalizeMyChatMember(updateID int64, mcm *ChatMemberUpdated) (*contract.Update, error) {
+	u := &contract.Update{
+		UpdateID:  updateID,
+		Type:      "service",
+		ChatID:    mcm.Chat.ID,
+		Timestamp: mcm.Date,
+		FromUser:  normalizeUser(mcm.From),
+	}
+
+	u.Service = &contract.Service{
+		Type:      contract.ServiceTypeMyChatMember,
+		OldStatus: &mcm.OldChatMember.Status,
+		NewStatus: &mcm.NewChatMember.Status,
+	}
+
+	return u, nil
 }

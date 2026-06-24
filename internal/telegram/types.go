@@ -11,10 +11,11 @@ type GetUpdatesResponse struct {
 
 // Update is a raw Telegram Update object.
 type Update struct {
-	UpdateID      int64          `json:"update_id"`
-	Message       *Message       `json:"message,omitempty"`
-	EditedMessage *Message       `json:"edited_message,omitempty"`
-	CallbackQuery *CallbackQuery `json:"callback_query,omitempty"`
+	UpdateID      int64              `json:"update_id"`
+	Message       *Message           `json:"message,omitempty"`
+	EditedMessage *Message           `json:"edited_message,omitempty"`
+	CallbackQuery *CallbackQuery     `json:"callback_query,omitempty"`
+	MyChatMember  *ChatMemberUpdated `json:"my_chat_member,omitempty"`
 }
 
 // Message is a raw Telegram Message object.
@@ -142,3 +143,47 @@ type ForumTopicClosed struct{}
 
 // ForumTopicReopened is sent when a forum topic is reopened (empty struct).
 type ForumTopicReopened struct{}
+
+// ChatMemberUpdated represents a change in chat member status.
+type ChatMemberUpdated struct {
+	Chat        Chat             `json:"chat"`
+	From        User             `json:"from"`
+	Date        int64            `json:"date"`
+	OldChatMember ChatMember     `json:"old_chat_member"`
+	NewChatMember ChatMember     `json:"new_chat_member"`
+	InviteLink  *ChatInviteLink  `json:"invite_link,omitempty"`
+}
+
+// ChatMember represents the current status of a chat member.
+type ChatMember struct {
+	Status           string        `json:"status"`
+	User             *User         `json:"user,omitempty"`
+	UntilDate        *int64        `json:"until_date,omitempty"`
+	CanBeEdited      *bool         `json:"can_be_edited,omitempty"`
+	CanChangeInfo    *bool         `json:"can_change_info,omitempty"`
+	CanPostMessages  *bool         `json:"can_post_messages,omitempty"`
+	CanEditMessages  *bool         `json:"can_edit_messages,omitempty"`
+	CanDeleteMessages *bool        `json:"can_delete_messages,omitempty"`
+	CanInviteUsers   *bool         `json:"can_invite_users,omitempty"`
+	CanRestrictMembers *bool       `json:"can_restrict_members,omitempty"`
+	CanPinMessages   *bool         `json:"can_pin_messages,omitempty"`
+	CanManageTopics  *bool         `json:"can_manage_topics,omitempty"`
+	CanPromoteMembers *bool        `json:"can_promote_members,omitempty"`
+	CanManageVideoChats *bool       `json:"can_manage_video_chats,omitempty"`
+	CanManageChat    *bool         `json:"can_manage_chat,omitempty"`
+	IsAnonymous      *bool         `json:"is_anonymous,omitempty"`
+	CustomTitle      *string      `json:"custom_title,omitempty"`
+}
+
+// ChatInviteLink represents an invite link for a chat.
+type ChatInviteLink struct {
+	InviteLink string  `json:"invite_link"`
+	Creator    User    `json:"creator"`
+	CreatesJoinRequest *bool `json:"creates_join_request,omitempty"`
+	IsPrimary  *bool   `json:"is_primary,omitempty"`
+	IsRevoked  *bool   `json:"is_revoked,omitempty"`
+	ExpireDate *int64  `json:"expire_date,omitempty"`
+	MemberLimit *int32 `json:"member_limit,omitempty"`
+	Name       *string `json:"name,omitempty"`
+	PendingJoinRequestCount *int32 `json:"pending_join_request_count,omitempty"`
+}
