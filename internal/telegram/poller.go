@@ -299,6 +299,8 @@ func (p *Poller) getUpdates(ctx context.Context) ([]Update, error) {
 	params := url.Values{}
 	params.Set("timeout", "30")
 	params.Set("offset", strconv.FormatInt(offset, 10))
+	// Only request update types that we support
+	params.Set("allowed_updates", `["message","edited_message","callback_query"]`)
 
 	apiURL := fmt.Sprintf("%s/bot%s/getUpdates?%s", p.apiBase, p.token, params.Encode())
 
