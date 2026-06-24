@@ -421,6 +421,7 @@ type Server struct {
 	checker   *Checker
 	server    *http.Server
 	reconnect chan struct{} // Signals when proxy becomes healthy after being unhealthy
+	addr      string         // Actual bound address (set after Start)
 }
 
 // NewServer creates a new health server listening on addr (e.g., "127.0.0.1:9091").
@@ -429,6 +430,7 @@ func NewServer(addr string, checker *Checker) *Server {
 	s := &Server{
 		checker:   checker,
 		reconnect: make(chan struct{}, 1),
+		addr:      addr, // Will be updated to actual bound address after Start
 	}
 	mux.HandleFunc("/health", s.handleHealth)
 
@@ -441,14 +443,25 @@ func NewServer(addr string, checker *Checker) *Server {
 	return s
 }
 
+// Addr returns the actual bound address (after Start).
+func (s *Server) Addr() string {
+	return s.addr
+}
+
 // Start starts the health server in the background.
 func (s *Server) Start() {
+	ln, err := net.Listen("tcp", s.server.Addr)
+	if err != nil {
+		s.checker.LogError("health_server_listen_failed", "error", err)
+		return
+	}
+	s.addr = ln.Addr().String() // Store actual bound address
+	s.checker.LogInfo("health_server_started", "addr", s.addr)
 	go func() {
-		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			s.checker.LogError("health_server_failed", "error", err)
 		}
 	}()
-	s.checker.LogInfo("health_server_started", "addr", s.server.Addr)
 }
 
 // Shutdown gracefully shuts down the health server.
