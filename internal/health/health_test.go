@@ -314,6 +314,51 @@ func TestCheckerCheckDatabase(t *testing.T) {
 			t.Error("database check should be unhealthy when database is closed")
 		}
 	})
+
+	t.Run("database handles exec context errors", func(t *testing.T) {
+		db, err := sql.Open("sqlite", ":memory:")
+		if err != nil {
+			t.Fatalf("sql.Open() error = %v", err)
+		}
+		defer db.Close()
+
+		checker := NewChecker("http://proxy:8080", db)
+
+		// Create a cancelled context
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
+
+		result := checker.Check(ctx)
+
+		// Should handle cancelled context gracefully
+		if result == nil {
+			t.Fatal("Check() should not return nil even with cancelled context")
+		}
+	})
+
+	t.Run("database check latency in message", func(t *testing.T) {
+		db, err := sql.Open("sqlite", ":memory:")
+		if err != nil {
+			t.Fatalf("sql.Open() error = %v", err)
+		}
+		defer db.Close()
+
+		checker := NewChecker("http://proxy:8080", db)
+		result := checker.Check(context.Background())
+
+		for _, check := range result.Checks {
+			if check.Name == "database" && check.Healthy {
+				// Message should contain latency (e.g., "5ms" or "1.2s")
+				if check.Message == "" {
+					t.Error("database check latency message should not be empty")
+				}
+				// Try to parse as duration to validate format
+				if _, err := time.ParseDuration(check.Message); err != nil {
+					t.Errorf("database check message %q is not a valid duration: %v", check.Message, err)
+				}
+			}
+		}
+	})
 }
 
 func TestCheckerCheckClaudeCLI(t *testing.T) {
@@ -332,6 +377,64 @@ func TestCheckerCheckClaudeCLI(t *testing.T) {
 		// Just check that it doesn't crash
 		_ = result
 	})
+
+	t.Run("claude CLI not in PATH", func(t *testing.T) {
+		// Save original PATH
+		origPath := os.Getenv("PATH")
+		defer func() {
+			if origPath != "" {
+				os.Setenv("PATH", origPath)
+			} else {
+				os.Unsetenv("PATH")
+			}
+		}()
+
+		// Set PATH to empty to ensure claude is not found
+		os.Unsetenv("PATH")
+
+		checker := NewChecker("http://proxy:8080", db)
+		result := checker.Check(context.Background())
+
+		// Should handle missing claude CLI gracefully
+		if result == nil {
+			t.Fatal("Check() should not return nil even when claude CLI is missing")
+		}
+
+		// Find the claude_cli check
+		var claudeCheck *Status
+		for i := range result.Checks {
+			if result.Checks[i].Name == "claude_cli" {
+				claudeCheck = &result.Checks[i]
+				break
+			}
+		}
+
+		if claudeCheck == nil {
+			t.Fatal("claude_cli check should be present in results")
+		}
+
+		// Should be unhealthy when claude is not found
+		if claudeCheck.Healthy {
+			t.Error("claude_cli check should be unhealthy when claude CLI is not in PATH")
+		}
+		if claudeCheck.Message == "" {
+			t.Error("claude_cli check should have error message when claude CLI is not found")
+		}
+	})
+
+	t.Run("claude CLI with cancelled context", func(t *testing.T) {
+		checker := NewChecker("http://proxy:8080", db)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
+
+		result := checker.Check(ctx)
+
+		// Should handle cancelled context gracefully
+		if result == nil {
+			t.Fatal("Check() should not return nil even with cancelled context")
+		}
+	})
 }
 
 func TestGetTelegramPollingStatus(t *testing.T) {
@@ -341,21 +444,78 @@ func TestGetTelegramPollingStatus(t *testing.T) {
 	}
 	defer db.Close()
 
-	t.Run("successful polling status fetch", func(t *testing.T) {
+	t.Run("successful polling status fetch with polling=true", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"ok":             true,
 				"polling":        true,
 				"last_update_id": int64(123),
+				"uptime_seconds": int64(3600),
 			})
 		}))
 		defer server.Close()
 
-		_ = NewChecker(server.URL, db)
+		checker := NewChecker(server.URL, db)
+		result := checker.Check(context.Background())
 
-		// We can't call getTelegramPollingStatus directly, but we can observe its effects
-		// through Check() when it publishes events
+		// Should be healthy and include proxy check
+		if !result.Healthy {
+			t.Error("Check() should be healthy when proxy returns polling=true")
+		}
+
+		// Find the proxy check
+		proxyCheckFound := false
+		for _, check := range result.Checks {
+			if check.Name == "proxy" && check.Healthy {
+				proxyCheckFound = true
+			}
+		}
+		if !proxyCheckFound {
+			t.Error("proxy check should be present and healthy")
+		}
+	})
+
+	t.Run("successful polling status fetch with polling=false", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok":             true,
+				"polling":        false,
+				"last_update_id": int64(123),
+				"uptime_seconds": int64(3600),
+			})
+		}))
+		defer server.Close()
+
+		checker := NewChecker(server.URL, db)
+		result := checker.Check(context.Background())
+
+		// Check should succeed even when polling is false
+		if result == nil {
+			t.Fatal("Check() should not return nil")
+		}
+		_ = result.Healthy // May be healthy or not depending on other checks
+	})
+
+	t.Run("successful polling status fetch without last_update_id", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok":             true,
+				"polling":        true,
+				"uptime_seconds": int64(3600),
+			})
+		}))
+		defer server.Close()
+
+		checker := NewChecker(server.URL, db)
+		result := checker.Check(context.Background())
+
+		// Should not crash
+		if result == nil {
+			t.Fatal("Check() should not return nil")
+		}
 	})
 
 	t.Run("invalid JSON response", func(t *testing.T) {
@@ -368,8 +528,136 @@ func TestGetTelegramPollingStatus(t *testing.T) {
 		checker := NewChecker(server.URL, db)
 		result := checker.Check(context.Background())
 
-		// Should not crash, just handle the error
-		_ = result
+		// Should not crash, but proxy check may fail
+		if result == nil {
+			t.Fatal("Check() should not return nil")
+		}
+	})
+
+	t.Run("malformed JSON response", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"polling": "not a boolean"}`))
+		}))
+		defer server.Close()
+
+		checker := NewChecker(server.URL, db)
+		result := checker.Check(context.Background())
+
+		// Should not crash
+		if result == nil {
+			t.Fatal("Check() should not return nil")
+		}
+	})
+
+	t.Run("proxy returns 500 status", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer server.Close()
+
+		checker := NewChecker(server.URL, db)
+		result := checker.Check(context.Background())
+
+		// Should not crash, proxy check should be unhealthy
+		if result == nil {
+			t.Fatal("Check() should not return nil")
+		}
+
+		proxyUnhealthy := false
+		for _, check := range result.Checks {
+			if check.Name == "proxy" && !check.Healthy {
+				proxyUnhealthy = true
+			}
+		}
+		if !proxyUnhealthy {
+			t.Error("proxy check should be unhealthy when proxy returns 500")
+		}
+	})
+
+	t.Run("context cancellation during request", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(100 * time.Millisecond)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		checker := NewChecker(server.URL, db)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+
+		result := checker.Check(ctx)
+
+		// Should not crash
+		if result == nil {
+			t.Fatal("Check() should not return nil")
+		}
+	})
+
+	t.Run("empty response body", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte{})
+		}))
+		defer server.Close()
+
+		checker := NewChecker(server.URL, db)
+		result := checker.Check(context.Background())
+
+		// Should not crash
+		if result == nil {
+			t.Fatal("Check() should not return nil")
+		}
+	})
+
+	t.Run("proxy health with null last_update_id", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok":             true,
+				"polling":        true,
+				"last_update_id": nil,
+				"uptime_seconds": int64(3600),
+			})
+		}))
+		defer server.Close()
+
+		checker := NewChecker(server.URL, db)
+		result := checker.Check(context.Background())
+
+		// Should not crash when last_update_id is null
+		if result == nil {
+			t.Fatal("Check() should not return nil")
+		}
+		if !result.Healthy {
+			t.Error("Check() should be healthy even with null last_update_id")
+		}
+	})
+
+	t.Run("proxy health with all fields present", func(t *testing.T) {
+		var lastUpdateID int64 = 456
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok":             true,
+				"polling":        true,
+				"last_update_id": &lastUpdateID,
+				"uptime_seconds": int64(7200),
+			})
+		}))
+		defer server.Close()
+
+		checker := NewChecker(server.URL, db)
+		result := checker.Check(context.Background())
+
+		// Should parse all fields correctly
+		if result == nil {
+			t.Fatal("Check() should not return nil")
+		}
+		if !result.Healthy {
+			t.Error("Check() should be healthy with all proxy fields present")
+		}
 	})
 }
 
