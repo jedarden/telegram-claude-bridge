@@ -27,7 +27,7 @@ User commands:
 /opus — quick switch to claude-opus-4-6
 /color [name] — set topic icon color (active, complete, blocked, error, review, research)
 /notify [mode] — set notification mode (live, summary, quiet)
-/context <thread_id> — fetch context from another topic and inject it
+/context <thread_id|topic_name> — fetch context from another topic and inject it
 /snippet <name> <content> — save a context snippet (use "delete <name>" to remove)
 /snippets — list all context snippets for this chat
 /info — show session info (model, cwd, session_id, messages, notification mode)
@@ -991,6 +991,7 @@ func (h *CommandHandler) cmdNew(ctx context.Context, update contract.Update, gro
 		CWD:       group.CWD,
 		Model:     resolveSessionModel(nil, group),
 		Status:    "active",
+		TopicName: topicName,
 	}
 	if err := h.db.CreateSession(ctx, session); err != nil {
 		return "", fmt.Errorf("create session record: %w", err)
@@ -1521,10 +1522,10 @@ func (h *CommandHandler) cmdUsers(ctx context.Context, update contract.Update) (
 	return strings.TrimRight(sb.String(), "\n"), nil
 }
 
-// cmdContext handles /context <thread_id> — fetches context from another topic.
+// cmdContext handles /context <thread_id|topic_name> — fetches context from another topic.
 func (h *CommandHandler) cmdContext(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
 	if args == "" {
-		return "Usage: /context <thread_id>\n\nFetches context from another topic and injects it into your next prompt.", nil
+		return "Usage: /context <thread_id or topic_name>\n\nFetches context from another topic and injects it into your next prompt.\n\nExamples:\n  /context 12345\n  /context fix-auth-bug", nil
 	}
 	if group == nil {
 		return "This group is not registered. Use /cwd <path> to register it.", nil
@@ -1540,10 +1541,18 @@ func (h *CommandHandler) cmdContext(ctx context.Context, update contract.Update,
 		return "Context commands only work within a topic session. Use /new to create a topic first.", nil
 	}
 
-	// Try parsing as thread_id
+	// Try parsing as thread_id first
 	threadID, err := strconv.ParseInt(arg, 10, 64)
 	if err != nil {
-		return fmt.Sprintf("Invalid thread_id %q — must be a number.", arg), nil
+		// Not a number, try looking up by topic name
+		session, err := h.db.GetSessionByTopicName(ctx, update.ChatID, arg)
+		if err != nil {
+			return fmt.Sprintf("Error looking up topic %q: %v", arg, err), nil
+		}
+		if session == nil {
+			return fmt.Sprintf("Topic not found: %q\n\nUse /status to see available topics in this group.", arg), nil
+		}
+		threadID = session.ThreadID
 	}
 
 	// Get context from the referenced topic
