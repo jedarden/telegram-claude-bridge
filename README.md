@@ -116,6 +116,7 @@ The proxy runs as a Docker container and has no host-level dependencies beyond a
 | `SESSION_TTL_HOURS` | `168` (7 days) | Age at which a session is considered stale |
 | `CLOSE_INACTIVE_TOPICS` | `false` | Close Telegram topics for stale sessions |
 | `ADMIN_USER_ID` | `0` | Bootstrap initial admin on startup |
+| `ADMIN_CHAT_ID` | `0` | Chat ID for crash-loop alerts (via ExecStopPost) |
 | `EVENT_PUBLISHING_ENABLED` | `false` | Enable dashboard Unix socket events |
 | `EVENT_SOCKET_PATH` | `/tmp/telegram-bridge-events.sock` | Dashboard socket path |
 | `UPDATE_INTERVAL_MINUTES` | `5` | Self-update check interval (`0` = disabled) |
