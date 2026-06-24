@@ -3,7 +3,10 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -27,6 +30,21 @@ type ProxyConfig struct {
 	// OffsetFilePath is the path to persist the Telegram polling offset.
 	// If empty, offset is not persisted and will be lost on restart.
 	OffsetFilePath string
+
+	// OpenBaoAddr is the address of the OpenBao server (e.g., "http://openbao:8200").
+	// If set, the token will be fetched from OpenBao instead of environment variables.
+	OpenBaoAddr string
+
+	// OpenBaoToken is the OpenBao authentication token.
+	// Required when OpenBaoAddr is set.
+	OpenBaoToken string
+
+	// OpenBaoSecretPath is the path to the secret in OpenBao's KV store (e.g., "secret/telegram").
+	// Required when OpenBaoAddr is set.
+	OpenBaoSecretPath string
+
+	// OpenBaoSecretKey is the key within the secret that contains the bot token (default: "bot_token").
+	OpenBaoSecretKey string
 }
 
 // BridgeConfig holds configuration for the bridge component.
@@ -80,23 +98,107 @@ type BridgeConfig struct {
 	EventSocketPath string
 }
 
-// LoadProxyConfig reads ProxyConfig from environment variables.
-// Required: BOT_TOKEN (or TELEGRAM_TOKEN for backward compatibility).
-func LoadProxyConfig() (*ProxyConfig, error) {
-	token := os.Getenv("BOT_TOKEN")
-	if token == "" {
-		token = os.Getenv("TELEGRAM_TOKEN")
+// fetchOpenBaoSecret retrieves a secret from OpenBao's KV v2 store.
+func fetchOpenBaoSecret(addr, token, secretPath, secretKey string) (string, error) {
+	if addr == "" {
+		return "", fmt.Errorf("OpenBao address is required")
 	}
 	if token == "" {
-		return nil, fmt.Errorf("BOT_TOKEN environment variable is required")
+		return "", fmt.Errorf("OpenBao token is required")
+	}
+	if secretPath == "" {
+		return "", fmt.Errorf("OpenBao secret path is required")
 	}
 
+	// Default to "bot_token" if not specified
+	if secretKey == "" {
+		secretKey = "bot_token"
+	}
+
+	// Construct the URL for v1/secret/data/{path} (KV v2 engine)
+	url := fmt.Sprintf("%s/v1/secret/data/%s", addr, secretPath)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("X-Vault-Token", token)
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch secret: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("OpenBao returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse the KV v2 response structure: {"data": {"data": {"key": "value"}, ...}}
+	var responseData map[string]interface{}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if err := json.Unmarshal(body, &responseData); err != nil {
+		return "", fmt.Errorf("failed to decode OpenBao response: %w", err)
+	}
+
+	// Navigate the KV v2 response structure: data.data.{key}
+	if data, ok := responseData["data"].(map[string]interface{}); ok {
+		if secretData, ok := data["data"].(map[string]interface{}); ok {
+			if value, ok := secretData[secretKey].(string); ok {
+				return value, nil
+			}
+			return "", fmt.Errorf("secret key %q not found in OpenBao secret", secretKey)
+		}
+	}
+
+	return "", fmt.Errorf("invalid OpenBao response structure: missing data.data")
+}
+
+// LoadProxyConfig reads ProxyConfig from environment variables.
+// Required: BOT_TOKEN (or TELEGRAM_TOKEN for backward compatibility), OR OpenBao configuration.
+func LoadProxyConfig() (*ProxyConfig, error) {
 	cfg := &ProxyConfig{
-		TelegramToken:  token,
 		ListenAddr:     envOrDefault("PROXY_LISTEN_ADDR", ":8080"),
 		DBPath:         envOrDefault("PROXY_DB_PATH", "proxy.db"),
 		OffsetFilePath: envOrDefault("OFFSET_FILE_PATH", "/data/offset.json"),
 		PollTimeout:    30,
+	}
+
+	// Load OpenBao configuration
+	cfg.OpenBaoAddr = os.Getenv("OPENBAO_ADDR")
+	cfg.OpenBaoToken = os.Getenv("OPENBAO_TOKEN")
+	cfg.OpenBaoSecretPath = os.Getenv("OPENBAO_SECRET_PATH")
+	cfg.OpenBaoSecretKey = envOrDefault("OPENBAO_SECRET_KEY", "bot_token")
+
+	// Try to fetch token from OpenBao if configured
+	if cfg.OpenBaoAddr != "" {
+		token, err := fetchOpenBaoSecret(cfg.OpenBaoAddr, cfg.OpenBaoToken, cfg.OpenBaoSecretPath, cfg.OpenBaoSecretKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch token from OpenBao: %w", err)
+		}
+		if token == "" {
+			return nil, fmt.Errorf("OpenBao returned empty token")
+		}
+		cfg.TelegramToken = token
+	} else {
+		// Fall back to environment variables
+		token := os.Getenv("BOT_TOKEN")
+		if token == "" {
+			token = os.Getenv("TELEGRAM_TOKEN")
+		}
+		if token == "" {
+			return nil, fmt.Errorf("BOT_TOKEN environment variable is required (or configure OpenBao)")
+		}
+		cfg.TelegramToken = token
 	}
 
 	if v := os.Getenv("POLL_TIMEOUT"); v != "" {

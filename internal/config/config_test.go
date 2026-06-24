@@ -2,6 +2,9 @@
 package config
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -37,6 +40,7 @@ func TestLoadProxyConfig(t *testing.T) {
 		envs := []string{
 			"BOT_TOKEN", "TELEGRAM_TOKEN", "PROXY_LISTEN_ADDR",
 			"PROXY_DB_PATH", "OFFSET_FILE_PATH", "POLL_TIMEOUT",
+			"OPENBAO_ADDR", "OPENBAO_TOKEN", "OPENBAO_SECRET_PATH", "OPENBAO_SECRET_KEY",
 		}
 		saved := make(map[string]string)
 		for _, e := range envs {
@@ -64,8 +68,10 @@ func TestLoadProxyConfig(t *testing.T) {
 		if err == nil {
 			t.Error("LoadProxyConfig() expected error when BOT_TOKEN is missing")
 		}
-		if err.Error() != "BOT_TOKEN environment variable is required" {
-			t.Errorf("LoadProxyConfig() error = %v, want %v", err, "BOT_TOKEN environment variable is required")
+		// Error message should mention both BOT_TOKEN and OpenBao option
+		expectedErrMsg := "BOT_TOKEN environment variable is required"
+		if err.Error() != expectedErrMsg && err.Error() != expectedErrMsg+" (or configure OpenBao)" {
+			t.Errorf("LoadProxyConfig() error = %v, want %v or %v", err, expectedErrMsg, expectedErrMsg+" (or configure OpenBao)")
 		}
 	})
 
@@ -201,6 +207,178 @@ func TestLoadProxyConfig(t *testing.T) {
 		_, err := LoadProxyConfig()
 		if err == nil {
 			t.Error("LoadProxyConfig() expected error for zero POLL_TIMEOUT")
+		}
+	})
+
+	t.Run("OpenBao takes precedence over BOT_TOKEN", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		// Set up a test HTTP server to mock OpenBao
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Verify request headers
+			if r.Header.Get("X-Vault-Token") != "test-token" {
+				t.Errorf("Expected X-Vault-Token header 'test-token', got %q", r.Header.Get("X-Vault-Token"))
+			}
+			// Return a valid KV v2 response
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"data":{"data":{"bot_token":"openbao-token-value"}}}`)
+		}))
+		defer server.Close()
+
+		os.Setenv("BOT_TOKEN", "env_token")
+		os.Setenv("OPENBAO_ADDR", server.URL)
+		os.Setenv("OPENBAO_TOKEN", "test-token")
+		os.Setenv("OPENBAO_SECRET_PATH", "secret/telegram")
+
+		cfg, err := LoadProxyConfig()
+		if err != nil {
+			t.Fatalf("LoadProxyConfig() error = %v", err)
+		}
+		if cfg.TelegramToken != "openbao-token-value" {
+			t.Errorf("TelegramToken = %v, want openbao-token-value (should prefer OpenBao over BOT_TOKEN)", cfg.TelegramToken)
+		}
+		if cfg.OpenBaoAddr != server.URL {
+			t.Errorf("OpenBaoAddr = %v, want %v", cfg.OpenBaoAddr, server.URL)
+		}
+	})
+
+	t.Run("OpenBao with custom secret key", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"data":{"data":{"custom_key":"custom-token-value"}}}`)
+		}))
+		defer server.Close()
+
+		os.Setenv("OPENBAO_ADDR", server.URL)
+		os.Setenv("OPENBAO_TOKEN", "test-token")
+		os.Setenv("OPENBAO_SECRET_PATH", "secret/telegram")
+		os.Setenv("OPENBAO_SECRET_KEY", "custom_key")
+
+		cfg, err := LoadProxyConfig()
+		if err != nil {
+			t.Fatalf("LoadProxyConfig() error = %v", err)
+		}
+		if cfg.TelegramToken != "custom-token-value" {
+			t.Errorf("TelegramToken = %v, want custom-token-value", cfg.TelegramToken)
+		}
+		if cfg.OpenBaoSecretKey != "custom_key" {
+			t.Errorf("OpenBaoSecretKey = %v, want custom_key", cfg.OpenBaoSecretKey)
+		}
+	})
+
+	t.Run("OpenBao with missing secret key", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"data":{"data":{"other_key":"some-value"}}}`)
+		}))
+		defer server.Close()
+
+		os.Setenv("OPENBAO_ADDR", server.URL)
+		os.Setenv("OPENBAO_TOKEN", "test-token")
+		os.Setenv("OPENBAO_SECRET_PATH", "secret/telegram")
+
+		_, err := LoadProxyConfig()
+		if err == nil {
+			t.Error("LoadProxyConfig() expected error when secret key is missing")
+		}
+	})
+
+	t.Run("OpenBao with HTTP error", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintf(w, `{"errors":["permission denied"]}`)
+		}))
+		defer server.Close()
+
+		os.Setenv("OPENBAO_ADDR", server.URL)
+		os.Setenv("OPENBAO_TOKEN", "test-token")
+		os.Setenv("OPENBAO_SECRET_PATH", "secret/telegram")
+
+		_, err := LoadProxyConfig()
+		if err == nil {
+			t.Error("LoadProxyConfig() expected error when OpenBao returns HTTP error")
+		}
+	})
+
+	t.Run("OpenBao with invalid response structure", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"invalid":"structure"}`)
+		}))
+		defer server.Close()
+
+		os.Setenv("OPENBAO_ADDR", server.URL)
+		os.Setenv("OPENBAO_TOKEN", "test-token")
+		os.Setenv("OPENBAO_SECRET_PATH", "secret/telegram")
+
+		_, err := LoadProxyConfig()
+		if err == nil {
+			t.Error("LoadProxyConfig() expected error when OpenBao returns invalid structure")
+		}
+	})
+
+	t.Run("OpenBao with empty token", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"data":{"data":{"bot_token":""}}}`)
+		}))
+		defer server.Close()
+
+		os.Setenv("OPENBAO_ADDR", server.URL)
+		os.Setenv("OPENBAO_TOKEN", "test-token")
+		os.Setenv("OPENBAO_SECRET_PATH", "secret/telegram")
+
+		_, err := LoadProxyConfig()
+		if err == nil {
+			t.Error("LoadProxyConfig() expected error when OpenBao returns empty token")
+		}
+	})
+
+	t.Run("OpenBao without token configured", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		os.Setenv("OPENBAO_ADDR", "http://openbao:8200")
+		os.Unsetenv("OPENBAO_TOKEN")
+
+		_, err := LoadProxyConfig()
+		if err == nil {
+			t.Error("LoadProxyConfig() expected error when OpenBao addr is set but token is missing")
+		}
+	})
+
+	t.Run("OpenBao without secret path configured", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		os.Setenv("OPENBAO_ADDR", "http://openbao:8200")
+		os.Setenv("OPENBAO_TOKEN", "token")
+		os.Unsetenv("OPENBAO_SECRET_PATH")
+
+		_, err := LoadProxyConfig()
+		if err == nil {
+			t.Error("LoadProxyConfig() expected error when OpenBao addr is set but secret path is missing")
 		}
 	})
 }
