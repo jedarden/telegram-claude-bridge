@@ -54,7 +54,8 @@ Admin commands:
 /update [do] — check for updates or apply update now
 /adduser <telegram_user_id> [role] — add a user (role: admin|user)
 /removeuser <telegram_user_id> — remove a user
-/users — list all users`
+/users — list all users
+/usage [user_id] — show per-user cost breakdown (admin only)`
 
 // validPermissionModes lists the --permission-mode values accepted by Claude CLI.
 var validPermissionModes = map[string]bool{
@@ -206,6 +207,8 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 		reply, err = h.cmdSnippet(ctx, update, group, args)
 	case "/snippets":
 		reply, err = h.cmdSnippets(ctx, update, group)
+	case "/usage":
+		reply, err = h.cmdUsage(ctx, update, group, args)
 	default:
 		reply = fmt.Sprintf("Unknown command: %s\n\nUse /help for available commands.", cmd)
 	}
@@ -1355,6 +1358,148 @@ func (h *CommandHandler) cmdCost(ctx context.Context, update contract.Update, gr
 				fmt.Fprintf(&sb, "  • User %d: $%.4f (%d events)\n", uc.UserID, uc.TotalCost, uc.EventCount)
 			}
 		}
+	}
+
+	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// cmdUsage handles /usage [user_id] — shows per-user cost breakdown (admin only).
+// Without an argument: shows cost breakdown for all users across all groups.
+// With a user_id argument: shows detailed cost breakdown for that specific user.
+func (h *CommandHandler) cmdUsage(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	// Check if the user is an admin
+	userID := update.FromUser.ID
+	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can view usage statistics.", nil
+	}
+
+	args = strings.TrimSpace(args)
+
+	if args == "" {
+		// Show usage for all users across all groups
+		return h.cmdUsageAllUsers(ctx)
+	}
+
+	// Parse user ID
+	targetUserID, err := strconv.ParseInt(args, 10, 64)
+	if err != nil {
+		return fmt.Sprintf("Invalid user ID %q. Use /usage <user_id> with a numeric user ID.", args), nil
+	}
+
+	// Show detailed usage for a specific user
+	return h.cmdUsageUserDetail(ctx, targetUserID)
+}
+
+// cmdUsageAllUsers shows cost breakdown for all users across all groups.
+func (h *CommandHandler) cmdUsageAllUsers(ctx context.Context) (string, error) {
+	// Get all users with cost events
+	users, err := h.db.ListAllowedUsers(ctx)
+	if err != nil {
+		return "", fmt.Errorf("list allowed users: %w", err)
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "💰 Usage Report — All Users\n\n")
+
+	totalCost := 0.0
+	userCosts := make(map[int64]float64)
+
+	// Collect costs for each user
+	for _, user := range users {
+		userCost, err := h.db.GetUserTotalCost(ctx, user.UserID)
+		if err != nil {
+			continue
+		}
+		if userCost > 0 {
+			userCosts[user.UserID] = userCost
+			totalCost += userCost
+		}
+	}
+
+	if len(userCosts) == 0 {
+		return "No usage data found for any users.", nil
+	}
+
+	fmt.Fprintf(&sb, "Total Cost: $%.4f\n\n", totalCost)
+	fmt.Fprintf(&sb, "Cost by user:\n")
+
+	// Sort users by cost (descending)
+	type userCostEntry struct {
+		userID int64
+		cost   float64
+		role   string
+	}
+	var sortedUsers []userCostEntry
+	for _, user := range users {
+		if cost, ok := userCosts[user.UserID]; ok {
+			sortedUsers = append(sortedUsers, userCostEntry{
+				userID: user.UserID,
+				cost:   cost,
+				role:   user.Role,
+			})
+		}
+	}
+
+	// Sort by cost descending
+	for i := 0; i < len(sortedUsers); i++ {
+		for j := i + 1; j < len(sortedUsers); j++ {
+			if sortedUsers[j].cost > sortedUsers[i].cost {
+				sortedUsers[i], sortedUsers[j] = sortedUsers[j], sortedUsers[i]
+			}
+		}
+	}
+
+	for _, entry := range sortedUsers {
+		percent := (entry.cost / totalCost) * 100
+		fmt.Fprintf(&sb, "  • User %d [%s]: $%.4f (%.1f%%)\n", entry.userID, entry.role, entry.cost, percent)
+	}
+
+	sb.WriteString("\nUsage: /usage <user_id> for detailed breakdown")
+
+	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// cmdUsageUserDetail shows detailed cost breakdown for a specific user.
+func (h *CommandHandler) cmdUsageUserDetail(ctx context.Context, userID int64) (string, error) {
+	// Get user info
+	user, err := h.db.GetAllowedUser(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("get user info: %w", err)
+	}
+	if user == nil {
+		return fmt.Sprintf("User %d not found in allowed users list.", userID), nil
+	}
+
+	// Get total cost for user
+	totalCost, err := h.db.GetUserTotalCost(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("get user total cost: %w", err)
+	}
+
+	// Get recent cost events for user
+	recentEvents, err := h.db.GetUserRecentCosts(ctx, userID, 10)
+	if err != nil {
+		return "", fmt.Errorf("get user recent costs: %w", err)
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "💰 Usage Report — User %d\n\n", userID)
+	fmt.Fprintf(&sb, "Role: %s\n", user.Role)
+	fmt.Fprintf(&sb, "Total Cost: $%.4f\n\n", totalCost)
+
+	if len(recentEvents) > 0 {
+		sb.WriteString("Recent events (last 10):\n")
+		for _, event := range recentEvents {
+			relTime := time.Since(event.CreatedAt).Round(time.Second)
+			fmt.Fprintf(&sb, "  • chat %d/thread %d — $%.4f (%s) — %s ago\n",
+				event.ChatID, event.ThreadID, event.CostUSD, event.Model, relTime)
+		}
+	} else {
+		sb.WriteString("No cost events found for this user.\n")
 	}
 
 	return strings.TrimRight(sb.String(), "\n"), nil
