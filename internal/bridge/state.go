@@ -65,6 +65,7 @@ type Session struct {
 	TimeoutSec       int    // Per-topic timeout override (0 = use group timeout)
 	DispatcherMode   int    // 1 = dispatcher enabled (default), 0 = direct mode; -1 = use group default
 	TopicName        string // Name of the forum topic (stored for /context lookup)
+	LastFromUserID   int64  // Telegram user ID who sent the last message in this session
 }
 
 // AllowedUser represents a user permitted to interact with the bot.
@@ -163,7 +164,7 @@ type ConversationMessage struct {
 	CreatedAt time.Time
 }
 
-const schemaVersion = 22
+const schemaVersion = 23
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -356,6 +357,9 @@ var migrations = []string{
 
 			// Version 22 — add transcript_verify to groups for opt-in audio transcription verification.
 			`ALTER TABLE groups ADD COLUMN transcript_verify INTEGER NOT NULL DEFAULT 0;`,
+
+				// Version 23 — add last_from_user_id to sessions for per-user last message attribution.
+				`ALTER TABLE sessions ADD COLUMN last_from_user_id INTEGER NOT NULL DEFAULT 0;`,
 	}
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
 // and applies any pending migrations.
@@ -555,7 +559,7 @@ func (d *DB) GetSession(ctx context.Context, chatID, threadID int64) (*Session, 
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
 		        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec, COALESCE(dispatcher_mode,-1),
-		        COALESCE(topic_name,'')
+			        COALESCE(topic_name,''), COALESCE(last_from_user_id,0)
 		 FROM sessions WHERE chat_id = ? AND thread_id = ?`, chatID, threadID)
 	return scanSession(row)
 }
@@ -567,7 +571,7 @@ func (d *DB) GetSessionByTopicName(ctx context.Context, chatID int64, topicName 
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
 		        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec, COALESCE(dispatcher_mode,-1),
-		        COALESCE(topic_name,'')
+			        COALESCE(topic_name,''), COALESCE(last_from_user_id,0)
 		 FROM sessions WHERE chat_id = ? AND topic_name = ?`, chatID, topicName)
 	return scanSession(row)
 }
@@ -592,7 +596,7 @@ func (d *DB) CreateSession(ctx context.Context, s *Session) error {
 	}
 	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO sessions
-		   (chat_id, thread_id, session_id, cwd, model, status, icon_color, created_at, last_active, message_count, pinned_message_id, total_cost_usd, summary, notification_mode, timeout_sec, topic_name)
+		   (chat_id, thread_id, session_id, cwd, model, status, icon_color, created_at, last_active, message_count, pinned_message_id, total_cost_usd, summary, notification_mode, timeout_sec, topic_name, last_from_user_id)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.ChatID, s.ThreadID, s.SessionID, s.CWD, nullableString(s.Model), s.Status,
 		s.IconColor,
@@ -605,6 +609,8 @@ func (d *DB) CreateSession(ctx context.Context, s *Session) error {
 		s.NotificationMode,
 		s.TimeoutSec,
 		nullableString(s.TopicName),
+
+			s.LastFromUserID,
 	)
 	return err
 }
@@ -626,7 +632,8 @@ func (d *DB) UpdateSession(ctx context.Context, s *Session) error {
 		     notification_mode = ?,
 		     timeout_sec       = ?,
 		     dispatcher_mode   = ?,
-		     topic_name        = ?
+			     topic_name        = ?,
+			     last_from_user_id = ?
 		 WHERE chat_id = ? AND thread_id = ?`,
 		s.SessionID, s.CWD, nullableString(s.Model), s.Status,
 		s.IconColor,
@@ -638,7 +645,8 @@ func (d *DB) UpdateSession(ctx context.Context, s *Session) error {
 		s.NotificationMode,
 		s.TimeoutSec,
 		s.DispatcherMode,
-		nullableString(s.TopicName),
+			nullableString(s.TopicName),
+			s.LastFromUserID,
 		s.ChatID, s.ThreadID,
 	)
 	return err
@@ -701,7 +709,7 @@ func (d *DB) ListSessions(ctx context.Context, chatID int64) ([]*Session, error)
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
 		        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec, COALESCE(dispatcher_mode,-1),
-		        COALESCE(topic_name,'')
+		        COALESCE(topic_name,'"), COALESCE(last_from_user_id,0)
 		 FROM sessions WHERE chat_id = ? ORDER BY last_active DESC`, chatID)
 	if err != nil {
 		return nil, err
@@ -725,8 +733,8 @@ func (d *DB) ListAllSessions(ctx context.Context) ([]*Session, error) {
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
 		        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec, COALESCE(dispatcher_mode,-1),
-		        COALESCE(topic_name,'')
-		 FROM sessions ORDER BY last_active DESC`)
+		        COALESCE(topic_name,''), COALESCE(last_from_user_id,0)
+			 FROM sessions ORDER BY last_active DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1062,6 +1070,16 @@ func (d *DB) UpdateSessionSummary(ctx context.Context, chatID, threadID int64, s
 	return err
 }
 
+// UpdateSessionLastUser updates the last_from_user_id field for a session.
+// This should be called when a user sends a message that triggers a Claude invocation.
+func (d *DB) UpdateSessionLastUser(ctx context.Context, chatID, threadID, userID int64) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE sessions SET last_from_user_id = ? WHERE chat_id = ? AND thread_id = ?`,
+		userID, chatID, threadID,
+	)
+	return err
+}
+
 type sessionScanner interface {
 	Scan(dest ...any) error
 }
@@ -1073,7 +1091,7 @@ func scanSession(s sessionScanner) (*Session, error) {
 		&sess.ChatID, &sess.ThreadID, &sess.SessionID, &sess.CWD,
 		&sess.Model, &sess.Status, &createdAt, &lastActive, &sess.MessageCount, &sess.IconColor,
 		&sess.PinnedMessageID, &sess.TotalCostUSD, &sess.Summary, &sess.NotificationMode, &sess.TimeoutSec,
-		&sess.DispatcherMode, &sess.TopicName,
+		&sess.DispatcherMode, &sess.TopicName, &sess.LastFromUserID,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
