@@ -351,12 +351,17 @@ func (h *CommandHandler) cmdConfig(ctx context.Context, update contract.Update, 
 			fmt.Fprintf(&sb, "Disallowed Tools: (none)\n")
 		}
 
+		fmt.Fprintf(&sb, "Max Subtasks: %d\n", group.MaxSubtasks)
+		fmt.Fprintf(&sb, "Max Workers: %d\n", group.MaxWorkers)
+
 		sb.WriteString("\nUsage: /config <setting> <value>\n")
-		sb.WriteString("Settings: permission_mode, allowed_tools, disallowed_tools\n\n")
+		sb.WriteString("Settings: permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers\n\n")
 		sb.WriteString("Examples:\n")
 		sb.WriteString("  /config permission_mode dontAsk\n")
 		sb.WriteString("  /config allowed_tools [\"Read\",\"Grep\",\"Glob\"]\n")
-		sb.WriteString("  /config disallowed_tools [\"Bash\",\"Edit\"]")
+		sb.WriteString("  /config disallowed_tools [\"Bash\",\"Edit\"]\n")
+		sb.WriteString("  /config max_subtasks 10\n")
+		sb.WriteString("  /config max_workers 3")
 
 		return strings.TrimRight(sb.String(), "\n"), nil
 	}
@@ -364,7 +369,7 @@ func (h *CommandHandler) cmdConfig(ctx context.Context, update contract.Update, 
 	// Parse setting name and value
 	parts := strings.Fields(args)
 	if len(parts) < 2 {
-		return "Usage: /config <setting> <value>\n\nSettings: permission_mode, allowed_tools, disallowed_tools\n\nExamples:\n  /config permission_mode dontAsk\n  /config allowed_tools [\"Read\",\"Grep\",\"Glob\"]\n  /config disallowed_tools [\"Bash\",\"Edit\"]", nil
+		return "Usage: /config <setting> <value>\n\nSettings: permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers\n\nExamples:\n  /config permission_mode dontAsk\n  /config allowed_tools [\"Read\",\"Grep\",\"Glob\"]\n  /config disallowed_tools [\"Bash\",\"Edit\"]\n  /config max_subtasks 10\n  /config max_workers 3", nil
 	}
 
 	setting := strings.ToLower(parts[0])
@@ -434,8 +439,30 @@ func (h *CommandHandler) cmdConfig(ctx context.Context, update contract.Update, 
 		}
 		return fmt.Sprintf("Disallowed tools set to: %s", trimmed), nil
 
+	case "max_subtasks", "max-subtasks", "maxsubtasks":
+		n, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil || n < 0 {
+			return "Max subtasks must be a valid positive integer.\n\nExample: /config max_subtasks 10", nil
+		}
+		group.MaxSubtasks = n
+		if err := h.db.UpsertGroup(ctx, group); err != nil {
+			return "", fmt.Errorf("save group: %w", err)
+		}
+		return fmt.Sprintf("Max subtasks set to: %d", n), nil
+
+	case "max_workers", "max-workers", "maxworkers":
+		n, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil || n < 0 {
+			return "Max workers must be a valid positive integer.\n\nExample: /config max_workers 3", nil
+		}
+		group.MaxWorkers = n
+		if err := h.db.UpsertGroup(ctx, group); err != nil {
+			return "", fmt.Errorf("save group: %w", err)
+		}
+		return fmt.Sprintf("Max workers set to: %d", n), nil
+
 	default:
-		return fmt.Sprintf("Unknown setting %q.\n\nValid settings: permission_mode, allowed_tools, disallowed_tools", setting), nil
+		return fmt.Sprintf("Unknown setting %q.\n\nValid settings: permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers", setting), nil
 	}
 }
 
