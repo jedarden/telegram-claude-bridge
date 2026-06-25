@@ -66,6 +66,10 @@ func (h *CallbackHandler) Handle(ctx context.Context, update contract.Update) {
 		replyText, showAlert = h.handleToolApproval(ctx, update, params, true)
 	case "deny_tool":
 		replyText, showAlert = h.handleToolApproval(ctx, update, params, false)
+	case "approve_transcript":
+		replyText, showAlert = h.handleTranscriptApproval(ctx, update, params)
+	case "edit_transcript":
+		replyText, showAlert = h.handleTranscriptEdit(ctx, update, params)
 	default:
 		log.Printf("[callback] unknown action: %s", action)
 		replyText = "Unknown action"
@@ -120,6 +124,84 @@ func (h *CallbackHandler) handleToolApproval(ctx context.Context, update contrac
 		return "Tool approved", false
 	}
 	return "Tool denied", false
+}
+
+// handleTranscriptApproval processes a transcript approval.
+// params format: "chatID:threadID:messageID"
+func (h *CallbackHandler) handleTranscriptApproval(ctx context.Context, update contract.Update, params string) (string, bool) {
+	// Parse params: chatID:threadID:messageID
+	parts := strings.Split(params, ":")
+	if len(parts) != 3 {
+		return "Invalid approval parameters", true
+	}
+
+	var chatID, threadID, messageID int64
+	if _, err := fmt.Sscanf(params, "%d:%d:%d", &chatID, &threadID, &messageID); err != nil {
+		return "Invalid approval parameters", true
+	}
+
+	// Verify the callback is for the correct chat
+	if chatID != update.ChatID {
+		return "Chat mismatch", true
+	}
+
+	// Get the pending transcript from session manager
+	transcript, ok := h.sessionMgr.GetPendingTranscript(chatID, threadID, messageID)
+	if !ok {
+		log.Printf("[callback] no pending transcript found for (%d,%d) msg %d", chatID, threadID, messageID)
+		return "Transcript not found or already processed", true
+	}
+
+	log.Printf("[callback] transcript approved for (%d,%d) msg %d: %q", chatID, threadID, messageID, transcript)
+
+	// Submit the approved transcript for processing
+	h.sessionMgr.SubmitApprovedTranscript(chatID, threadID, messageID)
+
+	return "Transcript sent to Claude", false
+}
+
+// handleTranscriptEdit handles the "Edit first" action for transcript verification.
+// params format: "chatID:threadID:messageID"
+func (h *CallbackHandler) handleTranscriptEdit(ctx context.Context, update contract.Update, params string) (string, bool) {
+	// Parse params: chatID:threadID:messageID
+	parts := strings.Split(params, ":")
+	if len(parts) != 3 {
+		return "Invalid edit parameters", true
+	}
+
+	var chatID, threadID, messageID int64
+	if _, err := fmt.Sscanf(params, "%d:%d:%d", &chatID, &threadID, &messageID); err != nil {
+		return "Invalid edit parameters", true
+	}
+
+	// Verify the callback is for the correct chat
+	if chatID != update.ChatID {
+		return "Chat mismatch", true
+	}
+
+	// Get the pending transcript
+	transcript, ok := h.sessionMgr.GetPendingTranscript(chatID, threadID, messageID)
+	if !ok {
+		log.Printf("[callback] no pending transcript found for (%d,%d) msg %d", chatID, threadID, messageID)
+		return "Transcript not found or already processed", true
+	}
+
+	// Reply with instructions and the current transcript so user can copy/edit it
+	// The transcript is sent as a quoted message
+	tid := threadID
+	tidPtr := &tid
+
+	// Clean up the pending transcript since the user wants to edit (they'll send it manually)
+	h.sessionMgr.ClearPendingTranscript(chatID, threadID, messageID)
+
+	// Send a message with the transcript for the user to copy/edit
+	msgText := fmt.Sprintf("✏️ Copy and edit the transcription, then send it back:\n\n%s", transcript)
+	if err := h.sender.SendResponse(ctx, chatID, tidPtr, messageID, msgText); err != nil {
+		log.Printf("[callback] failed to send edit instructions: %v", err)
+		return "Failed to send edit instructions", true
+	}
+
+	return "Edit mode activated", false
 }
 
 // answerCallback sends a response to the callback query.

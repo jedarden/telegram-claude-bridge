@@ -435,6 +435,45 @@ func (s *Sender) SendToolApprovalPrompt(ctx context.Context, chatID int64, threa
 	return resp.MessageID, nil
 }
 
+// SendTranscriptVerifyPrompt sends a transcript verification prompt with "Send to Claude" / "Edit first" buttons.
+// The callback data format is "action:chatID:threadID:messageID" where action is "approve_transcript" or "edit_transcript".
+func (s *Sender) SendTranscriptVerifyPrompt(ctx context.Context, chatID int64, threadID *int64, transcript string, messageID int64) (int64, error) {
+	// Truncate transcript for display (max 500 chars)
+	maxTranscriptLen := 500
+	displayTranscript := transcript
+	if len(displayTranscript) > maxTranscriptLen {
+		displayTranscript = displayTranscript[:maxTranscriptLen] + "..."
+	}
+
+	text := fmt.Sprintf("🎤 Transcription ready\n\n%s\n\nSend this to Claude or edit it first?", displayTranscript)
+
+	// Build inline keyboard with "Send to Claude" and "Edit first" buttons
+	approveData := fmt.Sprintf("approve_transcript:%d:%d:%d", chatID, int64(ptrVal(threadID)), messageID)
+	editData := fmt.Sprintf("edit_transcript:%d:%d:%d", chatID, int64(ptrVal(threadID)), messageID)
+
+	keyboard := &contract.InlineKeyboard{
+		InlineKeyboard: [][]contract.InlineButton{
+			{
+				{Text: "📤 Send to Claude", CallbackData: approveData},
+				{Text: "✏️ Edit first", CallbackData: editData},
+			},
+		},
+	}
+
+	req := contract.SendRequest{
+		ChatID:      chatID,
+		ThreadID:    threadID,
+		Text:        text,
+		ReplyMarkup: keyboard,
+	}
+
+	var resp contract.SendResponse
+	if err := s.postWithRetry(ctx, "/send", req, &resp); err != nil {
+		return 0, err
+	}
+	return resp.MessageID, nil
+}
+
 // ptrVal returns the int64 value if ptr is non-nil, otherwise 0.
 func ptrVal(ptr *int64) int64 {
 	if ptr == nil {
