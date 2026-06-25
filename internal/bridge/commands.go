@@ -353,15 +353,17 @@ func (h *CommandHandler) cmdConfig(ctx context.Context, update contract.Update, 
 
 		fmt.Fprintf(&sb, "Max Subtasks: %d\n", group.MaxSubtasks)
 		fmt.Fprintf(&sb, "Max Workers: %d\n", group.MaxWorkers)
+		fmt.Fprintf(&sb, "Progress Interval: %d seconds\n", group.ProgressIntervalSec)
 
 		sb.WriteString("\nUsage: /config <setting> <value>\n")
-		sb.WriteString("Settings: permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers\n\n")
+		sb.WriteString("Settings: permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers, progress_interval_sec\n\n")
 		sb.WriteString("Examples:\n")
 		sb.WriteString("  /config permission_mode dontAsk\n")
 		sb.WriteString("  /config allowed_tools [\"Read\",\"Grep\",\"Glob\"]\n")
 		sb.WriteString("  /config disallowed_tools [\"Bash\",\"Edit\"]\n")
 		sb.WriteString("  /config max_subtasks 10\n")
-		sb.WriteString("  /config max_workers 3")
+		sb.WriteString("  /config max_workers 3\n")
+		sb.WriteString("  /config progress_interval_sec 60")
 
 		return strings.TrimRight(sb.String(), "\n"), nil
 	}
@@ -369,7 +371,7 @@ func (h *CommandHandler) cmdConfig(ctx context.Context, update contract.Update, 
 	// Parse setting name and value
 	parts := strings.Fields(args)
 	if len(parts) < 2 {
-		return "Usage: /config <setting> <value>\n\nSettings: permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers\n\nExamples:\n  /config permission_mode dontAsk\n  /config allowed_tools [\"Read\",\"Grep\",\"Glob\"]\n  /config disallowed_tools [\"Bash\",\"Edit\"]\n  /config max_subtasks 10\n  /config max_workers 3", nil
+		return "Usage: /config <setting> <value>\n\nSettings: permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers, progress_interval_sec\n\nExamples:\n  /config permission_mode dontAsk\n  /config allowed_tools [\"Read\",\"Grep\",\"Glob\"]\n  /config disallowed_tools [\"Bash\",\"Edit\"]\n  /config max_subtasks 10\n  /config max_workers 3\n  /config progress_interval_sec 60", nil
 	}
 
 	setting := strings.ToLower(parts[0])
@@ -461,8 +463,22 @@ func (h *CommandHandler) cmdConfig(ctx context.Context, update contract.Update, 
 		}
 		return fmt.Sprintf("Max workers set to: %d", n), nil
 
+	case "progress_interval_sec", "progress-interval-sec", "progressintervalsec", "progress_interval":
+		n, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil || n < 0 {
+			return "Progress interval must be a valid non-negative integer (seconds).\n\nExample: /config progress_interval_sec 60\n0 = disabled", nil
+		}
+		group.ProgressIntervalSec = n
+		if err := h.db.UpsertGroup(ctx, group); err != nil {
+			return "", fmt.Errorf("save group: %w", err)
+		}
+		if n == 0 {
+			return "Progress ticker disabled (0 = no progress updates)", nil
+		}
+		return fmt.Sprintf("Progress interval set to: %d seconds", n), nil
+
 	default:
-		return fmt.Sprintf("Unknown setting %q.\n\nValid settings: permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers", setting), nil
+		return fmt.Sprintf("Unknown setting %q.\n\nValid settings: permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers, progress_interval_sec", setting), nil
 	}
 }
 
