@@ -1734,14 +1734,15 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 	if existing == nil {
 		// New session: create the record
 		sess := &Session{
-			ChatID:       key.chatID,
-			ThreadID:     key.threadID,
-			SessionID:    out.SessionID,
-			CWD:          group.CWD,
-			Model:        resolveSessionModel(nil, group),
-			Status:       "active",
-			MessageCount: 1,
-			TotalCostUSD: out.TotalCostUSD,
+			ChatID:         key.chatID,
+			ThreadID:       key.threadID,
+			SessionID:      out.SessionID,
+			CWD:            group.CWD,
+			Model:          resolveSessionModel(nil, group),
+			Status:         "active",
+			MessageCount:   1,
+			TotalCostUSD:   out.TotalCostUSD,
+			LastFromUserID: fromUserID,
 		}
 		if err := m.db.CreateSession(ctx, sess); err != nil {
 			return err
@@ -1810,6 +1811,7 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 	existing.LastActive = time.Now().UTC()
 	existing.MessageCount++
 	existing.TotalCostUSD += out.TotalCostUSD
+	existing.LastFromUserID = fromUserID
 	if err := m.db.UpdateSession(ctx, existing); err != nil {
 		return err
 	}

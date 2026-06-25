@@ -465,14 +465,24 @@ func (h *CommandHandler) cmdStatus(ctx context.Context, update contract.Update, 
 		fmt.Fprintf(&sb, "  • thread %d — %d messages, last active %s ago",
 			s.ThreadID, s.MessageCount, since)
 
-		// Show user attribution
+		// Show last user attribution prominently
+		if s.LastFromUserID != 0 {
+			fmt.Fprintf(&sb, "\n    Last message from: user %d", s.LastFromUserID)
+		}
+
+		// Show all participants if different from last user
 		participants, err := h.db.GetSessionParticipants(ctx, s.ChatID, s.ThreadID)
 		if err == nil && len(participants) > 0 {
-			userStrs := make([]string, 0, len(participants))
+			// Filter to show only users other than the last one
+			otherUsers := make([]string, 0, len(participants))
 			for _, uid := range participants {
-				userStrs = append(userStrs, fmt.Sprintf("user:%d", uid))
+				if uid != s.LastFromUserID {
+					otherUsers = append(otherUsers, fmt.Sprintf("%d", uid))
+				}
 			}
-			fmt.Fprintf(&sb, "\n    users: %s", strings.Join(userStrs, ", "))
+			if len(otherUsers) > 0 {
+				fmt.Fprintf(&sb, "\n    Other participants: %s", strings.Join(otherUsers, ", "))
+			}
 		}
 		sb.WriteByte('\n')
 	}
@@ -497,14 +507,24 @@ func (h *CommandHandler) cmdSessions(ctx context.Context) (string, error) {
 		fmt.Fprintf(&sb, "  • chat %d / thread %d [%s] — %d messages, last active %s ago",
 			s.ChatID, s.ThreadID, s.Status, s.MessageCount, since)
 
-		// Show user attribution
+		// Show last user attribution prominently
+		if s.LastFromUserID != 0 {
+			fmt.Fprintf(&sb, "\n    Last message from: user %d", s.LastFromUserID)
+		}
+
+		// Show all participants if different from last user
 		participants, err := h.db.GetSessionParticipants(ctx, s.ChatID, s.ThreadID)
 		if err == nil && len(participants) > 0 {
-			userStrs := make([]string, 0, len(participants))
+			// Filter to show only users other than the last one
+			otherUsers := make([]string, 0, len(participants))
 			for _, uid := range participants {
-				userStrs = append(userStrs, fmt.Sprintf("user:%d", uid))
+				if uid != s.LastFromUserID {
+					otherUsers = append(otherUsers, fmt.Sprintf("%d", uid))
+				}
 			}
-			fmt.Fprintf(&sb, "\n    users: %s", strings.Join(userStrs, ", "))
+			if len(otherUsers) > 0 {
+				fmt.Fprintf(&sb, "\n    Other participants: %s", strings.Join(otherUsers, ", "))
+			}
 		}
 		sb.WriteByte('\n')
 	}
