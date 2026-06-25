@@ -401,6 +401,7 @@ type SessionManager struct {
 	pinnedUpdateLastSeen  map[topicKey]time.Time         // debounce: track last pinned msg update time
 	pendingContext        map[topicKey]string            // pending context to inject into next prompt
 	pendingWorkerResults  map[topicKey][]WorkerResult    // completed worker results to inject into next prompt
+	pendingTranscripts    map[topicKey]map[int64]string   // pending approved transcripts (messageID -> transcript) to inject into next prompt
 	activeInvocations     map[topicKey]*activeInvocation // tracks running commands for cancellation
 	approvalChans         map[topicKey]chan toolApproval // tool approval channels for plan mode
 	paneNames             map[topicKey]string            // topicKey → active tmux pane target
@@ -610,6 +611,7 @@ func NewSessionManager(db *DB, sender *Sender, proxyURL string, eventPublisher e
 		pinnedUpdateLastSeen: make(map[topicKey]time.Time),
 		pendingContext:       make(map[topicKey]string),
 		pendingWorkerResults: make(map[topicKey][]WorkerResult),
+		pendingTranscripts:   make(map[topicKey]map[int64]string),
 		activeInvocations:    make(map[topicKey]*activeInvocation),
 		approvalChans:        make(map[topicKey]chan toolApproval),
 		paneNames:            make(map[topicKey]string),
@@ -855,6 +857,53 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	// Transcription complete — stop the audio typing loop.
 	if stopTyping != nil {
 		stopTyping()
+	}
+
+	// Check for transcript verification mode (opt-in feature)
+	// If enabled and there's a transcription in the batch, send verification prompt and wait
+	if group.TranscriptVerify {
+		for i, msg := range batch {
+			ex := msgExtra{}
+			if i < len(extras) {
+				ex = extras[i]
+			}
+			// Check if this message has a transcription
+			if ex.transcription != "" && msg.update.Content != nil &&
+				(msg.update.Content.Type == contract.ContentTypeVoice ||
+					msg.update.Content.Type == contract.ContentTypeAudio ||
+					msg.update.Content.Type == contract.ContentTypeVideo ||
+					msg.update.Content.Type == contract.ContentTypeVideoNote) {
+
+				// Store the pending transcript for later retrieval
+				m.StorePendingTranscript(key.chatID, key.threadID, msg.update.MessageID, ex.transcription)
+
+				// Send verification prompt with inline keyboard
+				tid := key.threadID
+				tidPtr := &tid
+				verifyMsgID, err := m.sender.SendTranscriptVerifyPrompt(ctx, key.chatID, tidPtr, ex.transcription, msg.update.MessageID)
+				if err != nil {
+					log.Printf("[session_mgr] send transcript verify prompt (%d,%d) msg %d: %v",
+						key.chatID, key.threadID, msg.update.MessageID, err)
+					_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, msg.update.MessageID,
+						"⚠️ Failed to send verification prompt. Please try again.")
+				} else {
+					log.Printf("[session_mgr] sent transcript verification prompt (%d,%d) msg %d -> verifyMsg %d",
+						key.chatID, key.threadID, msg.update.MessageID, verifyMsgID)
+				}
+
+				// Clean up temp files and return early - wait for user approval
+				for _, ex := range extras {
+					for _, p := range ex.cleanupPaths {
+						if p != "" {
+							if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+								log.Printf("[session_mgr] cleanup %s: %v", p, err)
+							}
+						}
+					}
+				}
+				return // Exit early - will continue when user approves
+			}
+		}
 	}
 
 	// Check for cancel intent before processing further.
@@ -2709,6 +2758,82 @@ func (m *SessionManager) AddPendingWorkerResult(chatID, threadID int64, result W
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pendingWorkerResults[key] = append(m.pendingWorkerResults[key], result)
+}
+
+// StorePendingTranscript stores a transcript that is awaiting user approval.
+// The transcript will be used once the user approves it via callback.
+func (m *SessionManager) StorePendingTranscript(chatID, threadID int64, messageID int64, transcript string) {
+	key := topicKey{chatID: chatID, threadID: threadID}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pendingTranscripts[key] == nil {
+		m.pendingTranscripts[key] = make(map[int64]string)
+	}
+	m.pendingTranscripts[key][messageID] = transcript
+}
+
+// GetPendingTranscript retrieves a stored transcript by messageID.
+// Returns the transcript and true if found, empty string and false otherwise.
+func (m *SessionManager) GetPendingTranscript(chatID, threadID int64, messageID int64) (string, bool) {
+	key := topicKey{chatID: chatID, threadID: threadID}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pendingTranscripts[key] == nil {
+		return "", false
+	}
+	transcript, ok := m.pendingTranscripts[key][messageID]
+	return transcript, ok
+}
+
+// ClearPendingTranscript removes a stored transcript after it has been processed.
+func (m *SessionManager) ClearPendingTranscript(chatID, threadID int64, messageID int64) {
+	key := topicKey{chatID: chatID, threadID: threadID}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pendingTranscripts[key] != nil {
+		delete(m.pendingTranscripts[key], messageID)
+	}
+}
+
+// SubmitApprovedTranscript is called when a user approves a transcript via callback.
+// It creates a synthetic text message with the approved transcript and processes it.
+func (m *SessionManager) SubmitApprovedTranscript(chatID, threadID int64, messageID int64) {
+	// Get the stored transcript
+	transcript, ok := m.GetPendingTranscript(chatID, threadID, messageID)
+	if !ok {
+		log.Printf("[session_mgr] no pending transcript found for (%d,%d) msg %d", chatID, threadID, messageID)
+		return
+	}
+
+	// Create a synthetic update with the approved transcript as text
+	// This will be processed as if the user typed the transcript
+	syntheticUpdate := contract.Update{
+		UpdateID: int64(time.Now().UnixNano()),
+		ChatID:   chatID,
+		ThreadID: &threadID,
+		MessageID: messageID,
+		Content: &contract.Content{
+			Type: contract.ContentTypeText,
+			Text: &transcript,
+		},
+		FromUser: contract.FromUser{
+			ID: 0, // System message
+		},
+	}
+
+	// Get session and group for the synthetic update
+	session, group, err := m.resolveSessionGroup(context.Background(), topicKey{chatID: chatID, threadID: threadID}, sessionMsg{update: syntheticUpdate, group: nil, session: nil})
+	if err != nil {
+		log.Printf("[session_mgr] resolve session/group for approved transcript: %v", err)
+		return
+	}
+
+	// Re-process with the approved transcript
+	log.Printf("[session_mgr] re-processing approved transcript for (%d,%d) msg %d", chatID, threadID, messageID)
+	m.Handle(context.Background(), syntheticUpdate, session, group)
+
+	// Clear the pending transcript after processing
+	m.ClearPendingTranscript(chatID, threadID, messageID)
 }
 
 // GetSessionContext retrieves context from another session for use with /context.

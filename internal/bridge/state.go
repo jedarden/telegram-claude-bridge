@@ -42,6 +42,7 @@ type Group struct {
 	MaxWorkers         int    // Maximum concurrent spawn_worker per topic (default 5)
 	ProgressIntervalSec int    // Progress ticker interval in seconds (0 = disabled, default 120)
 	DispatcherMode     int    // 1 = orchestrator system prompt injected (default), 0 = direct mode
+	TranscriptVerify   bool   // true = require user approval before sending audio transcription to Claude
 	CreatedAt          time.Time
 }
 
@@ -162,7 +163,7 @@ type ConversationMessage struct {
 	CreatedAt time.Time
 }
 
-const schemaVersion = 21
+const schemaVersion = 22
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -352,6 +353,9 @@ var migrations = []string{
 
 			// Version 21 — add topic_name to sessions for /context command lookup.
 			`ALTER TABLE sessions ADD COLUMN topic_name TEXT;`,
+
+			// Version 22 — add transcript_verify to groups for opt-in audio transcription verification.
+			`ALTER TABLE groups ADD COLUMN transcript_verify INTEGER NOT NULL DEFAULT 0;`,
 	}
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
 // and applies any pending migrations.
@@ -444,7 +448,7 @@ func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 		        COALESCE(permission_mode,'acceptEdits'),
 		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''),
 		        COALESCE(max_subtasks,5), COALESCE(max_workers,5), COALESCE(progress_interval_sec,120),
-		        COALESCE(dispatcher_mode,1), created_at
+		        COALESCE(dispatcher_mode,1), COALESCE(transcript_verify,0), created_at
 		 FROM groups WHERE chat_id = ?`, chatID)
 	return scanGroup(row)
 }
@@ -452,8 +456,8 @@ func (d *DB) GetGroup(ctx context.Context, chatID int64) (*Group, error) {
 // UpsertGroup inserts or replaces a group record.
 func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers, progress_interval_sec, dispatcher_mode, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO groups (chat_id, name, cwd, default_model, max_budget, timeout_sec, permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers, progress_interval_sec, dispatcher_mode, transcript_verify, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(chat_id) DO UPDATE SET
 		   name                = excluded.name,
 		   cwd                  = excluded.cwd,
@@ -466,10 +470,13 @@ func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 		   max_subtasks         = excluded.max_subtasks,
 		   max_workers          = excluded.max_workers,
 		   progress_interval_sec = excluded.progress_interval_sec,
-		   dispatcher_mode      = excluded.dispatcher_mode`,
+		   dispatcher_mode      = excluded.dispatcher_mode,
+		   transcript_verify    = excluded.transcript_verify
+		 WHERE chat_id = excluded.chat_id`,
 		g.ChatID, g.Name, g.CWD, g.DefaultModel, g.MaxBudget, g.TimeoutSec, g.PermissionMode,
 		nullableString(g.AllowedTools), nullableString(g.DisallowedTools),
 		g.MaxSubtasks, g.MaxWorkers, g.ProgressIntervalSec, g.DispatcherMode,
+		boolToInt(g.TranscriptVerify),
 		g.CreatedAt.UTC().Format(time.RFC3339),
 	)
 	return err
@@ -482,7 +489,7 @@ func (d *DB) ListGroups(ctx context.Context) ([]*Group, error) {
 		        COALESCE(permission_mode,'acceptEdits'),
 		        COALESCE(allowed_tools,''), COALESCE(disallowed_tools,''),
 		        COALESCE(max_subtasks,5), COALESCE(max_workers,5), COALESCE(progress_interval_sec,120),
-		        COALESCE(dispatcher_mode,1), created_at
+		        COALESCE(dispatcher_mode,1), COALESCE(transcript_verify,0), created_at
 		 FROM groups ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -527,13 +534,15 @@ type groupScanner interface {
 func scanGroup(s groupScanner) (*Group, error) {
 	var g Group
 	var createdAt string
-	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &g.PermissionMode, &g.AllowedTools, &g.DisallowedTools, &g.MaxSubtasks, &g.MaxWorkers, &g.ProgressIntervalSec, &g.DispatcherMode, &createdAt)
+	var transcriptVerify int
+	err := s.Scan(&g.ChatID, &g.Name, &g.CWD, &g.DefaultModel, &g.MaxBudget, &g.TimeoutSec, &g.PermissionMode, &g.AllowedTools, &g.DisallowedTools, &g.MaxSubtasks, &g.MaxWorkers, &g.ProgressIntervalSec, &g.DispatcherMode, &transcriptVerify, &createdAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	g.TranscriptVerify = transcriptVerify != 0
 	g.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	return &g, nil
 }
@@ -1269,6 +1278,14 @@ func nullableString(s string) any {
 		return nil
 	}
 	return s
+}
+
+// boolToInt returns 1 for true, 0 for false, suitable for INTEGER columns storing booleans.
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // ── subtasks ───────────────────────────────────────────────────────────────────
