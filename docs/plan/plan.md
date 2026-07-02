@@ -147,11 +147,9 @@ For responding to inline keyboard button presses.
 
 ### Token Storage
 
-Token fetched from OpenBao at pod startup, held only in memory. Never written to disk, never in the pod spec or environment variable literals in manifests.
+Token fetched from ExternalSecret-managed Kubernetes Secret at pod startup, held only in memory. Never written to disk, never in the pod spec or environment variable literals in manifests.
 
-OpenBao path: `secret/data/telegram-claude-bridge/bot-token` (key in ExternalSecret: `remoteRef.key`)
-
-Fallback: Kubernetes Secret object referenced via `secretKeyRef` in the Deployment env, with the Secret managed by sealed-secrets or ExternalSecret in declarative-config.
+ExternalSecret in `declarative-config/k8s/ardenone-cluster/telegram-bridge/external-secret.yml` references the bot token secret. The Secret object is managed by the cluster's external secret operator and synced to the pod at runtime.
 
 ### Deployment
 
@@ -560,7 +558,7 @@ CREATE TABLE groups (
     default_model           TEXT NOT NULL DEFAULT 'claude-sonnet-4-6',
     max_budget              REAL NOT NULL DEFAULT 5.0,
     timeout_sec             INTEGER NOT NULL DEFAULT 1800,
-    permission_mode         TEXT NOT NULL DEFAULT 'acceptEdits',  -- bypassPermissions, acceptEdits, plan, dontAsk
+    permission_mode         TEXT NOT NULL DEFAULT 'bypassPermissions',  -- bypassPermissions, acceptEdits, plan, dontAsk
     allowed_tools           TEXT,                              -- JSON array of tool names
     disallowed_tools        TEXT,                              -- JSON array of tool names
     max_subtasks            INTEGER NOT NULL DEFAULT 5,        -- Max concurrent /parallel subtasks
@@ -781,14 +779,14 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 
 ### 1.1 — Telegram Bot Setup
 - Create bot via BotFather
-- Store token in OpenBao on ardenone-cluster
+- Store token in ExternalSecret on ardenone-cluster
 - Create a supergroup with forum mode enabled
 - Grant bot admin with `can_manage_topics`
 
 ### 1.2 — Proxy MVP
 - Go binary (`cmd/proxy/main.go`), stdlib `net/http`
 - Long-poll Telegram, expose `/updates`, `/send`, `/edit`, `/health`
-- Token from env var (OpenBao injection at pod start)
+- Token from env var (ExternalSecret injection at pod start)
 - `FROM scratch` container, deploy to ardenone-cluster via ArgoCD
 - Verify: curl from EX44 over Tailscale returns updates
 
@@ -961,7 +959,7 @@ A terminal UI that provides real-time visibility into the bridge's operation. Ru
 │                                                                          │
 │  ┌─ Cost Tracker ───────────────────────────────────────────────────────┐│
 │  │ Session totals today: $0.48  │  This hour: $0.12  │  Active: 4      ││
-│  └─────────────────────────────────────────────────────────────────────┘│
+│  └──────────────────────────────────────────────────────────────────────┘│
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1497,7 +1495,7 @@ The bridge queries the proxy's `/health` endpoint (which returns `contract_versi
 |---|---|---|---|
 | Proxy | ardenone-cluster, `telegram-bridge` namespace | Deployment via ArgoCD, `FROM scratch` ~10MB image | `declarative-config` repo |
 | Bridge | Hetzner EX44 | Single Go binary, systemd unit, self-updating from git | Local config file + SQLite |
-| Bot token | OpenBao on ardenone-cluster | Fetched at proxy startup | ExternalSecret in `declarative-config/k8s/ardenone-cluster/telegram-bridge/external-secret.yml` |
+| Bot token | ExternalSecret-managed Secret on ardenone-cluster | Fetched at proxy startup via ExternalSecret | `declarative-config/k8s/ardenone-cluster/telegram-bridge/external-secret.yml` |
 | Manifests | `declarative-config` repo | GitOps via ArgoCD | `k8s/ardenone-cluster/telegram-bridge/` |
 | Source | `telegram-claude-bridge` repo | Go monorepo: `cmd/proxy/`, `cmd/bridge/` | This repo |
 
