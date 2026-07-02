@@ -1562,10 +1562,10 @@ func (m *SessionManager) invokeClaudeAPI(
 
 	if !warm {
 		// Cold path: spawn a new pane.
-		args := []string{
-			"--dangerously-skip-permissions",
+		permArgs := resolvePermissionArgs(group)
+		args := append(permArgs,
 			"--model", resolveSessionModel(session, group),
-		}
+		)
 		allowed, disallowed := resolveToolRestrictions(group)
 		if allowed != "" {
 			args = append(args, "--allowed-tools", allowed)
@@ -2124,6 +2124,17 @@ func resolvePermissionMode(group *Group) string {
 		return group.PermissionMode
 	}
 	return defaultPermissionMode
+}
+
+// resolvePermissionArgs returns the command-line arguments for Claude's permission mode.
+// For bypassPermissions, it returns ["--dangerously-skip-permissions"].
+// For other modes (acceptEdits, plan, dontAsk), it returns ["--permission-mode", "<mode>"].
+func resolvePermissionArgs(group *Group) []string {
+	mode := resolvePermissionMode(group)
+	if mode == "bypassPermissions" {
+		return []string{"--dangerously-skip-permissions"}
+	}
+	return []string{"--permission-mode", mode}
 }
 
 // resolveToolRestrictions returns the allowed and disallowed tools for a Claude invocation.
@@ -3119,10 +3130,10 @@ func (m *SessionManager) createNewSession(ctx context.Context, chatID int64, gro
 // and returns the captured session_id by scanning ~/.claude/projects/.
 func (m *SessionManager) createClaudeSession(ctx context.Context, group *Group, prompt string) (string, error) {
 	paneName := fmt.Sprintf("init-%d", time.Now().UnixNano())
-	args := []string{
-		"--dangerously-skip-permissions",
+	permArgs := resolvePermissionArgs(group)
+	args := append(permArgs,
 		"--model", resolveSessionModel(nil, group),
-	}
+	)
 
 	snapshot := SnapshotSessionFiles(group.CWD)
 	paneTarget, err := m.ptyMgr.SpawnPane(paneName, group.CWD, args)

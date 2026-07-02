@@ -16,11 +16,17 @@ The system is split into two processes:
 
 ### Claude invocation
 
-The bridge maintains a tmux session named `telegram-bridge`. Each active Telegram forum topic maps to one tmux window. Claude Code is launched as:
+The bridge maintains a tmux session named `telegram-bridge`. Each active Telegram forum topic maps to one tmux window. Claude Code is launched with configurable permissions:
 
 ```
-claude --dangerously-skip-permissions --model <model> [--resume <session_id>]
+claude <permission_flags> --model <model> [--resume <session_id>]
 ```
+
+Permission flags are determined by the group's `permission_mode` setting:
+- `bypassPermissions` → `--dangerously-skip-permissions` (default)
+- `acceptEdits`, `plan`, `dontAsk` → `--permission-mode <mode>`
+
+Configure via `/config permission_mode <mode>` or `/permission <mode>`.
 
 Panes stay warm between messages (45 s idle threshold). A Claude stop-hook writes the final response to a file that the bridge polls; it falls back to PTY screen-scraping if the hook is not configured. On session ID loss, up to 40 messages of history are prepended from SQLite to restore context.
 

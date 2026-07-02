@@ -104,10 +104,10 @@ func (sc *SessionCloser) generateSessionSummary(ctx context.Context, session *Se
 	defer cancel()
 
 	paneName := fmt.Sprintf("sum-%d", time.Now().UnixNano())
-	args := []string{
-		"--dangerously-skip-permissions",
+	permArgs := resolvePermissionArgs(group)
+	args := append(permArgs,
 		"--model", "claude-haiku-4-5",
-	}
+	)
 	if session.SessionID != "" {
 		args = append(args, "--resume", session.SessionID)
 	}

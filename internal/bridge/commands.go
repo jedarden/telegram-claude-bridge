@@ -673,10 +673,10 @@ func (h *CommandHandler) generateSessionSummary(ctx context.Context, session *Se
 
 	ptyMgr := h.sessionMgr.PTYManager()
 	paneName := fmt.Sprintf("sum-%d", time.Now().UnixNano())
-	args := []string{
-		"--dangerously-skip-permissions",
+	permArgs := resolvePermissionArgs(group)
+	args := append(permArgs,
 		"--model", "claude-haiku-4-5",
-	}
+	)
 	if session.SessionID != "" {
 		args = append(args, "--resume", session.SessionID)
 	}
@@ -1992,10 +1992,10 @@ func GenerateSessionSummary(ctx context.Context, session *Session, group *Group,
 	defer cancel()
 
 	paneName := fmt.Sprintf("sum-%d", time.Now().UnixNano())
-	args := []string{
-		"--dangerously-skip-permissions",
+	permArgs := resolvePermissionArgs(group)
+	args := append(permArgs,
 		"--model", "claude-haiku-4-5",
-	}
+	)
 	if session.SessionID != "" {
 		args = append(args, "--resume", session.SessionID)
 	}

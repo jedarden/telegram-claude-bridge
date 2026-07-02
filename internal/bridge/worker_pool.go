@@ -120,10 +120,10 @@ func (wp *WorkerPool) runWorker(
 	ptyMgr := wp.sessionMgr.PTYManager()
 
 	paneName := fmt.Sprintf("w-%s-%d", worker.ID[:8], time.Now().UnixNano())
-	args := []string{
-		"--dangerously-skip-permissions",
+	permArgs := resolvePermissionArgs(group)
+	args := append(permArgs,
 		"--model", model,
-	}
+	)
 
 	// Add tool restrictions; always disallow spawn_worker (depth limit = 1)
 	allowed, disallowed := resolveToolRestrictions(group)

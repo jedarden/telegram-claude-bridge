@@ -136,10 +136,10 @@ func (o *SubtaskOrchestrator) executeSubtask(ctx context.Context, req SubtaskReq
 	ptyMgr := o.sessionMgr.PTYManager()
 	paneName := fmt.Sprintf("st-%s-%d", subtaskID[:8], time.Now().UnixNano())
 
-	args := []string{
-		"--dangerously-skip-permissions",
+	permArgs := resolvePermissionArgs(req.Group)
+	args := append(permArgs,
 		"--model", resolveSessionModel(req.Session, req.Group),
-	}
+	)
 
 	// Add tool restrictions if configured
 	allowed, disallowed := resolveToolRestrictions(req.Group)
