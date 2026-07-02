@@ -110,7 +110,7 @@ func main() {
 	callbackHandler := bridge.NewCallbackHandler(db, sender, cfg.ProxyURL, &http.Client{Timeout: 10 * time.Second}, sessionMgr)
 
 	updates := make(chan contract.Update, 64)
-	poller := bridge.NewPoller(cfg.ProxyURL, cfg.PollTimeout, updates)
+	poller := bridge.NewPoller(cfg.ProxyURL, cfg.PollTimeout, updates, db)
 
 	// Wire event publisher to health checker for health status events
 	checker.SetEventPublisher(eventPublisher)

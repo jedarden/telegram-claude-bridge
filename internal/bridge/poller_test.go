@@ -68,7 +68,7 @@ func TestPoller_DispatchesSingleBatch(t *testing.T) {
 	defer srv.Close()
 
 	ch := make(chan contract.Update, 10)
-	p := NewPoller(srv.URL, 30, ch)
+	p := NewPoller(srv.URL, 30, ch, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -92,7 +92,7 @@ func TestPoller_DispatchesMultipleBatches(t *testing.T) {
 	defer srv.Close()
 
 	ch := make(chan contract.Update, 10)
-	p := NewPoller(srv.URL, 30, ch)
+	p := NewPoller(srv.URL, 30, ch, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -115,7 +115,7 @@ func TestPoller_EmptyResponseRetriesImmediately(t *testing.T) {
 	defer srv.Close()
 
 	ch := make(chan contract.Update, 1)
-	p := NewPoller(srv.URL, 30, ch)
+	p := NewPoller(srv.URL, 30, ch, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
@@ -136,7 +136,7 @@ func TestPoller_BackoffOnConnectionError(t *testing.T) {
 	srv.Close() // closed before poller starts
 
 	ch := make(chan contract.Update, 1)
-	p := NewPoller(srv.URL, 30, ch)
+	p := NewPoller(srv.URL, 30, ch, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
@@ -159,7 +159,7 @@ func TestPoller_Backoff502(t *testing.T) {
 	defer srv.Close()
 
 	ch := make(chan contract.Update, 1)
-	p := NewPoller(srv.URL, 30, ch)
+	p := NewPoller(srv.URL, 30, ch, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
@@ -189,7 +189,7 @@ func TestPoller_ContextCancelShutdown(t *testing.T) {
 	defer srv.Close()
 
 	ch := make(chan contract.Update, 1)
-	p := NewPoller(srv.URL, 30, ch)
+	p := NewPoller(srv.URL, 30, ch, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p.Start(ctx)
@@ -214,4 +214,79 @@ func TestPoller_ContextCancelShutdown(t *testing.T) {
 		close(done)
 	}
 	<-done
+}
+
+func TestPoller_DeduplicationFiltersDuplicateUpdateIDs(t *testing.T) {
+	// Create a temporary database for this test.
+	tmpDB := t.TempDir() + "/test.db"
+	db, err := OpenDB(tmpDB)
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Create a mock proxy that returns the same update batch multiple times.
+	updates := []contract.Update{makeUpdate(1), makeUpdate(2)}
+	var callCount int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&callCount, 1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(contract.UpdatesResponse{OK: true, Updates: updates})
+	}))
+	defer srv.Close()
+
+	ch := make(chan contract.Update, 10)
+	p := NewPoller(srv.URL, 1, ch, db)
+
+	// Start poller with a short timeout so it makes multiple calls quickly.
+	pollCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	go p.Start(pollCtx)
+
+	// Collect the first batch (2 updates).
+	firstBatch := collect(t, ch, 2, 2*time.Second)
+	if len(firstBatch) != 2 {
+		t.Fatalf("expected 2 updates in first batch, got %d", len(firstBatch))
+	}
+	if firstBatch[0].UpdateID != 1 || firstBatch[1].UpdateID != 2 {
+		t.Errorf("unexpected update IDs in first batch: %v", []int64{firstBatch[0].UpdateID, firstBatch[1].UpdateID})
+	}
+
+	// Verify the updates are marked as processed in the database.
+	processed1, err := db.IsUpdateProcessed(ctx, 1)
+	if err != nil {
+		t.Fatalf("failed to check if update 1 was processed: %v", err)
+	}
+	if !processed1 {
+		t.Error("update 1 should be marked as processed")
+	}
+	processed2, err := db.IsUpdateProcessed(ctx, 2)
+	if err != nil {
+		t.Fatalf("failed to check if update 2 was processed: %v", err)
+	}
+	if !processed2 {
+		t.Error("update 2 should be marked as processed")
+	}
+
+	// The poller will fetch the same batch again from the proxy.
+	// Wait for another poll cycle (mock returns quickly, so 500ms should be enough).
+	time.Sleep(500 * time.Millisecond)
+
+	// Try to collect more updates with a short timeout.
+	// Since all updates are duplicates, the channel should remain empty.
+	secondBatch := collect(t, ch, 1, 500*time.Millisecond)
+	if len(secondBatch) != 0 {
+		t.Errorf("expected no updates in second batch (all duplicates), got %d", len(secondBatch))
+	}
+
+	// Verify that the proxy was called at least twice (same data replayed).
+	calls := atomic.LoadInt64(&callCount)
+	if calls < 2 {
+		t.Errorf("expected at least 2 proxy calls, got %d", calls)
+	}
+
+	cancel()
 }

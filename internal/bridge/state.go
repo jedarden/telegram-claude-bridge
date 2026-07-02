@@ -172,7 +172,7 @@ type ConversationMessage struct {
 	CreatedAt time.Time
 }
 
-const schemaVersion = 23
+const schemaVersion = 24
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -368,6 +368,18 @@ var migrations = []string{
 
 				// Version 23 — add last_from_user_id to sessions for per-user last message attribution.
 				`ALTER TABLE sessions ADD COLUMN last_from_user_id INTEGER NOT NULL DEFAULT 0;`,
+
+				// Version 24 — add processed_updates table for update deduplication.
+				// Tracks which Telegram update_ids have been processed to prevent replay
+				// after proxy restarts or offset loss. The update_id is the unique,
+				// monotonically-increasing identifier from Telegram's getUpdates API.
+				`CREATE TABLE IF NOT EXISTS processed_updates (
+					update_id INTEGER PRIMARY KEY,
+					processed_at TEXT NOT NULL DEFAULT (datetime('now'))
+				);
+
+				CREATE INDEX IF NOT EXISTS idx_processed_updates_at
+					ON processed_updates (processed_at);`,
 	}
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
 // and applies any pending migrations.
@@ -1850,6 +1862,27 @@ func (d *DB) DeleteConversationHistory(ctx context.Context, chatID, threadID int
 	_, err := d.db.ExecContext(ctx,
 		`DELETE FROM conversation_messages WHERE chat_id = ? AND thread_id = ?`,
 		chatID, threadID)
+	return err
+}
+
+// ── processed_updates (update deduplication) ───────────────────────────────────
+
+// IsUpdateProcessed returns true if the given update_id has already been processed.
+// This prevents replay attacks after proxy restarts or offset loss.
+func (d *DB) IsUpdateProcessed(ctx context.Context, updateID int64) (bool, error) {
+	var count int
+	err := d.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM processed_updates WHERE update_id = ?`, updateID,
+	).Scan(&count)
+	return count > 0, err
+}
+
+// MarkUpdateProcessed records that an update has been processed.
+// Uses INSERT OR IGNORE to be idempotent.
+func (d *DB) MarkUpdateProcessed(ctx context.Context, updateID int64) error {
+	_, err := d.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO processed_updates (update_id) VALUES (?)`, updateID,
+	)
 	return err
 }
 

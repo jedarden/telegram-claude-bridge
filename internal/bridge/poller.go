@@ -24,16 +24,19 @@ type Poller struct {
 	pollTimeout int // seconds passed as ?timeout= to the proxy
 	updates     chan<- contract.Update
 	client      *http.Client
+	db          *DB // For update deduplication
 }
 
 // NewPoller creates a Poller that sends received updates to updates.
 // The HTTP client timeout is set to pollTimeout+5s so the proxy's own
 // long-poll timeout fires before the client gives up.
-func NewPoller(proxyURL string, pollTimeout int, updates chan<- contract.Update) *Poller {
+// If db is non-nil, the poller will filter out duplicate update_ids.
+func NewPoller(proxyURL string, pollTimeout int, updates chan<- contract.Update, db *DB) *Poller {
 	return &Poller{
 		proxyURL:    proxyURL,
 		pollTimeout: pollTimeout,
 		updates:     updates,
+		db:          db,
 		client: &http.Client{
 			Timeout: time.Duration(pollTimeout+5) * time.Second,
 		},
@@ -86,8 +89,27 @@ func (p *Poller) pollLoop(ctx context.Context) {
 		backoff = backoffMin // reset on success
 
 		for _, u := range updates {
+			// Skip if this update was already processed (deduplication).
+			// This protects against replay when the proxy loses its offset.
+			if p.db != nil {
+				alreadyProcessed, err := p.db.IsUpdateProcessed(ctx, u.UpdateID)
+				if err != nil {
+					log.Printf("[bridge/poller] dedup check failed for update %d: %v — processing anyway", u.UpdateID, err)
+				} else if alreadyProcessed {
+					log.Printf("[bridge/poller] skipping duplicate update %d", u.UpdateID)
+					continue
+				}
+			}
+
+			// Forward to channel for routing.
 			select {
 			case p.updates <- u:
+				// Mark as processed only after successful send.
+				if p.db != nil {
+					if err := p.db.MarkUpdateProcessed(ctx, u.UpdateID); err != nil {
+						log.Printf("[bridge/poller] failed to mark update %d as processed: %v", u.UpdateID, err)
+					}
+				}
 			case <-ctx.Done():
 				return
 			}
