@@ -149,9 +149,9 @@ For responding to inline keyboard button presses.
 
 Token fetched from OpenBao at pod startup, held only in memory. Never written to disk, never in the pod spec or environment variable literals in manifests.
 
-OpenBao path: `ardenone-cluster/telegram/ardenone_bot` (key in ExternalSecret: `remoteRef.key`)
+OpenBao path: `secret/data/telegram-claude-bridge/bot-token` (key in ExternalSecret: `remoteRef.key`)
 
-Fallback: Kubernetes Secret object referenced via `secretKeyRef` in the Deployment env, with the Secret managed by sealed-secrets.
+Fallback: Kubernetes Secret object referenced via `secretKeyRef` in the Deployment env, with the Secret managed by sealed-secrets or ExternalSecret in declarative-config.
 
 ### Deployment
 
@@ -174,7 +174,7 @@ The bridge is the dispatcher and message bus. It routes Telegram messages to the
 
 - **Language:** Go
 - **HTTP:** stdlib `net/http` for client to proxy
-- **Claude integration:** Interactive Claude CLI via PTY, one tmux pane per active topic. Each session runs `claude --resume <session_id>` in a persistent tmux pane within the `telegram-bridge` session. Prompts are injected via PTY write (bracketed paste mode); responses are extracted by reading PTY output and scraping the VT100 screen via a pyte emulator. Billing uses subscription (not API credits) because `claude` runs in a real TTY context, not headless `-p` mode.
+- **Claude integration:** Interactive Claude CLI via PTY, one tmux pane per active topic. Each session runs `claude --resume <session_id>` in a persistent tmux pane within the `telegram-bridge` session. Prompts are injected via PTY write (bracketed paste mode); responses are extracted via a **stop-hook mechanism** (Claude's `--stop-hook` writes final response to a file that the bridge polls) with **tmux capture-pane screen scraping** as fallback. Billing uses subscription (not API credits) because `claude` runs in a real TTY context, not headless `-p` mode.
 - **Media processing:** `whisper` CLI for audio transcription, `ffmpeg` CLI for video frame/audio extraction (both invoked as subprocesses)
 - **State:** SQLite via `modernc.org/sqlite` (pure Go, no CGo)
 - **Runtime:** single static binary, systemd unit on EX44
@@ -194,7 +194,8 @@ The bridge is the dispatcher and message bus. It routes Telegram messages to the
 │                                  │  │    claude --resume session_id │ │
 │                                  │  │    --append-system-prompt     │ │
 │                                  │  │    PTY write (bracketed paste)│ │
-│                                  │  │    pyte screen scrape         │ │
+│                                  │  │    stop-hook file extraction  │ │
+│                                  │  │    tmux capture-pane fallback │ │
 │                                  │  │                               │ │
 │                                  │  │  Intercepts synthetic tools:  │ │
 │                                  │  │  ├─ spawn_worker → WorkerPool │ │
@@ -209,14 +210,16 @@ The bridge is the dispatcher and message bus. It routes Telegram messages to the
 │  ┌──────────────┐  ┌──────────────────────────────────────────────┐  │
 │  │  Command     │  │  State (SQLite)                              │  │
 │  │  Handler     │  │  groups · sessions · workers · cost_events   │  │
-│  │  /new /close │  └──────────────────────────────────────────────┘  │
-│  │  /model etc  │                                                    │
-│  └──────────────┘  ┌──────────────┐  ┌──────────────┐               │
-│                    │  Media       │  │  Sender       │               │
-│                    │  Processor   │  │  POST /send   │               │
-│                    │  Whisper     │  │  POST /edit   │               │
-│                    │  ffmpeg      │  │  POST /send_* │               │
-│                    └──────────────┘  └──────────────┘               │
+│  │  /new /close │  │  subtasks · background_jobs · snippets       │  │
+│  │  /model etc  │  │  conversation_messages · sent_messages       │  │
+│  └──────────────┘  └──────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐               │
+│  │  Media       │  │  Sender       │  │  Intent       │               │
+│  │  Processor   │  │  POST /send   │  │  Detector     │               │
+│  │  Whisper     │  │  POST /edit   │  │  (NL parsing) │               │
+│  │  ffmpeg      │  │  POST /send_* │  │               │               │
+│  └──────────────┘  └──────────────┘  └──────────────┘               │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -272,15 +275,16 @@ Pane alive for topic?
    ├── Yes (warm)  → inject prompt via PTY write immediately
    └── No  (cold) → spawn pane:
                      tmux new-window -t telegram-bridge -n "topic-<thread_id>"
-                       "claude --resume <session_id>   # or no --resume on first ever message
+                       "claude --resume <session_id>
                                --dangerously-skip-permissions
                                --model <topic_model>
                                --cwd <project_dir>
-                               --append-system-prompt '<dispatcher context>'"
+                               --append-system-prompt '<dispatcher context>'
+                               --stop-hook scripts/bridge-stop-hook.sh"
                      wait for startup handshake (~3s: DA query + trust dismiss + ready)
                      inject prompt via bracketed paste
 
-Response scraped
+Response extracted
         │
         ▼
 Reset idle timer (pane_idle_ttl = 5 min)
@@ -301,7 +305,7 @@ tmux new-window -t telegram-bridge -n "worker-<worker_id>" \
           --cwd <project_dir> \
           --disallowed-tools spawn_worker"
 
-# Prompt injected via bracketed paste; result extracted via pyte scrape
+# Prompt injected via bracketed paste; result extracted via stop-hook file or tmux capture-pane
 # Pane closed after result captured
 ```
 
@@ -314,10 +318,12 @@ Workers do not get `--resume` (fresh session each time) and cannot call `spawn_w
 - `--disallowed-tools spawn_worker` — workers cannot recursively spawn
 - `--model` — per-session or per-worker model override
 - `--allowed-tools` / `--disallowed-tools` — tool restrictions per group
+- `--stop-hook scripts/bridge-stop-hook.sh` — writes final response to `$BRIDGE_RESPONSE_FILE` for authoritative extraction
+- **Response extraction (primary):** Stop-hook file polling — the stop-hook reads Claude's transcript JSONL, extracts the last assistant message, writes atomically to `.tmp` → rename → touches `.ready`. The bridge polls `.ready` and reads the file.
+- **Response extraction (fallback):** tmux capture-pane — if stop-hook fails or no file produced, bridge scrapes screen via `tmux capture-pane -p -t <paneTarget>`.
 - Bracketed paste mode (`\x1b[200~` … `\x1b[201~`) — injects multi-line prompts without triggering premature submission
-- pyte VT100 screen emulator — extracts response text from PTY byte stream; watches for response-start sentinel (`●`) and end-of-response separators (`────`)
 - `PRE_RESP_TIMEOUT = 120s` — wait for first `●` after prompt injection
-- `IDLE_TIMEOUT = 30s` — session considered done after 30s silence past last response chunk
+- `IDLE_TIMEOUT = 45s` — session considered done after 45s silence past last response chunk
 
 **Synthetic tools intercepted by the bridge** (not real Anthropic tools — described via system prompt):
 
@@ -328,13 +334,14 @@ Workers do not get `--resume` (fresh session each time) and cannot call `spawn_w
 
 The scanner loop in `invokeClaudeAPI` intercepts `tool_use` blocks with these names before they reach the `result` event, handles them synchronously (DB write + goroutine spawn), and writes the `tool_result` back to the subprocess stdin so the orchestrator continues without stalling.
 
-**PTY output parsing (replacing NDJSON stream):**
+**PTY output parsing:**
 - Response start detected by `●` (U+25CF) sentinel in PTY byte stream
-- Tool use detected by watching for known tool-start patterns in the VT100 screen buffer
+- Tool use detected by watching for known tool-start patterns in the VT100 screen buffer (tmux capture-pane fallback)
 - Response end detected by `────` separator bars and subsequent idle gap
-- Full response extracted by pyte `_SCREEN_ROWS=2000` screen emulator after end-of-response detected
+- **Primary extraction:** Stop-hook file (`$BRIDGE_RESPONSE_FILE.ready` signals completion, file contains last assistant message)
+- **Fallback extraction:** tmux capture-pane screen scraping if stop-hook fails
 - Session ID captured from the initial pane startup output (claude prints it on attach/resume)
-- Cost/usage not available in interactive mode (subscription billing — no per-call token counts)
+- Cost/usage tracked via `cost_events` table with per-message token counts (from Claude stop-hook transcript)
 
 **Worker goroutine on completion:**
 1. Update `workers` row: `status=done`, `result=...`, `finished_at=now`
@@ -374,7 +381,7 @@ The `pendingWorkerResults` map is drained atomically at the start of each `proce
 // PTY read loop with timeout
 select {
 case resp := <-ptyResponseCh:
-    // response extracted from pyte screen
+    // response extracted from stop-hook file or tmux capture-pane
 case <-time.After(timeout):
     // kill the pane, notify user in Telegram
     tmuxKillPane(paneID)
@@ -436,6 +443,7 @@ Processes bot commands. Commands are recognized in both the General topic and no
 | `/model [name]` | View or set the default model for this group |
 | `/timeout [seconds]` | View or set the prompt timeout for this group |
 | `/budget [usd]` | View or set the max budget per session for this group |
+| `/cost` | Show cost breakdown (group total / daily trend / per-topic / per-user) |
 | `/help` | Show available commands |
 | `/ping` | Health check — responds with latency to proxy and Claude |
 | `/version` | Show bridge and proxy versions (semver + commit hash) |
@@ -449,31 +457,34 @@ Processes bot commands. Commands are recognized in both the General topic and no
 | `/haiku` | Shortcut: set this topic to `claude-haiku-4-5` |
 | `/sonnet` | Shortcut: set this topic to `claude-sonnet-4-6` |
 | `/opus` | Shortcut: set this topic to `claude-opus-4-6` |
-| `/info` | Show session info: model, cwd, session_id, cost, message count |
+| `/color [name]` | Set topic icon color (`active`, `complete`, `blocked`, `error`, `review`, `research`) |
+| `/notify [mode]` | Set notification mode (`live`, `summary`, `quiet`) |
+| `/context <thread_id>` | Inject context from another topic into this session |
+| `/snippet <name> <content>` | Save a named context snippet |
+| `/snippets` | List saved snippets |
+| `/info` | Show session info: model, cwd, session_id, cost, message count, notify mode, timeout |
+| `/dispatch [on|off|default]` | Toggle orchestrator mode |
+| `/timeout [N]` | Set per-topic timeout in seconds (0 = use group default) |
+| `/cancel` | Cancel the running request |
+| `/parallel <prompts>` | Run up to 5 prompts in parallel (separate with `---`) |
+| `/bg <command>` | Run a shell command in the background and stream output to the topic |
+| `/jobs` | List background jobs |
+| `/kill <job_id>` | Kill a background job |
 
-All other text in non-General topics is passed through to Claude as the prompt — but the bridge scans it for model-change intent first (see below).
+All other text in non-General topics is passed through to Claude as the prompt — but the bridge scans it for intent first (model switching, cancel, notify mode, cost queries, session control, timeout adjustments) via natural language intent detection.
 
-**Natural language model switching:**
+**Natural language intent detection:**
 
-Before dispatching a message to Claude, the bridge checks for model-change phrases in the message text. If detected, the bridge updates the topic's model, confirms the change with a short reply, and then forwards the rest of the message (if any) to Claude using the new model.
+The bridge intercepts common phrases before forwarding them to Claude:
 
-Detection is done by normalizing the message to lowercase and checking for known phrase substrings:
-
-| Phrase | Action |
-|---|---|
-| "use opus", "switch to opus", "let's use opus", "need opus for this" | Set model to `claude-opus-4-6` |
-| "use sonnet", "switch to sonnet", "back to sonnet" | Set model to `claude-sonnet-4-6` |
-| "use haiku", "switch to haiku", "quick mode" | Set model to `claude-haiku-4-5` |
-| "use a smarter model", "this needs more power", "think harder" | Escalate one tier (haiku→sonnet, sonnet→opus) |
-| "use a faster model", "keep it simple", "quick answer" | De-escalate one tier (opus→sonnet, sonnet→haiku) |
+- **Cancel:** "cancel", "stop", "abort", "never mind", "scratch that"
+- **Model switch:** "use opus", "think harder", "fast mode", "switch to sonnet", "back to default"
+- **Notify mode:** "stream updates", "quiet mode", "just tell me when done", "no updates"
+- **Cost / status queries:** "how much", "show cost", "what is the cost", "total cost", "show status", "session info"
+- **Session control:** "close session", "end session", "we are done", "all done", "wrap up"
+- **Timeout adjustments:** "give me more time", "extend timeout"
 
 Implementation: `strings.ToLower()` then `strings.Contains()` against a table of known phrases. No regex. The phrases are deliberately specific — a verb of intent ("use", "switch to", "need") paired with a model name or tier keyword — so the detector doesn't misfire on messages that happen to contain "opus" in a different context.
-
-When a model change is detected:
-1. Update `sessions.model` in SQLite
-2. Reply with a short confirmation: `Model → claude-opus-4-6`
-3. Update the pinned metadata message
-4. If the message contains additional text beyond the model-change phrase, strip the intent phrase and forward the remainder to Claude with the new model. If the message is *only* a model-change request, no Claude invocation is made.
 
 **Model resolution order:** The bridge resolves which model to use for each CLI invocation in this order (first non-null wins):
 
@@ -505,6 +516,16 @@ Converts Claude's output to Telegram-compatible format.
 - On completion, send final formatted message (replacing the streamed version if formatting differs)
 - If response exceeds 4096 chars during streaming, stop editing and send new messages for overflow
 
+**Notification modes:**
+
+Per-topic, configurable via `/notify` or natural language ("stream updates", "quiet mode", etc.):
+
+| Mode | Behavior |
+|------|----------|
+| `live` (default) | Progressively edits one Telegram message as Claude streams (1 s debounce) |
+| `summary` | Posts a placeholder, edits to the final response only when done |
+| `quiet` | No updates during processing; posts only on completion |
+
 #### 7. Sender
 
 Thin async HTTP client that posts to the proxy's outbound endpoints. Handles:
@@ -513,34 +534,63 @@ Thin async HTTP client that posts to the proxy's outbound endpoints. Handles:
 - Retry on proxy connection failure with exponential backoff
 - Response tracking: store `message_id` of sent messages for subsequent edits
 
-#### 8. State (SQLite)
+#### 8. Intent Detector
+
+Natural language intent recognition (test-driven examples) that intercepts common user phrases before forwarding to Claude:
+
+- `detectCancelIntent()` — cancel phrases: "cancel", "stop", "abort", "never mind", "scratch that"
+- `detectModelChange()` — model switching: "use opus", "switch to sonnet", "back to default", tier escalation ("think harder"), de-escalation ("keep it simple")
+- `detectNotifyIntent()` — notification mode: "quiet", "silent", "just tell me when done" → summary; "be quiet", "no updates" → quiet; "show everything", "keep me posted" → live
+- `detectCostIntent()` — cost queries: "how much", "what is the cost", "show cost", "total cost"
+- `detectStatusIntent()` — status queries: "what are you doing", "show status", "session info", "are you busy"
+- `detectCloseIntent()` — session control: "close this session", "end session", "we are done", "all done", "wrap up"
+- `detectTimeoutIntent()` — timeout adjustments: "give me more time", "extend timeout"
+
+#### 9. State (SQLite)
 
 ```sql
+-- Current schema version: 24
+-- Migrations are applied sequentially on startup; schema_version prevents re-application.
+
 -- Which groups are registered and their default settings
 CREATE TABLE groups (
-    chat_id         INTEGER PRIMARY KEY,
-    name            TEXT,
-    cwd             TEXT NOT NULL,
-    default_model   TEXT DEFAULT 'claude-sonnet-4-6',
-    max_budget      REAL DEFAULT 5.0,
-    timeout_sec     INTEGER DEFAULT 300,
-    pane_idle_ttl   INTEGER DEFAULT 300,  -- seconds to keep pane alive after last response (0 = kill immediately)
-    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    chat_id                 INTEGER PRIMARY KEY,
+    name                    TEXT,
+    cwd                     TEXT NOT NULL,
+    default_model           TEXT NOT NULL DEFAULT 'claude-sonnet-4-6',
+    max_budget              REAL NOT NULL DEFAULT 5.0,
+    timeout_sec             INTEGER NOT NULL DEFAULT 1800,
+    permission_mode         TEXT NOT NULL DEFAULT 'acceptEdits',  -- bypassPermissions, acceptEdits, plan, dontAsk
+    allowed_tools           TEXT,                              -- JSON array of tool names
+    disallowed_tools        TEXT,                              -- JSON array of tool names
+    max_subtasks            INTEGER NOT NULL DEFAULT 5,        -- Max concurrent /parallel subtasks
+    max_workers             INTEGER NOT NULL DEFAULT 5,        -- Max concurrent spawn_worker
+    progress_interval_sec   INTEGER NOT NULL DEFAULT 120,      -- Progress ticker (0 = disabled)
+    dispatcher_mode         INTEGER NOT NULL DEFAULT 1,        -- 1 = orchestrator mode, 0 = direct
+    transcript_verify       INTEGER NOT NULL DEFAULT 0,        -- 1 = require approval for audio transcription
+    created_at              TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- Maps each topic to a Claude Code session
 CREATE TABLE sessions (
-    chat_id       INTEGER NOT NULL,
-    thread_id     INTEGER NOT NULL,
-    session_id    TEXT NOT NULL,
-    cwd           TEXT NOT NULL,
-    model         TEXT,
-    status        TEXT NOT NULL DEFAULT 'active',  -- active, closed, error
-    pane_state    TEXT NOT NULL DEFAULT 'idle',    -- idle (no pane), warm (pane alive), processing
-    tmux_pane_id  TEXT,                            -- tmux pane target (e.g. "telegram-bridge:topic-42"), null when idle
-    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-    last_active   TEXT NOT NULL DEFAULT (datetime('now')),
-    message_count INTEGER NOT NULL DEFAULT 0,
+    chat_id               INTEGER NOT NULL,
+    thread_id             INTEGER NOT NULL,
+    session_id            TEXT NOT NULL,
+    cwd                   TEXT NOT NULL,
+    model                 TEXT,
+    status                TEXT NOT NULL DEFAULT 'active',      -- active, closed, error
+    icon_color            INTEGER,                              -- Topic icon color code
+    created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    last_active           TEXT NOT NULL DEFAULT (datetime('now')),
+    message_count         INTEGER NOT NULL DEFAULT 0,
+    pinned_message_id     INTEGER,                              -- Metadata message pinned in topic
+    total_cost_usd        REAL NOT NULL DEFAULT 0.0,
+    summary               TEXT,                                  -- Session summary generated on close
+    notification_mode     TEXT NOT NULL DEFAULT 'live',         -- live, summary, quiet
+    timeout_sec           INTEGER NOT NULL DEFAULT 0,           -- Per-topic timeout override
+    dispatcher_mode       INTEGER NOT NULL DEFAULT -1,          -- 1 = enabled, 0 = disabled, -1 = use group default
+    topic_name            TEXT,                                  -- Forum topic name for /context lookup
+    last_from_user_id     INTEGER NOT NULL DEFAULT 0,           -- Last Telegram user to message this session
     PRIMARY KEY (chat_id, thread_id),
     FOREIGN KEY (chat_id) REFERENCES groups(chat_id)
 );
@@ -548,18 +598,109 @@ CREATE TABLE sessions (
 -- Authorized Telegram user IDs
 CREATE TABLE allowed_users (
     user_id       INTEGER PRIMARY KEY,
-    role          TEXT NOT NULL DEFAULT 'user',  -- admin, user
+    role          TEXT NOT NULL DEFAULT 'user',      -- admin, user
     added_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Tracks sent message IDs for edit-in-place streaming
+-- Tracks sent message IDs for edit-in-place streaming and deduplication
 CREATE TABLE sent_messages (
     chat_id       INTEGER NOT NULL,
     thread_id     INTEGER NOT NULL,
     message_id    INTEGER NOT NULL,
-    purpose       TEXT NOT NULL,  -- streaming, response, command
+    purpose       TEXT NOT NULL,                       -- streaming, response, command, placeholder
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (chat_id, thread_id, message_id)
+);
+
+-- Cost tracking per API invocation (from Claude stop-hook transcript)
+CREATE TABLE cost_events (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id               INTEGER NOT NULL,
+    thread_id             INTEGER NOT NULL,
+    cost_usd              REAL NOT NULL,
+    input_tokens          INTEGER NOT NULL DEFAULT 0,
+    output_tokens         INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    model                 TEXT NOT NULL,
+    from_user_id          INTEGER NOT NULL DEFAULT 0,
+    created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (chat_id, thread_id) REFERENCES sessions(chat_id, thread_id)
+);
+
+-- Parallel subtasks spawned by /parallel or SubtaskOrchestrator
+CREATE TABLE subtasks (
+    id            TEXT PRIMARY KEY,                    -- UUID
+    chat_id       INTEGER NOT NULL,
+    thread_id     INTEGER NOT NULL,
+    parent_msg    INTEGER,                              -- Message ID that spawned this subtask
+    prompt        TEXT NOT NULL,
+    session_id    TEXT,                                  -- Optional session_id to resume
+    status        TEXT NOT NULL DEFAULT 'running',      -- running, complete, error
+    result        TEXT,
+    error         TEXT,
+    started_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at   TEXT,
+    FOREIGN KEY (chat_id, thread_id) REFERENCES sessions(chat_id, thread_id)
+);
+
+-- Worker processes spawned via spawn_worker synthetic tool
+CREATE TABLE workers (
+    id           TEXT PRIMARY KEY,                      -- UUID
+    chat_id      INTEGER NOT NULL,
+    thread_id    INTEGER NOT NULL,
+    parent_msg   INTEGER NOT NULL,
+    prompt       TEXT NOT NULL,
+    session_id   TEXT,
+    model        TEXT,
+    status       TEXT NOT NULL DEFAULT 'running',      -- running, done, failed
+    result       TEXT,
+    error        TEXT,
+    started_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at  TEXT,
+    FOREIGN KEY (chat_id, thread_id) REFERENCES sessions(chat_id, thread_id)
+);
+
+-- Background shell jobs spawned via /bg
+CREATE TABLE background_jobs (
+    id          TEXT PRIMARY KEY,                       -- 8-character hex
+    chat_id     INTEGER NOT NULL,
+    thread_id   INTEGER NOT NULL,
+    command     TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'running',       -- running, complete, error, interrupted
+    exit_code   INTEGER,
+    started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT,
+    FOREIGN KEY (chat_id, thread_id) REFERENCES sessions(chat_id, thread_id)
+);
+
+-- Reusable context snippets for a chat
+CREATE TABLE snippets (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(chat_id, name),
+    FOREIGN KEY (chat_id) REFERENCES groups(chat_id)
+);
+
+-- Conversation messages stored for session restore on loss
+CREATE TABLE conversation_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER NOT NULL,
+    thread_id  INTEGER NOT NULL,
+    role       TEXT NOT NULL,                            -- user, assistant
+    content    TEXT NOT NULL,
+    tg_msg_id  INTEGER NOT NULL DEFAULT 0,              -- Telegram message ID (0 for assistant)
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (chat_id, thread_id) REFERENCES sessions(chat_id, thread_id)
+);
+
+-- Update deduplication for replay prevention after proxy offset loss
+CREATE TABLE processed_updates (
+    update_id   INTEGER PRIMARY KEY,
+    processed_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 ```
 
@@ -569,7 +710,7 @@ CREATE TABLE sent_messages (
 
 - `allowed_users` table is the allowlist. Only messages from authorized `from_user_id` values are processed.
 - Admin role can use `/cwd`, `/model`, `/budget`, `/timeout`, and manage group settings.
-- User role can send messages to topics and use `/status`, `/help`, `/new`, `/close`.
+- User role can send messages to topics and use `/status`, `/help`, `/new`, `/close`, and all topic-level commands.
 - Unknown users are silently ignored (no error response to prevent enumeration).
 
 #### Input Handling
@@ -579,9 +720,10 @@ CREATE TABLE sent_messages (
 
 #### Claude Code Permissions
 
-- Default `--permission-mode plan` — Claude proposes changes before executing.
-- Configurable per group. Options: `plan` (default), `acceptEdits` (auto-approve file edits), `dontAsk` (full autonomy for trusted contexts).
-- `--allowedTools` and `--disallowedTools` configurable per group to restrict what Claude can do.
+- **Default runtime behavior:** Every Claude invocation passes `--dangerously-skip-permissions` flag (effectively `bypassPermissions`). The `permission_mode` is stored in the database (`groups.permission_mode`, `sessions.permission_mode`) but does not affect runtime behavior in the current implementation due to the pervasive skip-permissions flag.
+- **Stored permission modes:** `bypassPermissions` (default), `acceptEdits`, `plan`, `dontAsk` — configurable per group and per topic via `/permission` or `/config permission_mode`, but not wired to CLI flags (tracked open issue).
+- `--allowed-tools` and `--disallowed-tools` are configurable per group to restrict what Claude can do.
+- **Note:** Wiring the stored `permission_mode` value to actual CLI flags is a tracked open issue (see related bead about permission mode integration).
 
 ### Topic Lifecycle Management
 
@@ -656,9 +798,9 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 - SQLite state with `groups` and `sessions` tables (`modernc.org/sqlite`)
 - General topic: `/cwd` command to register a group
 - Non-General topics: create tmux pane + session on first message, inject into existing pane on subsequent
-- PTY manager component: launches/tracks tmux panes in the `telegram-bridge` session (one pane per active topic), injects prompts via bracketed paste, scrapes responses via pyte VT100 emulator
+- PTY manager component: launches/tracks tmux panes in the `telegram-bridge` session (one pane per active topic), injects prompts via bracketed paste, extracts responses via stop-hook file with tmux capture-pane fallback
 - Text-only (no media processing)
-- No streaming initially — wait for full response from PTY, send as single message (chunked if >4096)
+- No streaming initially — wait for full response from stop-hook or PTY, send as single message (chunked if >4096)
 - Single static binary, systemd unit on EX44
 - Verify: send message in topic, receive Claude response
 
@@ -674,8 +816,8 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 ## Phase 2: Streaming and Formatting
 
 ### 2.1 — Progressive Streaming
-- Poll pyte screen buffer while PTY output is arriving (after `●` sentinel, before end-of-response separator)
-- Extract incrementally-growing response text from screen on each poll tick (~500ms)
+- Monitor PTY output while arriving (after `●` sentinel, before end-of-response separator)
+- Extract response text via tmux capture-pane on each poll tick (~300ms)
 - Send placeholder message, edit in-place as new text appears
 - Debounce edits to 1/second
 - Handle overflow (>4096 chars) by sending new messages
@@ -686,12 +828,11 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 - Oversized code blocks sent as document attachments
 
 ### 2.3 — Permission Handling
-- Default `--permission-mode plan` means Claude proposes before executing
-- The interactive CLI shows a permission prompt in the pane — the bridge detects this pattern in PTY output and sends inline keyboards to Telegram
-- Callback query response writes approval/denial via PTY write to the pane
-- Alternative: use `--permission-mode acceptEdits` or `--permission-mode dontAsk` for trusted groups to skip interactive approval
+- **Default runtime behavior:** Every Claude invocation passes `--dangerously-skip-permissions` flag (effectively `bypassPermissions`).
+- The stored `permission_mode` in the database is configurable per group and per topic (`bypassPermissions`, `acceptEdits`, `plan`, `dontAsk`) via `/permission` or `/config permission_mode`, but is not currently wired to CLI flags (tracked open issue).
+- Alternative modes available in storage require manual wiring to affect runtime behavior.
 
-**Deliverable:** Streamed responses with proper formatting and interactive tool approval.
+**Deliverable:** Streamed responses with proper formatting.
 
 ---
 
@@ -707,7 +848,7 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 - Download voice messages and audio files from proxy
 - Transcribe via Whisper (turbo model)
 - Inject transcription into prompt
-- Consider: send transcription back to user for verification before prompting Claude
+- Send transcription back to user for verification before prompting Claude (opt-in via `groups.transcript_verify`)
 
 ### 3.3 — Document Support
 - Download documents from proxy
@@ -732,13 +873,14 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 ### 4.2 — Status Colors
 - Update topic icon color based on session state (active/complete/error/blocked)
 - Color updated automatically on session events
+- `/color [name]` command for manual override
 
 ### 4.3 — Pinned Metadata
 - Pin session info message on topic creation
 - Update on setting changes
 
 ### 4.4 — Session Cleanup
-- Configurable TTL for inactive sessions (e.g., 7 days)
+- Configurable TTL for inactive sessions (default 7 days)
 - Stale sessions marked inactive, topics optionally closed
 - `/sessions` command shows age and activity
 
@@ -748,6 +890,7 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 - Proxy health: `GET /health` checks Telegram polling is active
 - Bridge health: proxy reachable + SQLite writable + at least one session resumable
 - Reconnection notifications in General topic when bridge recovers from downtime
+- Crash-loop admin alerts via `ExecStopPost` hook to `ADMIN_CHAT_ID`
 
 **Deliverable:** Self-managing topic lifecycle with operational visibility.
 
@@ -762,15 +905,16 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 
 ### 5.2 — Cross-Topic Context
 - `/context <topic>` command to pull summary from another session
-- Shared context snippets via pinned messages
+- Shared context snippets via `/snippet` and `/snippets` commands
+- Context stored in `snippets` table per chat
 
 ### 5.3 — Per-Group Configuration
 - Different models, budgets, timeouts, permission modes per group
 - Stored in `groups` table, managed via General topic commands
 
 ### 5.4 — Notification Controls
-- Configurable verbosity per topic (full streaming vs. final-only)
-- Quiet mode for long-running tasks (only notify on completion or error)
+- Per-topic notification modes (`/notify [mode]` or natural language)
+- Three modes: `live` (default, progressive edits), `summary` (placeholder → final), `quiet` (no updates until done)
 
 **Deliverable:** Production-ready multi-user bridge with fine-grained configuration.
 
@@ -884,9 +1028,9 @@ The dashboard is optional — the bridge functions identically without it. It's 
 
 ### Purpose
 
-Prerequisite pieces that the Phase 9 dispatcher architecture depends on. The bridge must support long-running invocations, cancellation, and non-blocking operation before the orchestrator/worker model can work reliably. Phases 7 and 9 are designed together — Phase 7 is the infrastructure layer, Phase 9 is the dispatch layer built on top of it.
+Prerequisite pieces that the Phase 8 dispatcher architecture depends on. The bridge must support long-running invocations, cancellation, and non-blocking operation before the orchestrator/worker model can work reliably. Phases 7 and 8 are designed together — Phase 7 is the infrastructure layer, Phase 8 is the dispatch layer built on top of it.
 
-**Status of 7.1–7.2:** Implemented (under `claude -p` model). These need revisiting under the interactive PTY model — cancellation now means writing `\x03` (Ctrl-C) to the pane's PTY rather than sending SIGTERM to a subprocess, and timeout means abandoning the PTY read loop and killing the pane.
+**Status of 7.1–7.2:** Implemented (under interactive PTY model). These need revisiting under the interactive PTY model — cancellation now means writing `\x03` (Ctrl-C) to the pane's PTY rather than sending SIGTERM to a subprocess, and timeout means abandoning the PTY read loop and killing the pane.
 
 ### 7.1 — In-flight cancellation
 
@@ -988,7 +1132,7 @@ func (o *SubtaskOrchestrator) Run(ctx context.Context, req SubtaskRequest)
 
 Behavior:
 1. For each prompt, insert a `subtasks` row with `status=running`.
-2. Spawn a goroutine per prompt; each goroutine launches a fresh tmux pane running `claude` (no `--resume`), injects the prompt via bracketed paste, and scrapes the response via pyte.
+2. Spawn a goroutine per prompt; each goroutine launches a fresh tmux pane running `claude` (no `--resume`), injects the prompt via bracketed paste, and scrapes the response via stop-hook or capture-pane.
 3. As each goroutine completes, update the `subtasks` row and post the result to the originating topic.
 4. Post results as they arrive (fan-in is non-blocking).
 5. A final "All N sub-tasks complete" summary is sent when all goroutines exit.
@@ -1103,7 +1247,9 @@ CREATE TABLE background_jobs (
 
 ---
 
-## Phase 9: Dispatcher Architecture
+## Phase 8: Dispatcher Architecture
+
+**Note:** This was originally numbered as Phase 9 in the original plan. Phase 8 was reserved for a work item that was ultimately merged into other phases. The phase number has been adjusted for coherence.
 
 ### Purpose
 
@@ -1116,7 +1262,7 @@ User message
     │
     ▼
 Bridge (dispatcher)
-    │  ──── dispatches to ────►  Orchestrator Claude (-p --resume session_id)
+    │  ──── dispatches to ────►  Orchestrator Claude (--resume session_id)
     │                                │  understands request
     │                                │  posts "Starting X workers..." to thread
     │                                │  calls spawn_worker tool N times
@@ -1148,7 +1294,7 @@ Thread receives: progress updates + individual worker results + final synthesis
 | Result routing | Posts synthesis to thread | Result posted to thread + injected back to orchestrator |
 | Spawning | Calls `spawn_worker` tool | Cannot spawn further workers (depth limit 1) |
 
-### 9.1 — Orchestrator system prompt injection
+### 8.1 — Orchestrator system prompt injection
 
 The bridge appends a system prompt to every orchestrator invocation (`--append-system-prompt`) that makes the dispatcher pattern explicit to Claude:
 
@@ -1175,7 +1321,7 @@ Guidelines:
 
 This is injected via `--append-system-prompt` when `groups.dispatcher_mode = true` (default on, opt-out per group).
 
-### 9.2 — `spawn_worker` synthetic tool
+### 8.2 — `spawn_worker` synthetic tool
 
 The bridge intercepts `tool_use` blocks with `name="spawn_worker"` from the orchestrator's stream before forwarding them to Claude as `tool_result`. No actual Anthropic tool definition needed — the system prompt description is sufficient for Claude to call it.
 
@@ -1211,7 +1357,7 @@ ALTER TABLE groups ADD COLUMN dispatcher_mode INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE groups ADD COLUMN max_workers INTEGER NOT NULL DEFAULT 5;
 ```
 
-### 9.3 — `update_progress` synthetic tool
+### 8.3 — `update_progress` synthetic tool
 
 The bridge intercepts `tool_use` blocks with `name="update_progress"` and posts the message immediately to the Telegram thread without invoking any subprocess.
 
@@ -1222,7 +1368,7 @@ The bridge intercepts `tool_use` blocks with `name="update_progress"` and posts 
 
 This costs ~0ms and lets the orchestrator drive its own update cadence rather than relying on bridge-side timers.
 
-### 9.4 — Bridge-side progress ticker
+### 8.4 — Bridge-side progress ticker
 
 Independent of `update_progress` calls, the bridge posts a heartbeat to the thread when a long invocation is running with no output:
 
@@ -1237,7 +1383,7 @@ This is a safety net for invocations where Claude never calls `update_progress`.
 ALTER TABLE groups ADD COLUMN progress_interval_sec INTEGER NOT NULL DEFAULT 120;
 ```
 
-### 9.5 — Worker result injection on next prompt
+### 8.5 — Worker result injection on next prompt
 
 When the user sends a follow-up message while workers are still running (or just completed), the bridge prepends the worker results to the new prompt before sending to the orchestrator:
 
@@ -1252,7 +1398,7 @@ Worker 2 (check Y): <result>
 
 Workers complete asynchronously — results accumulate in `pendingWorkerResults` map keyed by `(chatID, threadID)`. The next `processBatch` drains and prepends them. This closes the loop: the orchestrator always has access to worker outputs without needing to poll.
 
-### 9.6 — Per-topic dispatcher opt-out
+### 8.6 — Per-topic dispatcher opt-out
 
 Some topics should remain in direct mode (no system prompt injection, no worker spawning). Add `/dispatch [on|off]` command to toggle `sessions.dispatcher_mode` per topic, overriding the group default.
 
@@ -1295,9 +1441,9 @@ If the bridge crashes 3 times within 60 seconds after an update, systemd stops r
 
 The proxy updates via the existing GitOps pipeline:
 
-1. CI builds a new container image on push to `main` (GitHub Actions, tagged with commit SHA)
+1. CI builds a new container image on push to `main` via the `telegram-claude-bridge-build` Argo WorkflowTemplate on the `iad-ci` cluster (declarative-config/k8s/iad-ci/argo-workflows/telegram-claude-bridge-workflowtemplate.yml). The workflow runs `go test`, builds proxy and dashboard images with kaniko, auto-bumps VERSION, and updates declarative-config manifests.
 2. Image pushed to container registry
-3. Manifest in `declarative-config` references the new image tag (updated by CI or image automation)
+3. Manifest in `declarative-config` references the new image tag (updated by CI workflow)
 4. ArgoCD syncs the updated manifest → rolling restart of the proxy pod
 
 No self-update logic in the proxy binary — ArgoCD handles it. This is consistent with how all other workloads on ardenone-cluster deploy.
@@ -1351,7 +1497,7 @@ The bridge queries the proxy's `/health` endpoint (which returns `contract_versi
 |---|---|---|---|
 | Proxy | ardenone-cluster, `telegram-bridge` namespace | Deployment via ArgoCD, `FROM scratch` ~10MB image | `declarative-config` repo |
 | Bridge | Hetzner EX44 | Single Go binary, systemd unit, self-updating from git | Local config file + SQLite |
-| Bot token | OpenBao on ardenone-cluster | Fetched at proxy startup | `secret/data/telegram-claude-bridge/bot-token` |
+| Bot token | OpenBao on ardenone-cluster | Fetched at proxy startup | ExternalSecret in `declarative-config/k8s/ardenone-cluster/telegram-bridge/external-secret.yml` |
 | Manifests | `declarative-config` repo | GitOps via ArgoCD | `k8s/ardenone-cluster/telegram-bridge/` |
 | Source | `telegram-claude-bridge` repo | Go monorepo: `cmd/proxy/`, `cmd/bridge/` | This repo |
 
@@ -1359,17 +1505,17 @@ The bridge queries the proxy's `/health` endpoint (which returns `contract_versi
 
 ## Open Decisions
 
-| Decision | Options | Leaning | Notes |
-|---|---|---|---|
+| Decision | Options | Resolution | Notes |
+|---|---|---|---|---|
 | Proxy language | Go | **Decided: Go** | Same language as bridge, single binary, minimal container |
 | Bridge language | Go | **Decided: Go** | See language evaluation below |
-| Claude integration | Interactive CLI via PTY | **Decided: Interactive CLI** | `claude` in interactive mode (no `-p`), one persistent tmux pane per topic within the `telegram-bridge` session. Prompt injection via bracketed paste, response extraction via pyte VT100 emulator. Subscription billing (not API credits). `--resume` for session continuity on pane restart. |
+| Claude integration | Interactive CLI via PTY | **Decided: Interactive CLI** | `claude` in interactive mode (no `-p`), one persistent tmux pane per topic within the `telegram-bridge` session. Prompt injection via bracketed paste, response extraction via stop-hook file with tmux capture-pane fallback. Subscription billing (not API credits). `--resume` for session continuity on pane restart. |
 | Message format proxy→bridge | Normalized envelope vs raw Telegram JSON | Normalized | Keeps bridge decoupled from Telegram API specifics, proxy handles schema changes |
 | Media transfer proxy→bridge | Inline in update vs separate `/file` endpoint | Separate `/file` | Keeps update payloads small, avoids large base64 blobs |
 | Whisper model | turbo vs base vs small | turbo | Best accuracy-to-speed ratio |
 | Private chat topics | Support vs groups only | Groups only (initially) | Bot API 9.4 supports private chat topics, but groups are the primary use case |
 | Response format | HTML vs MarkdownV2 | HTML | MarkdownV2 escaping is unreliable — universal consensus from existing implementations |
-| Permission mode | plan vs acceptEdits vs dontAsk | plan (default) | Configurable per group. `plan` gives interactive approval via Telegram inline keyboards. |
+| Permission mode | plan vs acceptEdits vs dontAsk | bypassPermissions (default runtime) | **Default runtime:** Every invocation passes `--dangerously-skip-permissions`. Stored `permission_mode` configurable (`bypassPermissions`, `acceptEdits`, `plan`, `dontAsk`) but not wired to CLI flags (tracked open issue). |
 
 ---
 
@@ -1472,12 +1618,12 @@ The bridge and proxy share a Go module (monorepo with `cmd/proxy/` and `cmd/brid
 |---|---|---|
 | Proxy pod restart loses polling offset | Missed messages | Store last `update_id` in a ConfigMap or PV; Telegram retains unacked updates for 24h |
 | Claude session corruption | Lost conversation context | Sessions are stateless from bridge perspective — create new session, close old topic |
-| Whisper transcription errors | Garbled prompts | Send transcription to user for verification before prompting Claude (opt-in) |
+| Whisper transcription errors | Garbled prompts | Send transcription to user for verification before prompting Claude (opt-in via `transcript_verify`) |
 | Telegram rate limiting (429) | Delayed responses | Respect `retry_after`, debounce edits, queue sends per chat |
 | Long-running Claude prompts | Telegram typing indicator expires (5s) | Re-send `sendChatAction` every 4 seconds during processing |
 | SQLite corruption on EX44 | Lost routing state | WAL mode, regular backups, sessions recoverable from Claude Code's own session storage |
 | Proxy unreachable (Tailscale disruption) | Bridge can't send/receive | Exponential backoff retry, notification on recovery, messages queued locally |
 | Token leak via Claude Code output | Bot token exposed | Impossible by design — token never reaches EX44 |
-| PTY screen scraping fragility | Response extraction breaks on claude UI changes | Pin sentinel characters (`●`, `────`) and test on each claude update; fall back to full screen dump if partial extraction fails |
+| PTY screen scraping fragility | Response extraction breaks on claude UI changes | Pin sentinel characters (`●`, `────`) and test on each claude update; fall back to stop-hook file extraction |
 | tmux session missing on bridge restart | All warm panes lost | Expected and safe — dynamic model means panes are ephemeral; on next message the bridge does a cold resume via `--resume <session_id>`; no manual recovery needed |
 | claude interactive mode UI changes | Bracketed paste or startup behavior changes break injection | Keep PTY integration logic isolated in PTYManager; sentinel + timing constants are the fragile surface — document and test them |
