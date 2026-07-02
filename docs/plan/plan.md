@@ -407,7 +407,7 @@ Handles non-text message types before they reach Claude.
 
 **Voice/Audio:**
 - Download from proxy
-- Transcribe via Whisper (`whisper --model turbo --output_format txt`)
+- Transcribe via Whisper (`whisper --model turbo --output-format txt`)
 - Prepend transcription to the text prompt: `[Voice message transcription]: <text>`
 - Retain original audio path for reference
 
@@ -815,7 +815,7 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 
 ### 2.1 — Progressive Streaming
 - Monitor PTY output while arriving (after `●` sentinel, before end-of-response separator)
-- Extract response text via tmux capture-pane on each poll tick (~300ms)
+- Extract response text via stop-hook file or tmux capture-pane on each poll tick (~300ms)
 - Send placeholder message, edit in-place as new text appears
 - Debounce edits to 1/second
 - Handle overflow (>4096 chars) by sending new messages
@@ -1247,8 +1247,6 @@ CREATE TABLE background_jobs (
 
 ## Phase 8: Dispatcher Architecture
 
-**Note:** This was originally numbered as Phase 9 in the original plan. Phase 8 was reserved for a work item that was ultimately merged into other phases. The phase number has been adjusted for coherence.
-
 ### Purpose
 
 The bridge is primarily a **dispatcher**, not a pipe. Each topic's Claude session is an **orchestrator** — it understands the user's request, delegates parallelisable sub-tasks to **worker** Claude instances, and responds to the user with progress updates and final synthesis. The bridge is the message bus that routes user messages to the orchestrator, worker spawn requests from the orchestrator to new subprocesses, and worker results back to both the orchestrator context and the Telegram thread.
@@ -1291,10 +1289,6 @@ Thread receives: progress updates + individual worker results + final synthesis
 | Model | Configured per topic (default sonnet) | Inherits from orchestrator, or overridden per spawn |
 | Result routing | Posts synthesis to thread | Result posted to thread + injected back to orchestrator |
 | Spawning | Calls `spawn_worker` tool | Cannot spawn further workers (depth limit 1) |
-
-## Phase 8: Dispatcher Architecture
-
-**Note:** This was originally numbered as Phase 9 in the original plan. Phase 8 was reserved for a work item that was ultimately merged into other phases. The phase number has been adjusted for coherence.
 
 ### 8.1 — Orchestrator system prompt injection
 
@@ -1493,7 +1487,7 @@ If the bridge crashes 3 times within 60 seconds after an update, systemd stops r
 
 The proxy updates via the existing GitOps pipeline:
 
-1. CI builds a new container image on push to `main` via the `telegram-claude-bridge-build` Argo WorkflowTemplate on the `iad-ci` cluster (declarative-config/k8s/iad-ci/argo-workflows/telegram-claude-bridge-workflowtemplate.yml). The workflow runs `go test`, builds proxy and dashboard images with kaniko, auto-bumps VERSION, and updates declarative-config manifests.
+1. **CI builds a new container image** on push to `main` via the `telegram-claude-bridge-build` Argo WorkflowTemplate on the `iad-ci` cluster (declarative-config/k8s/iad-ci/argo-workflows/telegram-claude-bridge-workflowtemplate.yml). The workflow runs `go test`, builds proxy and dashboard images with kaniko, auto-bumps VERSION, and updates declarative-config manifests.
 2. Image pushed to container registry
 3. Manifest in `declarative-config` references the new image tag (updated by CI workflow)
 4. ArgoCD syncs the updated manifest → rolling restart of the proxy pod
