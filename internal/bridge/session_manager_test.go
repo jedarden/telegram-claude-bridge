@@ -208,3 +208,54 @@ func TestPrependConversationHistory(t *testing.T) {
 		})
 	}
 }
+
+// ── tierModel (helper for tier changes) ─────────────────────────────────────────
+
+func TestTierModel(t *testing.T) {
+	tests := []struct {
+		name          string
+		tier          int
+		expectedModel string
+	}{
+		{
+			name:          "haiku tier",
+			tier:          modelTierHaiku,
+			expectedModel: "claude-haiku-4-5",
+		},
+		{
+			name:          "sonnet tier",
+			tier:          modelTierSonnet,
+			expectedModel: "claude-sonnet-4-6",
+		},
+		{
+			name:          "opus tier",
+			tier:          modelTierOpus,
+			expectedModel: "claude-opus-4-6",
+		},
+		{
+			name:          "invalid negative tier defaults to sonnet",
+			tier:          -1,
+			expectedModel: defaultSessionModel,
+		},
+		{
+			name:          "invalid high tier defaults to sonnet",
+			tier:          100,
+			expectedModel: defaultSessionModel,
+		},
+		{
+			name:          "zero tier defaults to sonnet",
+			tier:          0,
+			expectedModel: "claude-haiku-4-5",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tierModel(tc.tier)
+			if got != tc.expectedModel {
+				t.Errorf("tierModel(%d) = %q, want %q", tc.tier, got, tc.expectedModel)
+			}
+		})
+	}
+}
+
