@@ -172,7 +172,7 @@ The bridge is the dispatcher and message bus. It routes Telegram messages to the
 
 - **Language:** Go
 - **HTTP:** stdlib `net/http` for client to proxy
-- **Claude integration:** Interactive Claude CLI via PTY, one tmux pane per active topic. Each session runs `claude --resume <session_id>` in a persistent tmux pane within the `telegram-bridge` session. Prompts are injected via PTY write (bracketed paste mode); responses are extracted via a **stop-hook mechanism** (Claude's `--stop-hook` writes final response to a file that the bridge polls) with **tmux capture-pane screen scraping** as fallback. Billing uses subscription (not API credits) because `claude` runs in a real TTY context, not headless `-p` mode.
+- **Claude integration:** Interactive Claude CLI via PTY, one tmux pane per active topic. Each session runs `claude --resume <session_id>` in a persistent tmux pane within the `telegram-bridge` session. Prompts are injected via tmux bracketed paste mode (`tmux paste-buffer -p`); responses are extracted **primarily via a stop-hook mechanism** (Claude's `--stop-hook` writes final response to `$BRIDGE_RESPONSE_FILE` which the bridge polls atomically via a `.ready` sentinel file) with **tmux capture-pane screen scraping** as fallback. Billing uses subscription (not API credits) because `claude` runs in a real TTY context, not headless `-p` mode.
 - **Media processing:** `whisper` CLI for audio transcription, `ffmpeg` CLI for video frame/audio extraction (both invoked as subprocesses)
 - **State:** SQLite via `modernc.org/sqlite` (pure Go, no CGo)
 - **Runtime:** single static binary, systemd unit on EX44
@@ -558,7 +558,7 @@ CREATE TABLE groups (
     default_model           TEXT NOT NULL DEFAULT 'claude-sonnet-4-6',
     max_budget              REAL NOT NULL DEFAULT 5.0,
     timeout_sec             INTEGER NOT NULL DEFAULT 1800,
-    permission_mode         TEXT NOT NULL DEFAULT 'bypassPermissions',  -- bypassPermissions, acceptEdits, plan, dontAsk
+    permission_mode         TEXT NOT NULL DEFAULT 'acceptEdits',  -- Stored but not wired to CLI flags (see Security section)
     allowed_tools           TEXT,                              -- JSON array of tool names
     disallowed_tools        TEXT,                              -- JSON array of tool names
     max_subtasks            INTEGER NOT NULL DEFAULT 5,        -- Max concurrent /parallel subtasks
@@ -719,7 +719,7 @@ CREATE TABLE processed_updates (
 #### Claude Code Permissions
 
 - **Default runtime behavior:** Every Claude invocation passes `--dangerously-skip-permissions` flag (effectively `bypassPermissions`). The `permission_mode` is stored in the database (`groups.permission_mode`, `sessions.permission_mode`) but does not affect runtime behavior in the current implementation due to the pervasive skip-permissions flag.
-- **Stored permission modes:** `bypassPermissions` (default), `acceptEdits`, `plan`, `dontAsk` — configurable per group and per topic via `/permission` or `/config permission_mode`, but not wired to CLI flags (tracked open issue).
+- **Stored permission modes:** `acceptEdits` (default), `bypassPermissions`, `plan`, `dontAsk` — configurable per group and per topic via `/permission` or `/config permission_mode`, but not wired to CLI flags (tracked open issue).
 - `--allowed-tools` and `--disallowed-tools` are configurable per group to restrict what Claude can do.
 - **Note:** Wiring the stored `permission_mode` value to actual CLI flags is a tracked open issue (see related bead about permission mode integration).
 
@@ -1292,6 +1292,10 @@ Thread receives: progress updates + individual worker results + final synthesis
 | Result routing | Posts synthesis to thread | Result posted to thread + injected back to orchestrator |
 | Spawning | Calls `spawn_worker` tool | Cannot spawn further workers (depth limit 1) |
 
+## Phase 8: Dispatcher Architecture
+
+**Note:** This was originally numbered as Phase 9 in the original plan. Phase 8 was reserved for a work item that was ultimately merged into other phases. The phase number has been adjusted for coherence.
+
 ### 8.1 — Orchestrator system prompt injection
 
 The bridge appends a system prompt to every orchestrator invocation (`--append-system-prompt`) that makes the dispatcher pattern explicit to Claude:
@@ -1404,6 +1408,56 @@ Some topics should remain in direct mode (no system prompt injection, no worker 
 
 ---
 
+## Additional Implemented Features
+
+The following features were implemented during development but were not part of the original plan:
+
+### Natural Language Intent Detection (Beyond Model Switching)
+
+Beyond the planned model switching intents, the bridge now detects and handles:
+
+- **Cancel phrases:** "cancel", "stop", "abort", "never mind", "scratch that" → triggers `/cancel`
+- **Notification mode intents:** "quiet mode", "silent", "just tell me when done" → summary mode; "be quiet", "no updates" → quiet mode; "show everything", "keep me posted" → live mode
+- **Cost/status queries:** "how much", "show cost", "what is the cost", "total cost", "show status", "session info" → triggers `/cost` or `/info`
+- **Session control:** "close session", "end session", "we are done", "all done", "wrap up" → triggers `/close`
+- **Timeout adjustments:** "give me more time", "extend timeout" → triggers `/timeout` increase
+
+### Per-Topic Cost Tracking and Budget
+
+- `/cost` command shows detailed cost breakdown (group total, daily trend, per-topic, per-user)
+- `/budget [usd]` command sets max budget per session
+- Cost tracked via `cost_events` table with token counts and per-user attribution
+- Works in interactive mode (originally noted as unavailable)
+
+### Conversation History Restore on Session Loss
+
+- `conversation_messages` table stores last 40 messages per topic
+- On session loss or restart, history is restored to maintain context
+- Independent of Claude's own session storage for resilience
+
+### Crash-Loop Admin Alerts
+
+- `ExecStopPost` systemd hook sends alerts to `ADMIN_CHAT_ID` on crash
+- Prevents silent failures in production
+
+### Transcript Verification Opt-In
+
+- `transcript_verify` group setting requires user approval before sending audio transcription to Claude
+- Prevents accidental cost from voice messages
+
+### Topic Icon Color Manual Control
+
+- `/color [name]` command for manual override of topic icon color
+- Colors: active, complete, blocked, error, review, research
+
+### Context Snippets
+
+- `/snippet <name> <content>` saves reusable context snippets
+- `/snippets` lists saved snippets for a chat
+- Stored in `snippets` table per chat
+
+---
+
 ## Self-Updating
 
 Both components update themselves from the repo without manual intervention.
@@ -1443,6 +1497,8 @@ The proxy updates via the existing GitOps pipeline:
 2. Image pushed to container registry
 3. Manifest in `declarative-config` references the new image tag (updated by CI workflow)
 4. ArgoCD syncs the updated manifest → rolling restart of the proxy pod
+
+**Note:** GitHub Actions are disabled repo-wide (`.github/workflows/ci.yml.disabled`). All CI/CD runs on the internal Argo Workflows cluster, not on GitHub's infrastructure.
 
 No self-update logic in the proxy binary — ArgoCD handles it. This is consistent with how all other workloads on ardenone-cluster deploy.
 
@@ -1495,7 +1551,7 @@ The bridge queries the proxy's `/health` endpoint (which returns `contract_versi
 |---|---|---|---|
 | Proxy | ardenone-cluster, `telegram-bridge` namespace | Deployment via ArgoCD, `FROM scratch` ~10MB image | `declarative-config` repo |
 | Bridge | Hetzner EX44 | Single Go binary, systemd unit, self-updating from git | Local config file + SQLite |
-| Bot token | ExternalSecret-managed Secret on ardenone-cluster | Fetched at proxy startup via ExternalSecret | `declarative-config/k8s/ardenone-cluster/telegram-bridge/external-secret.yml` |
+| Bot token | ExternalSecret-managed Secret on ardenone-cluster | Fetched at proxy startup via ExternalSecret operator | `declarative-config/k8s/ardenone-cluster/telegram-bridge/external-secret.yml` |
 | Manifests | `declarative-config` repo | GitOps via ArgoCD | `k8s/ardenone-cluster/telegram-bridge/` |
 | Source | `telegram-claude-bridge` repo | Go monorepo: `cmd/proxy/`, `cmd/bridge/` | This repo |
 
@@ -1513,7 +1569,7 @@ The bridge queries the proxy's `/health` endpoint (which returns `contract_versi
 | Whisper model | turbo vs base vs small | turbo | Best accuracy-to-speed ratio |
 | Private chat topics | Support vs groups only | Groups only (initially) | Bot API 9.4 supports private chat topics, but groups are the primary use case |
 | Response format | HTML vs MarkdownV2 | HTML | MarkdownV2 escaping is unreliable — universal consensus from existing implementations |
-| Permission mode | plan vs acceptEdits vs dontAsk | bypassPermissions (default runtime) | **Default runtime:** Every invocation passes `--dangerously-skip-permissions`. Stored `permission_mode` configurable (`bypassPermissions`, `acceptEdits`, `plan`, `dontAsk`) but not wired to CLI flags (tracked open issue). |
+| Permission mode | plan vs acceptEdits vs dontAsk | acceptEdits (default stored) | **Default runtime:** Every invocation passes `--dangerously-skip-permissions`. Stored `permission_mode` configurable (`acceptEdits`, `bypassPermissions`, `plan`, `dontAsk`) but not wired to CLI flags (tracked open issue). |
 
 ---
 

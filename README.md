@@ -23,10 +23,10 @@ claude <permission_flags> --model <model> [--resume <session_id>]
 ```
 
 Permission flags are determined by the group's `permission_mode` setting:
-- `bypassPermissions` → `--dangerously-skip-permissions` (default)
+- `bypassPermissions` → `--dangerously-skip-permissions`
 - `acceptEdits`, `plan`, `dontAsk` → `--permission-mode <mode>`
 
-Configure via `/config permission_mode <mode>` or `/permission <mode>`.
+**Note:** The current implementation always passes `--dangerously-skip-permissions` regardless of the stored `permission_mode` (tracked issue). The `permission_mode` is configurable via `/config permission_mode <mode>` or `/permission <mode>`, but does not yet affect runtime behavior.
 
 Panes stay warm between messages (45 s idle threshold). A Claude stop-hook writes the final response to a file that the bridge polls; it falls back to PTY screen-scraping if the hook is not configured. On session ID loss, up to 40 messages of history are prepended from SQLite to restore context.
 
