@@ -691,6 +691,112 @@ func TestServer(t *testing.T) {
 		}
 	})
 
+	t.Run("Livez endpoint returns OK without downstream checks", func(t *testing.T) {
+		// Create a checker with an invalid proxy URL to prove /livez doesn't check it
+		checker := NewChecker("http://invalid:9999", db)
+		server := NewServer("127.0.0.1:0", checker)
+
+		server.Start()
+		defer server.Shutdown(context.Background())
+
+		// Retry with backoff until server is ready
+		var resp *http.Response
+		var err error
+		for i := 0; i < 10; i++ {
+			time.Sleep(50 * time.Millisecond)
+			resp, err = http.Get("http://" + server.Addr() + "/livez")
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			t.Fatalf("http.Get() error = %v (server may not have started)", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("status code = %d, want %d", resp.StatusCode, http.StatusOK)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("io.ReadAll() error = %v", err)
+		}
+
+		if string(body) != "OK" {
+			t.Errorf("body = %q, want OK", string(body))
+		}
+
+		// Verify content type is text/plain
+		if resp.Header.Get("Content-Type") != "text/plain" {
+			t.Errorf("Content-Type = %q, want text/plain", resp.Header.Get("Content-Type"))
+		}
+	})
+
+	t.Run("Livez endpoint rejects POST requests", func(t *testing.T) {
+		checker := NewChecker(proxyServer.URL, db)
+		server := NewServer("127.0.0.1:0", checker)
+
+		server.Start()
+		defer server.Shutdown(context.Background())
+
+		// Retry with backoff until server is ready
+		var resp *http.Response
+		var err error
+		for i := 0; i < 10; i++ {
+			time.Sleep(50 * time.Millisecond)
+			resp, err = http.Post("http://"+server.Addr()+"/livez", "application/json", nil)
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			t.Fatalf("http.Post() error = %v (server may not have started)", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("status code = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+		}
+	})
+
+	t.Run("Livez endpoint returns OK even when database is closed", func(t *testing.T) {
+		// Create a separate database that we can close
+		testDB, err := sql.Open("sqlite", ":memory:")
+		if err != nil {
+			t.Fatalf("sql.Open() error = %v", err)
+		}
+		defer testDB.Close()
+
+		// Close the database to prove /livez doesn't check it
+		testDB.Close()
+
+		checker := NewChecker("http://invalid:9999", testDB)
+		server := NewServer("127.0.0.1:0", checker)
+
+		server.Start()
+		defer server.Shutdown(context.Background())
+
+		// Retry with backoff until server is ready
+		var resp *http.Response
+		for i := 0; i < 10; i++ {
+			time.Sleep(50 * time.Millisecond)
+			resp, err = http.Get("http://" + server.Addr() + "/livez")
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			t.Fatalf("http.Get() error = %v (server may not have started)", err)
+		}
+		defer resp.Body.Close()
+
+		// Should still return OK even with closed DB and invalid proxy
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("status code = %d, want %d (livez should not check downstream)", resp.StatusCode, http.StatusOK)
+		}
+	})
+
 	t.Run("Server handles GET request", func(t *testing.T) {
 		proxyServerCalled := false
 		proxyServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

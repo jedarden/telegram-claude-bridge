@@ -36,7 +36,7 @@ func NewWatchdog(checker *Checker, healthAddr string) *Watchdog {
 
 	checker.LogInfo("watchdog_enabled",
 		"interval_ms", interval.Milliseconds(),
-		"health_url", healthAddr)
+		"livez_url", healthAddr+"/livez")
 
 	return &Watchdog{
 		interval:  interval,
@@ -86,13 +86,17 @@ func (w *Watchdog) Stop() {
 	<-w.done
 }
 
-// ping sends a WATCHDOG=1 notification to systemd if the health endpoint is healthy.
+// ping sends a WATCHDOG=1 notification to systemd if the liveness endpoint is responsive.
+// The liveness endpoint (/livez) only checks if the health server itself is up,
+// NOT downstream dependencies (proxy, DB, claude CLI). This ensures the watchdog
+// reflects only the bridge's own liveness, not external service reachability.
 func (w *Watchdog) ping() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	// Quick health check by calling our own endpoint
-	req, err := httpGetWithContext(ctx, w.healthURL+"/health")
+	// Quick liveness check by calling our own livez endpoint
+	// /livez is lightweight and returns OK if the HTTP server is responsive
+	req, err := httpGetWithContext(ctx, w.healthURL+"/livez")
 	if err != nil {
 		w.checker.LogWarn("watchdog_ping_failed", "error", err)
 		return
@@ -100,12 +104,12 @@ func (w *Watchdog) ping() {
 	defer req.Body.Close()
 
 	if req.StatusCode == 200 {
-		// Health check passed, notify systemd
+		// Liveness check passed, notify systemd
 		if _, err := daemon.SdNotify(false, "WATCHDOG=1"); err != nil {
 			w.checker.LogWarn("watchdog_notify_failed", "error", err)
 		}
 	} else {
-		w.checker.LogWarn("watchdog_health_unhealthy", "status_code", req.StatusCode)
+		w.checker.LogWarn("watchdog_livez_unhealthy", "status_code", req.StatusCode)
 	}
 }
 

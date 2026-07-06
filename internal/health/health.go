@@ -433,6 +433,7 @@ func NewServer(addr string, checker *Checker) *Server {
 		addr:      addr, // Will be updated to actual bound address after Start
 	}
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/livez", s.handleLivez)
 
 	s.server = &http.Server{
 		Addr:         addr,
@@ -521,6 +522,34 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(result)
+}
+
+// handleLivez serves the liveness probe endpoint.
+// This is a lightweight check that only verifies the health server itself is responsive.
+// It does NOT check downstream dependencies (proxy, DB, claude CLI).
+// This is used by the systemd watchdog to determine if the bridge process is alive.
+func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Only accept requests from localhost
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	if host != "127.0.0.1" && host != "::1" && host != "localhost" {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Liveness probe: just return OK if we can respond
+	// This proves the bridge's HTTP server is up and the watchdog goroutine is running
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
 }
 
 // SendReconnectNotification sends a reconnect notification to all groups.
