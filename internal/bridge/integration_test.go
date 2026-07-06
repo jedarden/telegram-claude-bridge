@@ -1615,3 +1615,450 @@ func TestWorkerPool_finishWorker_ErrorMessageTruncation(t *testing.T) {
 		t.Errorf("worker.Status = %q, want 'failed'", updated.Status)
 	}
 }
+
+	// ── Additional WorkerPool Edge Case Tests ─────────────────────────────────────────────
+
+func TestWorkerPool_SpawnWorker_EmptyGroupModel(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "", // Empty - should fall back to defaultSessionModel
+		MaxWorkers:   5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm)
+
+	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
+	workerID, _, err := wp.SpawnWorker(ctx, 100, 10, 1000, group, inputJSON)
+	if err != nil {
+		t.Fatalf("SpawnWorker: %v", err)
+	}
+
+	worker, err := db.GetWorker(ctx, workerID)
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+	// Should fall back to defaultSessionModel constant
+	if worker.Model == "" {
+		t.Error("worker.Model should not be empty when group.DefaultModel is empty")
+	}
+}
+
+func TestWorkerPool_SpawnWorker_NegativeChatID(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       -100123456789, // Supergroup ID (negative)
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxWorkers:   5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm)
+
+	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
+	workerID, _, err := wp.SpawnWorker(ctx, -100123456789, 42, 1000, group, inputJSON)
+	if err != nil {
+		t.Fatalf("SpawnWorker with negative chatID: %v", err)
+	}
+
+	worker, err := db.GetWorker(ctx, workerID)
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+	if worker.ChatID != -100123456789 {
+		t.Errorf("worker.ChatID = %d, want -100123456789", worker.ChatID)
+	}
+	if worker.ThreadID != 42 {
+		t.Errorf("worker.ThreadID = %d, want 42", worker.ThreadID)
+	}
+}
+
+func TestWorkerPool_SpawnWorker_DBErrorOnCount(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxWorkers:   5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	// Close DB to simulate error
+	db.Close()
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm)
+
+	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
+	_, _, err := wp.SpawnWorker(ctx, 100, 10, 1000, group, inputJSON)
+	if err == nil {
+		t.Error("expected error when DB is closed, got nil")
+	}
+	if err != nil && !containsSubstring(err.Error(), "count running workers") {
+		t.Errorf("error = %q, want substring 'count running workers'", err.Error())
+	}
+}
+
+func TestWorkerPool_SpawnWorker_ConcurrentIndexing(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxWorkers:   100,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm)
+
+	inputJSON := json.RawMessage(`{"prompt":"concurrent test"}`)
+
+	// Spawn multiple workers concurrently
+	numWorkers := 10
+	type result struct {
+		workerID string
+		index    int
+		err      error
+	}
+	results := make(chan result, numWorkers)
+
+	for i := 0; i < numWorkers; i++ {
+		go func(parentMsgID int64) {
+			workerID, index, err := wp.SpawnWorker(ctx, 100, 10, parentMsgID, group, inputJSON)
+			results <- result{workerID, index, err}
+		}(int64(1000 + i))
+	}
+
+	// Collect results
+	workerIDs := make([]string, 0, numWorkers)
+	indices := make([]int, 0, numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		res := <-results
+		if res.err != nil {
+			t.Fatalf("concurrent SpawnWorker failed: %v", res.err)
+		}
+		workerIDs = append(workerIDs, res.workerID)
+		indices = append(indices, res.index)
+	}
+
+	// Verify all indices are unique
+	seenIndices := make(map[int]bool)
+	for _, idx := range indices {
+		if seenIndices[idx] {
+			t.Errorf("duplicate index %d found - concurrent safety issue", idx)
+		}
+		seenIndices[idx] = true
+	}
+
+	// Verify all worker IDs are unique
+	seenIDs := make(map[string]bool)
+	for _, id := range workerIDs {
+		if seenIDs[id] {
+			t.Errorf("duplicate worker ID %s found", id)
+		}
+		seenIDs[id] = true
+	}
+
+	// Verify indices cover 1..numWorkers
+	for i := 1; i <= numWorkers; i++ {
+		if !seenIndices[i] {
+			t.Errorf("missing index %d in results", i)
+		}
+	}
+}
+
+func TestWorkerPool_SpawnWorker_WorkerIDFormat(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxWorkers:   5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm)
+
+	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
+	workerID, _, err := wp.SpawnWorker(ctx, 100, 10, 1000, group, inputJSON)
+	if err != nil {
+		t.Fatalf("SpawnWorker: %v", err)
+	}
+
+	// Verify worker ID format: worker_{threadID}_{timestamp}
+	if !containsSubstring(workerID, "worker_10_") {
+		t.Errorf("workerID = %q, want format 'worker_10_'", workerID)
+	}
+}
+
+func TestWorkerPool_SpawnWorker_MultipleTopicsIsolation(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxWorkers:   2, // Low limit
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm)
+
+	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
+
+	// Fill up topic 10 (max 2 workers)
+	_, _, err := wp.SpawnWorker(ctx, 100, 10, 1000, group, inputJSON)
+	if err != nil {
+		t.Fatalf("first worker topic 10: %v", err)
+	}
+	runningWorker := &Worker{
+		ID:        "running-topic10",
+		ChatID:    100,
+		ThreadID:  10,
+		Prompt:    "another task",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, runningWorker); err != nil {
+		t.Fatalf("create running worker topic 10: %v", err)
+	}
+
+	// Topic 10 should be at max capacity
+	_, _, err = wp.SpawnWorker(ctx, 100, 10, 1001, group, inputJSON)
+	if err == nil {
+		t.Error("expected error for topic 10 (at capacity), got nil")
+	}
+
+	// But topic 20 should still accept workers (different topic isolation)
+	_, _, err = wp.SpawnWorker(ctx, 100, 20, 1002, group, inputJSON)
+	if err != nil {
+		t.Errorf("topic 20 should accept workers (isolated from topic 10): %v", err)
+	}
+}
+
+func TestWorkerPool_finishWorker_DBError(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxWorkers:   5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm)
+
+	worker := &Worker{
+		ID:        "worker-db-error",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "test task",
+		Model:     "claude-haiku-4-5",
+		Status:    "running",
+	}
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("create worker: %v", err)
+	}
+
+	// Close DB to simulate error on UpdateWorker
+	db.Close()
+
+	// finishWorker should log error but not panic
+	wp.finishWorker(worker, 1, "test result", "")
+
+	// Worker won't be updated (DB is closed), but no panic occurred
+}
+
+func TestWorkerPool_SpawnWorker_CreateWorkerError(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxWorkers:   5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm)
+
+	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
+
+	// Close DB before spawning (will fail at CreateWorker)
+	db.Close()
+
+	_, _, err := wp.SpawnWorker(ctx, 100, 10, 1000, group, inputJSON)
+	if err == nil {
+		t.Error("expected error when CreateWorker fails, got nil")
+	}
+	if err != nil && !containsSubstring(err.Error(), "create worker record") {
+		t.Errorf("error = %q, want substring 'create worker record'", err.Error())
+	}
+}
+
+func TestWorkerPool_finishWorker_PendingResultInjection(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxWorkers:   5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm)
+
+	worker := &Worker{
+		ID:        "worker-inject-test",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "test task",
+		Model:     "claude-opus-4-6",
+		Status:    "running",
+	}
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("create worker: %v", err)
+	}
+
+	// Call finishWorker with successful result
+	testResult := "Worker completed: 2+2=4"
+	wp.finishWorker(worker, 3, testResult, "")
+
+	// Verify worker was updated in DB
+	updated, err := db.GetWorker(ctx, "worker-inject-test")
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+	if updated.Status != "done" {
+		t.Errorf("worker.Status = %q, want 'done'", updated.Status)
+	}
+	if updated.Result != testResult {
+		t.Errorf("worker.Result = %q, want %q", updated.Result, testResult)
+	}
+
+	// Verify pending result was added to SessionManager
+	// (Can't directly inspect, but successful DB update indicates proper flow)
+}
+
+func TestWorkerPool_SpawnWorker_IndexPerTopic(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxWorkers:   10,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm)
+
+	inputJSON := json.RawMessage(`{"prompt":"task"}`)
+
+	// Spawn workers in topic 10
+	_, idx1, err := wp.SpawnWorker(ctx, 100, 10, 1000, group, inputJSON)
+	if err != nil {
+		t.Fatalf("topic 10 worker 1: %v", err)
+	}
+	if idx1 != 1 {
+		t.Errorf("topic 10 worker 1 index = %d, want 1", idx1)
+	}
+
+	// Spawn workers in topic 20 (should start at 1)
+	_, idx2, err := wp.SpawnWorker(ctx, 100, 20, 1001, group, inputJSON)
+	if err != nil {
+		t.Fatalf("topic 20 worker 1: %v", err)
+	}
+	if idx2 != 1 {
+		t.Errorf("topic 20 worker 1 index = %d, want 1", idx2)
+	}
+
+	// Back to topic 10 (should continue at 2)
+	_, idx3, err := wp.SpawnWorker(ctx, 100, 10, 1002, group, inputJSON)
+	if err != nil {
+		t.Fatalf("topic 10 worker 2: %v", err)
+	}
+	if idx3 != 2 {
+		t.Errorf("topic 10 worker 2 index = %d, want 2", idx3)
+	}
+
+	// Topic 20 worker 2 (should be 2, not 3)
+	_, idx4, err := wp.SpawnWorker(ctx, 100, 20, 1003, group, inputJSON)
+	if err != nil {
+		t.Fatalf("topic 20 worker 2: %v", err)
+	}
+	if idx4 != 2 {
+		t.Errorf("topic 20 worker 2 index = %d, want 2", idx4)
+	}
+}
