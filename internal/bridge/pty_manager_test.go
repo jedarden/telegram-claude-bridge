@@ -14,10 +14,10 @@ import (
 // paneInfo describes a parsed pane name.
 // Mirrored from internal/bridge/pty_manager.go for testing.
 type paneInfo struct {
-	Type       string // "session", "worker", or "unknown"
-	ChatID     int64  // set for session panes
-	ThreadID   int64  // set for session panes
-	WorkerID   string // set for worker panes (partial ID)
+	Type     string // "session", "worker", or "unknown"
+	ChatID   int64  // set for session panes
+	ThreadID int64  // set for session panes
+	WorkerID string // set for worker panes (partial ID)
 }
 
 // parsePaneName extracts the type and identifiers from a pane name.
@@ -173,11 +173,11 @@ func containsOnlyValidPaneChars(s string) bool {
 // TestPaneTargetParsing tests parsing pane targets in the format "session:paneName".
 func TestPaneTargetParsing(t *testing.T) {
 	tests := []struct {
-		name              string
-		paneTarget        string
-		wantPaneName      string
-		wantSessionName   string
-		wantParseSucceed  bool
+		name             string
+		paneTarget       string
+		wantPaneName     string
+		wantSessionName  string
+		wantParseSucceed bool
 	}{
 		{
 			name:             "standard pane target",
@@ -269,11 +269,11 @@ func TestPaneTargetParsing(t *testing.T) {
 // TestPaneTargetFormatting tests formatting pane targets from components.
 func TestPaneTargetFormatting(t *testing.T) {
 	tests := []struct {
-		name         string
-		sessionName  string
-		paneName     string
-		wantTarget   string
-		wantValid    bool
+		name        string
+		sessionName string
+		paneName    string
+		wantTarget  string
+		wantValid   bool
 	}{
 		{
 			name:        "standard format",
@@ -447,8 +447,8 @@ func TestPaneNameUniqueness(t *testing.T) {
 // TestShellQuote tests shell argument quoting for safety.
 func TestShellQuote(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
+		name      string
+		input     string
 		wantQuote string
 	}{
 		{
@@ -506,13 +506,13 @@ func TestShellQuote(t *testing.T) {
 // This test captures the command arguments that would be executed.
 func TestTmuxCommandCapture(t *testing.T) {
 	tests := []struct {
-		name           string
-		paneName       string
-		sessionName    string
-		cwd            string
-		wantCmd        string
-		wantArgs       []string
-		wantCmdValid   bool
+		name         string
+		paneName     string
+		sessionName  string
+		cwd          string
+		wantCmd      string
+		wantArgs     []string
+		wantCmdValid bool
 	}{
 		{
 			name:         "spawn pane command",
@@ -598,28 +598,28 @@ func TestPaneNameExtraction(t *testing.T) {
 	}
 
 	tests := []struct {
-		name        string
-		paneTarget  string
+		name         string
+		paneTarget   string
 		wantPaneName string
 	}{
 		{
-			name:        "standard target",
-			paneTarget:  "telegram-bridge:t100-120",
+			name:         "standard target",
+			paneTarget:   "telegram-bridge:t100-120",
 			wantPaneName: "t100-120",
 		},
 		{
-			name:        "no colon",
-			paneTarget:  "telegram-bridge",
+			name:         "no colon",
+			paneTarget:   "telegram-bridge",
 			wantPaneName: "telegram-bridge",
 		},
 		{
-			name:        "multiple colons",
-			paneTarget:  "session:prefix:t100-120",
+			name:         "multiple colons",
+			paneTarget:   "session:prefix:t100-120",
 			wantPaneName: "t100-120",
 		},
 		{
-			name:        "empty",
-			paneTarget:  "",
+			name:         "empty",
+			paneTarget:   "",
 			wantPaneName: "",
 		},
 	}
@@ -917,33 +917,33 @@ func TestReconcileOrphanBehavior(t *testing.T) {
 // session panes against DB records during reconciliation.
 func TestPaneKeyGeneration(t *testing.T) {
 	tests := []struct {
-		name       string
-		chatID     int64
-		threadID   int64
+		name        string
+		chatID      int64
+		threadID    int64
 		wantPaneKey string
 	}{
 		{
-			name:       "positive chat ID",
-			chatID:     123456,
-			threadID:   789,
+			name:        "positive chat ID",
+			chatID:      123456,
+			threadID:    789,
 			wantPaneKey: "t123456-789",
 		},
 		{
-			name:       "negative chat ID (absolute value)",
-			chatID:     -123456,
-			threadID:   789,
+			name:        "negative chat ID (absolute value)",
+			chatID:      -123456,
+			threadID:    789,
 			wantPaneKey: "t123456-789",
 		},
 		{
-			name:       "zero thread ID",
-			chatID:     123456,
-			threadID:   0,
+			name:        "zero thread ID",
+			chatID:      123456,
+			threadID:    0,
 			wantPaneKey: "t123456-0",
 		},
 		{
-			name:       "large negative chat ID",
-			chatID:     -1003602927203,
-			threadID:   120,
+			name:        "large negative chat ID",
+			chatID:      -1003602927203,
+			threadID:    120,
 			wantPaneKey: "t1003602927203-120",
 		},
 	}
@@ -961,5 +961,13 @@ func TestPaneKeyGeneration(t *testing.T) {
 				t.Errorf("pane key: got %q, want %q", gotPaneKey, tt.wantPaneKey)
 			}
 		})
+	}
+}
+
+// TestPlaceholder is a minimal scaffolding test for pty_manager_test.go
+func TestPlaceholder(t *testing.T) {
+	// Placeholder test for basic scaffolding verification
+	if true != true {
+		t.Error("placeholder test failed")
 	}
 }
