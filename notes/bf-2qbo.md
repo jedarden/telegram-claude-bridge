@@ -63,5 +63,41 @@ Then those will unblock:
 
 And so on, progressively unblocking the entire chain.
 
+## Additional Root Cause (Same Day)
+Later investigation revealed a **second issue** causing the same starvation alert: the needle worker configuration was pointing to the wrong workspace.
+
+### Configuration Mismatch
+- **Configured default workspace:** `/home/coding/zai-proxy`
+- **Actual workspace:** `/home/coding/telegram-claude-bridge`
+
+This caused the needle worker's `Pluck` function to search for beads in the wrong directory.
+
+### Solution
+Updated `/home/coding/.config/needle/config.yaml`:
+
+```yaml
+workspace:
+  default: /home/coding/telegram-claude-bridge  # Changed from /home/coding/zai-proxy
+  home: /home/coding/.needle
+  labels: []
+```
+
+### Result
+- Worker now correctly searches the telegram-claude-bridge workspace
+- All 11 open beads are now visible to the worker
+- The `exclude_labels: []` setting ensures no labels are filtered out
+
+## Verification Commands
+```bash
+# Check open beads in workspace
+br --workspace=/home/coding/telegram-claude-bridge list | grep "open ("
+
+# Verify needle worker config
+cat ~/.config/needle/config.yaml | grep -A 3 "workspace:"
+
+# Check bead database integrity
+sqlite3 .beads/beads.db "PRAGMA integrity_check;"
+```
+
 ## Date
-2026-07-06
+2026-07-06 (Updated with additional root cause)
