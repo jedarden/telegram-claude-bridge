@@ -146,6 +146,44 @@ func (sc *SessionCleanup) sweepStaleWorkers(ctx context.Context) {
 	}
 }
 
+// MarkInactive marks a session as inactive and kills its associated tmux pane.
+// This is performed within a database transaction to ensure atomicity.
+func (sc *SessionCleanup) MarkInactive(ctx context.Context, sess *Session) error {
+	// Begin transaction
+	tx, err := sc.db.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Update session status to inactive
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE sessions SET status = ? WHERE chat_id = ? AND thread_id = ?`,
+		"inactive", sess.ChatID, sess.ThreadID); err != nil {
+		return fmt.Errorf("failed to update session status: %w", err)
+	}
+
+	// Calculate absolute chat ID for pane naming (Telegram uses negative IDs for groups)
+	absChatID := sess.ChatID
+	if absChatID < 0 {
+		absChatID = -absChatID
+	}
+
+	// Kill the corresponding tmux pane
+	paneName := fmt.Sprintf("t%d-%d", absChatID, sess.ThreadID)
+	paneTarget := fmt.Sprintf("%s:%s", tmuxSessionName, paneName)
+	sc.ptyMgr.KillPane(paneTarget)
+	log.Printf("[cleanup] killed pane for inactive session (%d,%d): %s",
+		sess.ChatID, sess.ThreadID, paneTarget)
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
 // runCleanup executes a single cleanup cycle.
 func (sc *SessionCleanup) runCleanup(ctx context.Context) {
 	// First, sweep stale workers (independent of session TTL)
