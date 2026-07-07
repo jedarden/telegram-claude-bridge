@@ -306,9 +306,9 @@ func TestWorkerPool_SpawnWorker_MalformedInput(t *testing.T) {
 	wp := NewWorkerPool(db, sender, sm)
 
 	tests := []struct {
-		name        string
-		inputJSON   json.RawMessage
-		wantErrSub  string
+		name       string
+		inputJSON  json.RawMessage
+		wantErrSub string
 	}{
 		{
 			name:       "invalid JSON",
@@ -897,6 +897,432 @@ func TestSubtaskOrchestrator_Run_UplevelChat(t *testing.T) {
 	}
 }
 
+func TestSubtaskOrchestrator_Run_DBErrorOnCreate(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	so := NewSubtaskOrchestrator(db, sender, sm)
+
+	req := SubtaskRequest{
+		ChatID:   100,
+		ThreadID: 10,
+		MsgID:    1000,
+		Prompts:  []string{"test task"},
+		Group:    group,
+	}
+
+	// Close DB before Run to force error on CreateSubtask
+	db.Close()
+
+	err := so.Run(ctx, req)
+	if err == nil {
+		t.Error("expected error when DB is closed, got nil")
+	}
+	if err != nil && !containsSubstring(err.Error(), "create subtask") {
+		t.Errorf("error = %q, want substring 'create subtask'", err.Error())
+	}
+}
+
+func TestSubtaskOrchestrator_ListRunningSubtasks_MixedStatuses(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	so := NewSubtaskOrchestrator(db, sender, sm)
+
+	// Create subtasks with different statuses
+	statuses := []string{"running", "complete", "error", "cancelled"}
+	for i, status := range statuses {
+		st := &Subtask{
+			ID:          fmt.Sprintf("sub-%d", i),
+			ChatID:      100,
+			ThreadID:    10,
+			ParentMsgID: 1000,
+			Prompt:      fmt.Sprintf("task %d", i+1),
+			Status:      status,
+			StartedAt:   time.Now().UTC(),
+		}
+		if err := db.CreateSubtask(ctx, st); err != nil {
+			t.Fatalf("create subtask with status %s: %v", status, err)
+		}
+	}
+
+	running, err := so.ListRunningSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListRunningSubtasks: %v", err)
+	}
+	if len(running) != 1 {
+		t.Errorf("got %d running subtasks, want 1 (only 'running' status)", len(running))
+	}
+	if len(running) > 0 && running[0].Status != "running" {
+		t.Errorf("running subtask status = %q, want 'running'", running[0].Status)
+	}
+}
+
+func TestSubtaskOrchestrator_CancelSubtasks_NoRunningSubtasks(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	so := NewSubtaskOrchestrator(db, sender, sm)
+
+	// No subtasks created for this topic
+	count, err := so.CancelSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("CancelSubtasks with no subtasks: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("cancelled %d subtasks, want 0", count)
+	}
+}
+
+func TestSubtaskOrchestrator_CancelSubtasks_OnlyNonRunning(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	so := NewSubtaskOrchestrator(db, sender, sm)
+
+	// Create only completed subtasks (no running ones)
+	for i := 0; i < 3; i++ {
+		st := &Subtask{
+			ID:          fmt.Sprintf("sub-%d", i),
+			ChatID:      100,
+			ThreadID:    10,
+			ParentMsgID: 1000,
+			Prompt:      fmt.Sprintf("task %d", i+1),
+			Status:      "complete",
+			Result:      "done",
+			StartedAt:   time.Now().UTC(),
+		}
+		if err := db.CreateSubtask(ctx, st); err != nil {
+			t.Fatalf("create subtask: %v", err)
+		}
+	}
+
+	count, err := so.CancelSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("CancelSubtasks with no running subtasks: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("cancelled %d subtasks, want 0 (none were running)", count)
+	}
+}
+
+func TestSubtaskOrchestrator_Run_SubtaskIDsAreUnique(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	so := NewSubtaskOrchestrator(db, sender, sm)
+
+	req := SubtaskRequest{
+		ChatID:   100,
+		ThreadID: 10,
+		MsgID:    1000,
+		Prompts:  []string{"task 1", "task 2", "task 3", "task 4", "task 5"},
+		Group:    group,
+	}
+
+	err := so.Run(ctx, req)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+
+	// Verify all subtask IDs are unique
+	seenIDs := make(map[string]bool)
+	for _, st := range subtasks {
+		if seenIDs[st.ID] {
+			t.Errorf("duplicate subtask ID %s found", st.ID)
+		}
+		seenIDs[st.ID] = true
+	}
+
+	// Verify we have 5 unique IDs
+	if len(seenIDs) != 5 {
+		t.Errorf("got %d unique subtask IDs, want 5", len(seenIDs))
+	}
+}
+
+func TestSubtaskOrchestrator_Run_VeryLongPrompt(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	so := NewSubtaskOrchestrator(db, sender, sm)
+
+	// Create a very long prompt (10KB)
+	longPrompt := strings.Repeat("Analyze this complex scenario: ", 200)
+	req := SubtaskRequest{
+		ChatID:   100,
+		ThreadID: 10,
+		MsgID:    1000,
+		Prompts:  []string{longPrompt},
+		Group:    group,
+	}
+
+	err := so.Run(ctx, req)
+	if err != nil {
+		t.Fatalf("Run with long prompt: %v", err)
+	}
+
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 1 {
+		t.Fatalf("expected 1 subtask, got %d", len(subtasks))
+	}
+
+	// Verify the full prompt was stored
+	if subtasks[0].Prompt != longPrompt {
+		t.Errorf("stored prompt length = %d, want %d", len(subtasks[0].Prompt), len(longPrompt))
+	}
+}
+
+func TestSubtaskOrchestrator_Run_EmptyPromptInList(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	so := NewSubtaskOrchestrator(db, sender, sm)
+
+	// Include an empty prompt in the list
+	req := SubtaskRequest{
+		ChatID:   100,
+		ThreadID: 10,
+		MsgID:    1000,
+		Prompts:  []string{"valid task", "", "another task"},
+		Group:    group,
+	}
+
+	err := so.Run(ctx, req)
+	if err != nil {
+		t.Fatalf("Run with empty prompt: %v", err)
+	}
+
+	// Verify all 3 subtasks were created (empty prompts are NOT filtered by Run)
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 3 {
+		t.Fatalf("expected 3 subtasks (empty one included), got %d", len(subtasks))
+	}
+}
+
+func TestSubtaskOrchestrator_Run_NilSession(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	so := NewSubtaskOrchestrator(db, sender, sm)
+
+	req := SubtaskRequest{
+		ChatID:   100,
+		ThreadID: 10,
+		MsgID:    1000,
+		Prompts:  []string{"test task"},
+		Group:    group,
+		Session:  nil, // No session
+	}
+
+	err := so.Run(ctx, req)
+	if err != nil {
+		t.Fatalf("Run with nil session: %v", err)
+	}
+
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 1 {
+		t.Fatalf("expected 1 subtask, got %d", len(subtasks))
+	}
+
+	// Verify SessionID is empty when Session is nil
+	if subtasks[0].SessionID != "" {
+		t.Errorf("subtask.SessionID = %q, want empty string (nil session)", subtasks[0].SessionID)
+	}
+}
+
+func TestSubtaskOrchestrator_Run_DuplicatePrompts(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	so := NewSubtaskOrchestrator(db, sender, sm)
+
+	// Same prompt multiple times
+	req := SubtaskRequest{
+		ChatID:   100,
+		ThreadID: 10,
+		MsgID:    1000,
+		Prompts:  []string{"What is 2+2?", "What is 2+2?", "What is 2+2?"},
+		Group:    group,
+	}
+
+	err := so.Run(ctx, req)
+	if err != nil {
+		t.Fatalf("Run with duplicate prompts: %v", err)
+	}
+
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 3 {
+		t.Fatalf("expected 3 subtasks, got %d", len(subtasks))
+	}
+
+	// All should have the same prompt but different IDs
+	seenIDs := make(map[string]bool)
+	for _, st := range subtasks {
+		if st.Prompt != "What is 2+2?" {
+			t.Errorf("subtask.Prompt = %q, want 'What is 2+2?'", st.Prompt)
+		}
+		if seenIDs[st.ID] {
+			t.Errorf("duplicate subtask ID %s", st.ID)
+		}
+		seenIDs[st.ID] = true
+	}
+}
+
+func TestSubtaskOrchestrator_CancelSubtasks_MultipleTopics(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManager(t, db, sender)
+	so := NewSubtaskOrchestrator(db, sender, sm)
+
+	// Create running subtasks in different topics
+	for _, topicID := range []int64{10, 20, 30} {
+		for i := 0; i < 2; i++ {
+			st := &Subtask{
+				ID:          fmt.Sprintf("sub-%d-%d", topicID, i),
+				ChatID:      100,
+				ThreadID:    topicID,
+				ParentMsgID: 1000,
+				Prompt:      fmt.Sprintf("task %d-%d", topicID, i+1),
+				Status:      "running",
+				StartedAt:   time.Now().UTC(),
+			}
+			if err := db.CreateSubtask(ctx, st); err != nil {
+				t.Fatalf("create subtask: %v", err)
+			}
+		}
+	}
+
+	// Cancel only topic 10
+	count, err := so.CancelSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("CancelSubtasks topic 10: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("cancelled %d subtasks in topic 10, want 2", count)
+	}
+
+	// Verify topic 10 has no running subtasks
+	running10, err := so.ListRunningSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListRunningSubtasks topic 10: %v", err)
+	}
+	if len(running10) != 0 {
+		t.Errorf("topic 10 has %d running subtasks after cancel, want 0", len(running10))
+	}
+
+	// Verify topic 20 still has running subtasks (not affected)
+	running20, err := so.ListRunningSubtasks(ctx, 100, 20)
+	if err != nil {
+		t.Fatalf("ListRunningSubtasks topic 20: %v", err)
+	}
+	if len(running20) != 2 {
+		t.Errorf("topic 20 has %d running subtasks, want 2 (untouched)", len(running20))
+	}
+}
+
 // ── /parallel Command Integration Tests ─────────────────────────────────────────────
 
 func TestSplitParallelPrompts_Basic(t *testing.T) {
@@ -999,33 +1425,33 @@ func TestSplitParallelPrompts_OnlyDelimiter(t *testing.T) {
 
 func TestSplitParallelPrompts_DelimiterVariations(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantLen  int
+		name      string
+		input     string
+		wantLen   int
 		wantFirst string
 	}{
 		{
-			name:     "dashes only",
-			input:    "a\n---\nb",
-			wantLen:  2,
+			name:      "dashes only",
+			input:     "a\n---\nb",
+			wantLen:   2,
 			wantFirst: "a",
 		},
 		{
-			name:     "dashes with spaces before",
-			input:    "a\n ---\nb",
-			wantLen:  2,
+			name:      "dashes with spaces before",
+			input:     "a\n ---\nb",
+			wantLen:   2,
 			wantFirst: "a",
 		},
 		{
-			name:     "dashes with spaces after",
-			input:    "a\n--- \nb",
-			wantLen:  2,
+			name:      "dashes with spaces after",
+			input:     "a\n--- \nb",
+			wantLen:   2,
 			wantFirst: "a",
 		},
 		{
-			name:     "dashes with spaces both sides",
-			input:    "a\n --- \nb",
-			wantLen:  2,
+			name:      "dashes with spaces both sides",
+			input:     "a\n --- \nb",
+			wantLen:   2,
 			wantFirst: "a",
 		},
 	}
@@ -1049,8 +1475,8 @@ func TestSplitParallelPrompts_DelimiterVariations(t *testing.T) {
 func containsSubstring(haystack, substring string) bool {
 	return len(haystack) >= len(substring) &&
 		(haystack == substring ||
-		 len(substring) == 0 ||
-		 findSubstring(haystack, substring) >= 0)
+			len(substring) == 0 ||
+			findSubstring(haystack, substring) >= 0)
 }
 
 func findSubstring(s, substr string) int {
@@ -1102,8 +1528,8 @@ func TestCommandHandler_cmdParallel_SinglePrompt(t *testing.T) {
 	threadID := int64(10)
 	text := "/parallel What is 2+2?"
 	update := contract.Update{
-		ChatID:     100,
-		ThreadID:   &threadID,
+		ChatID:    100,
+		ThreadID:  &threadID,
 		MessageID: 1000,
 		FromUser: contract.FromUser{
 			ID: 12345,
@@ -1175,9 +1601,9 @@ func TestCommandHandler_cmdParallel_MultiplePrompts(t *testing.T) {
 	threadID := int64(10)
 	text := "/parallel What is 2+2?\n---\nWhat is 3+3?\n---\nWhat is 4+4?"
 	update := contract.Update{
-		ChatID:     100,
-		ThreadID:   &threadID,
-		MessageID:  1000,
+		ChatID:    100,
+		ThreadID:  &threadID,
+		MessageID: 1000,
 		FromUser: contract.FromUser{
 			ID: 12345,
 		},
@@ -1264,10 +1690,10 @@ func TestCommandHandler_cmdParallel_MaxSubtasksEnforced(t *testing.T) {
 	}
 
 	session := &Session{
-		ChatID:    100,
-		ThreadID:  10,
-		CWD:       "/tmp/test",
-		Status:    "active",
+		ChatID:   100,
+		ThreadID: 10,
+		CWD:      "/tmp/test",
+		Status:   "active",
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -1282,9 +1708,9 @@ func TestCommandHandler_cmdParallel_MaxSubtasksEnforced(t *testing.T) {
 	threadID := int64(10)
 	text := "/parallel task1\n---\ntask2\n---\ntask3"
 	update := contract.Update{
-		ChatID:     100,
-		ThreadID:   &threadID,
-		MessageID:  1000,
+		ChatID:    100,
+		ThreadID:  &threadID,
+		MessageID: 1000,
 		FromUser: contract.FromUser{
 			ID: 12345,
 		},
@@ -1616,7 +2042,7 @@ func TestWorkerPool_finishWorker_ErrorMessageTruncation(t *testing.T) {
 	}
 }
 
-	// ── Additional WorkerPool Edge Case Tests ─────────────────────────────────────────────
+// ── Additional WorkerPool Edge Case Tests ─────────────────────────────────────────────
 
 func TestWorkerPool_SpawnWorker_EmptyGroupModel(t *testing.T) {
 	db := openTestDB(t)
