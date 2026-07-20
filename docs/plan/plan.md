@@ -1675,3 +1675,42 @@ The bridge and proxy share a Go module (monorepo with `cmd/proxy/` and `cmd/brid
 | PTY screen scraping fragility | Response extraction breaks on claude UI changes | Pin sentinel characters (`●`, `────`) and test on each claude update; fall back to stop-hook file extraction |
 | tmux session missing on bridge restart | All warm panes lost | Expected and safe — dynamic model means panes are ephemeral; on next message the bridge does a cold resume via `--resume <session_id>`; no manual recovery needed |
 | claude interactive mode UI changes | Bracketed paste or startup behavior changes break injection | Keep PTY integration logic isolated in PTYManager; sentinel + timing constants are the fragile surface — document and test them |
+
+---
+
+## ADR-001: 2026-07-20 — Self-update must run from a dedicated deploy worktree, not the shared NEEDLE dev checkout
+
+### Context
+
+The bridge self-updates by shelling out to `git` against `REPO_PATH` (`internal/updater/updater.go`), which in production is set to `/home/coding/telegram-claude-bridge` — the exact same directory that NEEDLE worker agents use as their live development worktree for this repo. Before building a new binary, `checkAndUpdate()` calls `hasUncommittedChanges()`, which runs `git status --porcelain` against that directory and aborts the whole check if anything beyond `.beads/` or `.needle-predispatch-sha` is dirty.
+
+In practice this directory is essentially never clean. As of 2026-07-20 the working tree has 8 modified tracked files and 8 untracked `*_test.go` files, and there are 6 beads (`bf-7wrz`, `bf-dozd`, `bf-4n7h`, `bf-140j`, `bf-3jxi`, `bf-5tzn`) `in_progress` against this exact checkout — i.e. this is a routine, expected state for the repo, not an anomaly.
+
+Live evidence from the running systemd unit (`journalctl --user -u telegram-claude-bridge`) confirms the resulting production impact: the last successful self-update was **2026-07-06 11:10** (commit `0865036`). Since then, `[updater] skipping update: uncommitted changes in repo` has logged **3,796 times** through 2026-07-20, roughly one skipped check every 5 minutes for **14 straight days**, while `main` on Forgejo/GitHub has advanced 50+ commits past what the running binary was built from. Self-update has not merely degraded — it has been completely inert for two weeks, silently, with no alert (the only signal is a repeating INFO-level log line nobody was watching).
+
+The `hasUncommittedChanges()` exclusion list already special-cases `.beads/` and `.needle-predispatch-sha` — a prior fix attempt for the same symptom that only addressed beads-workspace churn, not the far more common case of in-progress source/test edits from concurrent NEEDLE workers.
+
+### Decision
+
+Give the updater its own dedicated, otherwise-untouched checkout, isolated from the shared dev worktree:
+
+1. Create a linked `git worktree` for deploy purposes only (e.g. `/home/coding/.telegram-claude-bridge-deploy`), sharing the same `.git` object store as the dev checkout but with its own independent working tree and index.
+2. Point `Updater.Config.RepoPath` (and the systemd unit's `BINARY_PATH`/`ExecStart`) at the deploy worktree instead of the shared dev directory. `REPO_PATH` in the unit's environment file changes accordingly.
+3. Nothing except the updater's own `git fetch` / `git pull` / `go build` sequence ever writes to the deploy worktree, so `git status --porcelain` there is clean by construction — the `.beads/` / `.needle-predispatch-sha` allowlist in `hasUncommittedChanges()` becomes unnecessary and can be deleted, tightening the check back to "any diff at all blocks the update."
+4. The dev worktree at `/home/coding/telegram-claude-bridge` keeps working exactly as it does today for NEEDLE workers and interactive use — this change is additive and confined to the updater's `RepoPath`.
+
+### Alternatives Considered
+
+- **Do nothing.** Rejected — this is the status quo and has already produced a measured 14-day (and counting) update outage with 3,796 silent skips.
+- **Extend the `hasUncommittedChanges()` allowlist to also ignore test-file or `internal/**` diffs.** Rejected — turns the safety check into a fragile allowlist that could ship a build from a tree with real, non-test uncommitted changes (breaking the "binary matches HEAD" reproducibility guarantee the check exists to protect), and would need constant upkeep as new file patterns show up.
+- **Have the updater `git stash`/`git clean` the shared dev worktree before building.** Rejected — actively unsafe. This worktree currently has 6 beads `in_progress` under live NEEDLE workers; stashing or cleaning their uncommitted edits out from under them violates this workspace's rule against touching another agent's in-progress work, and risks silent data loss (see `feedback_git_add_intent_to_add_gotcha` in workspace memory for a related near-miss).
+- **Fresh `git clone` into a throwaway temp dir on every 5-minute check.** Rejected in favor of a linked worktree — a full clone re-transfers and re-writes the whole object store every cycle for no benefit over a worktree, which shares objects and only needs `fetch`.
+- **Move the bridge off bare-metal self-update entirely onto a CI-built artifact (Argo Workflows / iad-ci, matching most other repos in this fleet).** Rejected for now — the bridge is deliberately a single bare-metal systemd process bound to `tmux`, the `claude` CLI, and this host's Anthropic subscription session (see "Language Evaluation" / "Claude integration" decision above); it isn't a containerizable artifact under the current architecture. Worth revisiting only if that changes.
+
+### Consequences
+
+- Self-update becomes independent of how dirty the shared dev worktree is at any given moment — it resumes working deterministically the next time `main` advances, regardless of concurrent NEEDLE activity.
+- `hasUncommittedChanges()` simplifies back to an unconditional porcelain check, removing a special-case that was already proven insufficient.
+- One-time migration cost: create the deploy worktree, update the systemd unit's environment file (`REPO_PATH`, `BINARY_PATH`) and confirm the watchdog/health-check path still resolves the new binary location correctly.
+- A second on-disk copy of the repo (~13 MB) plus its own `bin/` build output; negligible on EX44.
+- Does not by itself add rollback-on-bad-build protection or an active alert if updates stall again — those are tracked separately (see beads filed alongside this ADR, labeled `artifact-improvement`).
