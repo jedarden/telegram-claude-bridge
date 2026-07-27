@@ -397,6 +397,70 @@ func (s *Sender) SendVideo(ctx context.Context, chatID int64, threadID *int64, o
 	return nil
 }
 
+// SendPhoto sends a photo file via the proxy's /send_photo endpoint.
+func (s *Sender) SendPhoto(ctx context.Context, chatID int64, threadID *int64, origMsgID int64, caption string, filename string, content []byte) error {
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+
+	// Write metadata fields
+	if err := w.WriteField("chat_id", fmt.Sprintf("%d", chatID)); err != nil {
+		return fmt.Errorf("write chat_id: %w", err)
+	}
+	if threadID != nil {
+		if err := w.WriteField("thread_id", fmt.Sprintf("%d", *threadID)); err != nil {
+			return fmt.Errorf("write thread_id: %w", err)
+		}
+	}
+	if caption != "" {
+		if err := w.WriteField("caption", caption); err != nil {
+			return fmt.Errorf("write caption: %w", err)
+		}
+	}
+	if origMsgID != 0 {
+		if err := w.WriteField("reply_to_message_id", fmt.Sprintf("%d", origMsgID)); err != nil {
+			return fmt.Errorf("write reply_to_message_id: %w", err)
+		}
+	}
+
+	// Write the file content
+	fw, err := w.CreateFormFile("photo", filename)
+	if err != nil {
+		return fmt.Errorf("create form file: %w", err)
+	}
+	if _, err := fw.Write(content); err != nil {
+		return fmt.Errorf("write file data: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("close multipart writer: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.proxyURL+"/send_photo", &body)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp contract.ErrorResponse
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		if errResp.ErrorCode == 0 {
+			errResp.ErrorCode = resp.StatusCode
+		}
+		if errResp.Description == "" {
+			errResp.Description = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		}
+		return &errResp
+	}
+
+	return nil
+}
+
 // SendToolApprovalPrompt sends a tool approval prompt with approve/deny inline keyboard buttons.
 // The callback data format is "action:chatID:threadID:toolIndex" where action is "approve_tool" or "deny_tool".
 func (s *Sender) SendToolApprovalPrompt(ctx context.Context, chatID int64, threadID *int64, toolName, toolInput string, toolIndex int64) (int64, error) {
