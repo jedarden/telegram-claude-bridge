@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,7 +11,134 @@ import (
 	"time"
 
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// ── Mock Infrastructure for exec.Command ────────────────────────────────────────
+
+// commandExec is an interface for executing commands, allowing test mocks.
+type commandExec interface {
+	CommandContext(ctx context.Context, name string, args ...string) command
+}
+
+// command is an interface for a running command, allowing test mocks.
+type command interface {
+	CombinedOutput() ([]byte, error)
+	Run() error
+}
+
+// realCommandExec implements commandExec using os/exec.Command.
+type realCommandExec struct{}
+
+func (r realCommandExec) CommandContext(ctx context.Context, name string, args ...string) command {
+	return &realCommand{cmd: exec.CommandContext(ctx, name, args...)}
+}
+
+// realCommand wraps exec.Cmd to implement the command interface.
+type realCommand struct {
+	cmd *exec.Cmd
+}
+
+func (r *realCommand) CombinedOutput() ([]byte, error) {
+	return r.cmd.CombinedOutput()
+}
+
+func (r *realCommand) Run() error {
+	return r.cmd.Run()
+}
+
+// mockCommandExec allows test code to provide predefined command results.
+type mockCommandExec struct {
+	commands map[string]command // keyed by "name arg1 arg2"
+}
+
+func newMockCommandExec() *mockCommandExec {
+	return &mockCommandExec{
+		commands: make(map[string]command),
+	}
+}
+
+func (m *mockCommandExec) addCommand(key string, cmd command) {
+	m.commands[key] = cmd
+}
+
+func (m *mockCommandExec) CommandContext(ctx context.Context, name string, args ...string) command {
+	key := commandKey(name, args...)
+	if cmd, ok := m.commands[key]; ok {
+		return cmd
+	}
+	return &mockCommand{err: fmt.Errorf("no mock for command: %s", key)}
+}
+
+// commandKey generates a unique key for a command invocation.
+func commandKey(name string, args ...string) string {
+	return fmt.Sprintf("%s %v", name, args)
+}
+
+// mockCommand allows test code to provide predefined outputs/errors.
+type mockCommand struct {
+	output []byte
+	err    error
+}
+
+func (m *mockCommand) CombinedOutput() ([]byte, error) {
+	return m.output, m.err
+}
+
+func (m *mockCommand) Run() error {
+	return m.err
+}
+
+// ── Test Context Helpers ───────────────────────────────────────────────────────
+
+// testAudioContext holds common test dependencies for audio tests.
+type testAudioContext struct {
+	ctx        context.Context
+	tempDir    string
+	chatID     int64
+	messageID  int64
+}
+
+// newTestAudioContext creates a fresh test context for audio tests.
+func newTestAudioContext(t *testing.T) testAudioContext {
+	t.Helper()
+
+	ctx := context.Background()
+	tempDir := t.TempDir()
+
+	return testAudioContext{
+		ctx:        ctx,
+		tempDir:    tempDir,
+		chatID:     12345,
+		messageID:  67890,
+	}
+}
+
+// createMockWhisperSuccess creates a mock command that simulates a successful Whisper run.
+// It creates the expected output file and returns success.
+func createMockWhisperSuccess(t *testing.T, outputDir string, stem string, transcription string) command {
+	t.Helper()
+
+	// Create the expected output file
+	outputPath := filepath.Join(outputDir, stem+".txt")
+	err := os.WriteFile(outputPath, []byte(transcription), 0644)
+	require.NoError(t, err, "failed to create mock Whisper output")
+
+	return &mockCommand{
+		output: []byte("whisper output"),
+		err:    nil,
+	}
+}
+
+// createMockWhisperError creates a mock command that simulates a Whisper failure.
+func createMockWhisperError(t *testing.T, errorMsg string) command {
+	t.Helper()
+	return &mockCommand{
+		output: []byte(errorMsg),
+		err:    fmt.Errorf("whisper failed: %s", errorMsg),
+	}
+}
 
 // ── Audio Type Detection (audioFileExt) ─────────────────────────────────────────
 
@@ -98,9 +226,7 @@ func TestAudioFileExt(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := audioFileExt(tt.contentType, tt.mimeType)
-			if got != tt.want {
-				t.Errorf("audioFileExt() = %v, want %v", got, tt.want)
-			}
+			assert.Equal(t, tt.want, got, "audioFileExt() should return correct extension")
 		})
 	}
 }
@@ -206,15 +332,11 @@ func TestWhisperOutputPaths(t *testing.T) {
 			// Test txt path construction
 			stem := fmt.Sprintf("%d", tt.messageID)
 			txtPath := filepath.Join(tt.dir, stem+".txt")
-			if txtPath != tt.expectedTxt {
-				t.Errorf("txt path: got %q, want %q", txtPath, tt.expectedTxt)
-			}
+			assert.Equal(t, tt.expectedTxt, txtPath, "txt path should be constructed correctly")
 
 			// Test audio path construction for voice
 			audioPath := filepath.Join(tt.dir, stem+".ogg")
-			if audioPath != tt.expectedAudio {
-				t.Errorf("audio path: got %q, want %q", audioPath, tt.expectedAudio)
-			}
+			assert.Equal(t, tt.expectedAudio, audioPath, "audio path should be constructed correctly")
 		})
 	}
 }
@@ -290,9 +412,7 @@ func TestTranscriptionParsing(t *testing.T) {
 				result = strings.Trim(tt.rawOutput, " \t\n\r")
 			}
 
-			if result != tt.expectedText {
-				t.Errorf("parsed transcription: got %q, want %q", result, tt.expectedText)
-			}
+			assert.Equal(t, tt.expectedText, result, "transcription parsing should handle whitespace correctly")
 		})
 	}
 }
@@ -322,17 +442,14 @@ func TestWhisperExecutionError(t *testing.T) {
 
 		// Write a mock script that exits with error
 		script := "#!/bin/sh\nexit 1\n"
-		if err := os.WriteFile(mockWhisper, []byte(script), 0o755); err != nil {
-			t.Fatalf("failed to create mock whisper: %v", err)
-		}
+		err := os.WriteFile(mockWhisper, []byte(script), 0o755)
+		require.NoError(t, err, "failed to create mock whisper script")
 
 		// Verify the mock script fails as expected
 		cmd := exec.Command(mockWhisper, "--version")
-		err := cmd.Run()
+		err = cmd.Run()
 
-		if err == nil {
-			t.Error("expected mock whisper to fail, got nil error")
-		}
+		assert.Error(t, err, "mock whisper should fail when executed")
 	})
 }
 
