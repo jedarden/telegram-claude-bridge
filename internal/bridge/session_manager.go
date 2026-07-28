@@ -3186,6 +3186,16 @@ func (m *SessionManager) detectGeneratedMedia(cwd string, startTime time.Time, o
 		".flv":  true,
 	}
 
+	// Image file extensions to look for
+	imageExts := map[string]bool{
+		".png":  true,
+		".jpg":  true,
+		".jpeg": true,
+		".gif":  true,
+		".webp": true,
+		".svg":  true,
+	}
+
 	// Walk the working directory looking for media files
 	err := filepath.Walk(cwd, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
