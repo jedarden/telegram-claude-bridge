@@ -3,6 +3,8 @@ package bridge
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -232,6 +234,160 @@ func TestAudioFileExt(t *testing.T) {
 }
 
 // ── Whisper Command Argument Building ────────────────────────────────────────
+
+// TestProcessAudio_Args tests Whisper CLI argument building in processAudio function.
+// It mocks exec.Command to capture Whisper invocation and verifies correct arguments.
+func TestProcessAudio_Args(t *testing.T) {
+	tests := []struct {
+		name          string
+		chatID        int64
+		messageID     int64
+		contentType   string
+		mimeType      string
+		fileID        string
+		transcription string
+		wantCmdName   string
+	}{
+		{
+			name:          "whisper with ogg voice message",
+			chatID:        12345,
+			messageID:     67890,
+			contentType:   contract.ContentTypeVoice,
+			mimeType:      "audio/ogg",
+			fileID:        "voice_file_123",
+			transcription: "Hello world, this is a test transcription.",
+			wantCmdName:   "whisper",
+		},
+		{
+			name:          "whisper with mp3 audio file",
+			chatID:        98765,
+			messageID:     43210,
+			contentType:   contract.ContentTypeAudio,
+			mimeType:      "audio/mpeg",
+			fileID:        "audio_file_456",
+			transcription: "This is an MP3 audio transcription.",
+			wantCmdName:   "whisper",
+		},
+		{
+			name:          "whisper with m4a audio file",
+			chatID:        11111,
+			messageID:     22222,
+			contentType:   contract.ContentTypeAudio,
+			mimeType:      "audio/mp4",
+			fileID:        "audio_file_789",
+			transcription: "M4A audio transcription test.",
+			wantCmdName:   "whisper",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openTestDB(t)
+			defer db.Close()
+
+			// Track command invocations
+			var capturedCmd struct {
+				name string
+				args []string
+			}
+
+			// Create the actual directory that processAudio will use (it uses the imageTempDir constant)
+			testChatDir := filepath.Join(imageTempDir, fmt.Sprintf("%d", tt.chatID))
+			require.NoError(t, os.MkdirAll(testChatDir, 0o755), "create chat directory")
+			t.Cleanup(func() { os.RemoveAll(testChatDir) })
+
+			// Create a test HTTP server to handle file downloads
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/file/") {
+					// Serve fake audio data
+					w.Header().Set("Content-Type", tt.mimeType)
+					w.WriteHeader(http.StatusOK)
+					w.Write([]byte("fake audio data"))
+				}
+			}))
+			defer server.Close()
+
+			// Create a capturing mock command exec
+			mockExec := &capturingCommandExec{
+				onCommand: func(name string, args ...string) command {
+					capturedCmd.name = name
+					capturedCmd.args = args
+
+					// Create mock audio file and transcription for success
+					ext := audioFileExt(tt.contentType, tt.mimeType)
+					audioPath := filepath.Join(testChatDir, fmt.Sprintf("%d.%s", tt.messageID, ext))
+					txtPath := filepath.Join(testChatDir, fmt.Sprintf("%d.txt", tt.messageID))
+
+					// Create files (directory already exists)
+					require.NoError(t, os.WriteFile(audioPath, []byte("fake audio"), 0644), "create audio file")
+					require.NoError(t, os.WriteFile(txtPath, []byte(tt.transcription), 0644), "create transcription")
+
+					return &mockCommand{
+						output: []byte("whisper processing complete"),
+						err:    nil,
+					}
+				},
+			}
+
+			// Create SessionManager with mock command exec
+			sender, err := NewSender(server.URL, filepath.Join(t.TempDir(), "sender.db"))
+			require.NoError(t, err, "failed to create sender")
+			t.Cleanup(func() { sender.Close() })
+
+			sm := &SessionManager{
+				db:          db,
+				sender:      sender,
+				proxyURL:    server.URL,
+				commandExec: mockExec,
+			}
+
+			// Prepare test content
+			mime := tt.mimeType
+			content := &contract.Content{
+				Type:     tt.contentType,
+				FileID:   &tt.fileID,
+				MimeType: &mime,
+			}
+
+			// Call processAudio
+			transcription, cleanupPaths, err := sm.processAudio(ctx, tt.chatID, tt.messageID, content)
+
+			// Verify the result
+			assert.NoError(t, err, "processAudio should succeed")
+			assert.Equal(t, tt.transcription, transcription, "transcription should match")
+			assert.Len(t, cleanupPaths, 2, "should track 2 cleanup paths")
+
+			// Verify command was called with correct name
+			assert.Equal(t, tt.wantCmdName, capturedCmd.name, "command name should be whisper")
+
+			// Verify command structure: whisper [audioPath] --model turbo --output_format txt --output_dir [chatDir]
+			// args contains: [audioPath, "--model", "turbo", "--output_format", "txt", "--output_dir", chatDir]
+			assert.Len(t, capturedCmd.args, 7, "whisper command should have 7 arguments")
+			assert.Equal(t, "--model", capturedCmd.args[1], "second arg should be --model")
+			assert.Equal(t, "turbo", capturedCmd.args[2], "third arg should be turbo")
+			assert.Equal(t, "--output_format", capturedCmd.args[3], "fourth arg should be --output_format")
+			assert.Equal(t, "txt", capturedCmd.args[4], "fifth arg should be txt")
+			assert.Equal(t, "--output_dir", capturedCmd.args[5], "sixth arg should be --output_dir")
+
+			// Verify audio file path is passed correctly as first argument
+			expectedChatDir := filepath.Join(imageTempDir, fmt.Sprintf("%d", tt.chatID))
+			expectedExt := audioFileExt(tt.contentType, tt.mimeType)
+			expectedAudioPath := filepath.Join(expectedChatDir, fmt.Sprintf("%d.%s", tt.messageID, expectedExt))
+			assert.Equal(t, expectedAudioPath, capturedCmd.args[0], "audio file path should be correct")
+			assert.Equal(t, expectedChatDir, capturedCmd.args[6], "output_dir should be correct")
+		})
+	}
+}
+
+// capturingCommandExec is a mock that captures command invocations
+type capturingCommandExec struct {
+	onCommand func(name string, args ...string) command
+}
+
+func (c *capturingCommandExec) CommandContext(ctx context.Context, name string, args ...string) command {
+	return c.onCommand(name, args...)
+}
 
 func TestWhisperArgs(t *testing.T) {
 	// Test that whisper command is built with correct arguments
