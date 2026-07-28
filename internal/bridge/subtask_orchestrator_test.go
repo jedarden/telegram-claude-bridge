@@ -145,6 +145,7 @@ func TestSplitParallelPrompts_ConsecutiveDelimiters(t *testing.T) {
 		wantLen  int
 		wantPrompts []string
 	}{
+		// Consecutive delimiters in the middle (with text before and after)
 		{
 			name:     "two consecutive delimiters",
 			input:    "First\n---\n---\nSecond",
@@ -163,6 +164,45 @@ func TestSplitParallelPrompts_ConsecutiveDelimiters(t *testing.T) {
 			wantLen:  3,
 			wantPrompts: []string{"A", "---", "---\nB"},
 		},
+		// Consecutive delimiters at the start
+		{
+			name:     "two consecutive delimiters at start",
+			input:    "\n---\n---\ntext",
+			wantLen:  1,
+			wantPrompts: []string{"text"},
+		},
+		{
+			name:     "three consecutive delimiters at start",
+			input:    "\n---\n---\n---\ntext",
+			wantLen:  1,
+			wantPrompts: []string{"text"},
+		},
+		{
+			name:     "four consecutive delimiters at start",
+			input:    "\n---\n---\n---\n---\ntext",
+			wantLen:  1,
+			wantPrompts: []string{"text"},
+		},
+		// Consecutive delimiters at the end
+		{
+			name:     "two consecutive delimiters at end",
+			input:    "text\n---\n---\n",
+			wantLen:  1,
+			wantPrompts: []string{"text"},
+		},
+		{
+			name:     "three consecutive delimiters at end",
+			input:    "text\n---\n---\n---\n",
+			wantLen:  1,
+			wantPrompts: []string{"text"},
+		},
+		{
+			name:     "four consecutive delimiters at end",
+			input:    "text\n---\n---\n---\n---\n",
+			wantLen:  1,
+			wantPrompts: []string{"text"},
+		},
+		// Consecutive delimiters with whitespace between them
 		{
 			name:     "consecutive delimiters with whitespace",
 			input:    "First\n---\n  \n---\nSecond",
@@ -174,6 +214,32 @@ func TestSplitParallelPrompts_ConsecutiveDelimiters(t *testing.T) {
 			input:    "First\n---\n   \t   \n---\nSecond",
 			wantLen:  2,
 			wantPrompts: []string{"First", "Second"},
+		},
+		{
+			name:     "consecutive delimiters with whitespace at start",
+			input:    "\n---\n  \n---\ntext",
+			wantLen:  1,
+			wantPrompts: []string{"text"},
+		},
+		// Consecutive delimiters throughout
+		{
+			name:     "consecutive delimiters throughout input",
+			input:    "\n---\n---\n---\n",
+			wantLen:  0,
+			wantPrompts: nil,
+		},
+		// Mixed consecutive patterns
+		{
+			name:     "two delimiters, text, two more delimiters",
+			input:    "\n---\n---\ntext\n---\n---\n",
+			wantLen:  1,
+			wantPrompts: []string{"text"},
+		},
+		{
+			name:     "consecutive delimiters between valid splits",
+			input:    "First\n---\n---\nSecond\n---\n---\nThird",
+			wantLen:  3,
+			wantPrompts: []string{"First", "Second", "Third"},
 		},
 	}
 
