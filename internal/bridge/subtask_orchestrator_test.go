@@ -827,3 +827,97 @@ func TestSplitParallelPrompts_VeryLongSinglePrompt(t *testing.T) {
 		})
 	}
 }
+
+// TestSplitParallelPrompts_DelimiterPositionEdgeCases tests exact delimiter position patterns.
+// These tests cover the specific edge cases of delimiter at beginning/end without
+// surrounding newlines, and input that is only the delimiter.
+func TestSplitParallelPrompts_DelimiterPositionEdgeCases(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+	}{
+		{
+			name:        "delimiter at beginning of input",
+			input:       "---\ntext",
+			wantLen:     1,
+			wantPrompts: []string{"---\ntext"},
+		},
+		{
+			name:        "delimiter at end of input",
+			input:       "text\n---",
+			wantLen:     1,
+			wantPrompts: []string{"text\n---"},
+		},
+		{
+			name:        "only the delimiter",
+			input:       "---",
+			wantLen:     1,
+			wantPrompts: []string{"---"},
+		},
+		{
+			name:        "delimiter at beginning with multiple lines",
+			input:       "---\nfirst line\nsecond line",
+			wantLen:     1,
+			wantPrompts: []string{"---\nfirst line\nsecond line"},
+		},
+		{
+			name:        "delimiter at end with multiple lines",
+			input:       "first line\nsecond line\n---",
+			wantLen:     1,
+			wantPrompts: []string{"first line\nsecond line\n---"},
+		},
+		{
+			name:        "delimiter at both edges without surrounding newlines",
+			input:       "---\ntext\n---",
+			wantLen:     1,
+			wantPrompts: []string{"---\ntext\n---"},
+		},
+		{
+			name:        "multiple delimiters at beginning without leading newline",
+			input:       "---\n---\ntext",
+			wantLen:     2,
+			wantPrompts: []string{"---", "text"},
+		},
+		{
+			name:        "multiple delimiters at end without trailing newline",
+			input:       "text\n---\n---",
+			wantLen:     2,
+			wantPrompts: []string{"text", "---"},
+		},
+		{
+			name:        "valid delimiter after delimiter at beginning",
+			input:       "---\ntext\n---\nnext",
+			wantLen:     2,
+			wantPrompts: []string{"---\ntext", "next"},
+		},
+		{
+			name:        "valid delimiter before delimiter at end",
+			input:       "first\n---\nsecond\n---",
+			wantLen:     2,
+			wantPrompts: []string{"first", "second\n---"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			if len(prompts) != tt.wantLen {
+				t.Errorf("got %d prompts, want %d", len(prompts), tt.wantLen)
+			}
+			if tt.wantPrompts != nil && len(prompts) > 0 {
+				// Verify we got the expected prompts
+				for i, want := range tt.wantPrompts {
+					if i >= len(prompts) {
+						t.Errorf("expected prompt[%d] = %q but got only %d prompts", i, want, len(prompts))
+						break
+					}
+					if prompts[i] != want {
+						t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
+					}
+				}
+			}
+		})
+	}
+}
