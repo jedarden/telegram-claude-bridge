@@ -12,45 +12,45 @@ import (
 // Verifies fallback behavior: empty/whitespace inputs return 1 prompt (trimmed original) instead of 0.
 func TestSplitParallelPrompts_EmptyInputs(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantLen  int
+		name        string
+		input       string
+		wantLen     int
 		wantPrompts []string
 	}{
 		{
-			name:     "empty string returns empty prompt",
-			input:    "",
-			wantLen:  1,
+			name:        "empty string returns empty prompt",
+			input:       "",
+			wantLen:     1,
 			wantPrompts: []string{""},
 		},
 		{
-			name:     "single newline returns empty prompt",
-			input:    "\n",
-			wantLen:  1,
+			name:        "single newline returns empty prompt",
+			input:       "\n",
+			wantLen:     1,
 			wantPrompts: []string{""},
 		},
 		{
-			name:     "multiple newlines only returns empty prompt",
-			input:    "\n\n\n",
-			wantLen:  1,
+			name:        "multiple newlines only returns empty prompt",
+			input:       "\n\n\n",
+			wantLen:     1,
 			wantPrompts: []string{""},
 		},
 		{
-			name:     "spaces only returns empty prompt",
-			input:    "     ",
-			wantLen:  1,
+			name:        "spaces only returns empty prompt",
+			input:       "     ",
+			wantLen:     1,
 			wantPrompts: []string{""},
 		},
 		{
-			name:     "tabs and spaces returns empty prompt",
-			input:    "\t\t  \t  ",
-			wantLen:  1,
+			name:        "tabs and spaces returns empty prompt",
+			input:       "\t\t  \t  ",
+			wantLen:     1,
 			wantPrompts: []string{""},
 		},
 		{
-			name:     "mixed whitespace returns empty prompt",
-			input:    "   \n  \t\n   ",
-			wantLen:  1,
+			name:        "mixed whitespace returns empty prompt",
+			input:       "   \n  \t\n   ",
+			wantLen:     1,
 			wantPrompts: []string{""},
 		},
 	}
@@ -75,45 +75,45 @@ func TestSplitParallelPrompts_EmptyInputs(t *testing.T) {
 // TestSplitParallelPrompts_DelimiterAtEdges tests delimiters at start/end of input.
 func TestSplitParallelPrompts_DelimiterAtEdges(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantLen  int
+		name        string
+		input       string
+		wantLen     int
 		wantPrompts []string
 	}{
 		{
-			name:     "delimiter at start only",
-			input:    "\n---\nFirst prompt",
-			wantLen:  1,
+			name:        "delimiter at start only",
+			input:       "\n---\nFirst prompt",
+			wantLen:     1,
 			wantPrompts: []string{"First prompt"},
 		},
 		{
-			name:     "delimiter at end only",
-			input:    "First prompt\n---\n",
-			wantLen:  1,
+			name:        "delimiter at end only",
+			input:       "First prompt\n---\n",
+			wantLen:     1,
 			wantPrompts: []string{"First prompt"},
 		},
 		{
-			name:     "delimiter at both edges",
-			input:    "\n---\nFirst prompt\n---\n",
-			wantLen:  1,
+			name:        "delimiter at both edges",
+			input:       "\n---\nFirst prompt\n---\n",
+			wantLen:     1,
 			wantPrompts: []string{"First prompt"},
 		},
 		{
-			name:     "multiple delimiters at start",
-			input:    "\n---\n\n---\nFirst prompt",
-			wantLen:  1,
+			name:        "multiple delimiters at start",
+			input:       "\n---\n\n---\nFirst prompt",
+			wantLen:     1,
 			wantPrompts: []string{"First prompt"},
 		},
 		{
-			name:     "multiple delimiters at end",
-			input:    "First prompt\n---\n\n---\n",
-			wantLen:  1,
+			name:        "multiple delimiters at end",
+			input:       "First prompt\n---\n\n---\n",
+			wantLen:     1,
 			wantPrompts: []string{"First prompt"},
 		},
 		{
-			name:     "delimiter at start with whitespace",
-			input:    "   \n---\n  First prompt",
-			wantLen:  1,
+			name:        "delimiter at start with whitespace",
+			input:       "   \n---\n  First prompt",
+			wantLen:     1,
 			wantPrompts: []string{"First prompt"},
 		},
 	}
@@ -140,105 +140,105 @@ func TestSplitParallelPrompts_DelimiterAtEdges(t *testing.T) {
 // newlines between them: "\n---\n---\n" splits once, "\n---\n---\n" does not split twice.
 func TestSplitParallelPrompts_ConsecutiveDelimiters(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantLen  int
+		name        string
+		input       string
+		wantLen     int
 		wantPrompts []string
 	}{
 		// Consecutive delimiters in the middle (with text before and after)
 		{
-			name:     "two consecutive delimiters",
-			input:    "First\n---\n---\nSecond",
-			wantLen:  2,
+			name:        "two consecutive delimiters",
+			input:       "First\n---\n---\nSecond",
+			wantLen:     2,
 			wantPrompts: []string{"First", "---\nSecond"},
 		},
 		{
-			name:     "three consecutive delimiters",
-			input:    "First\n---\n---\n---\nSecond",
-			wantLen:  3,
+			name:        "three consecutive delimiters",
+			input:       "First\n---\n---\n---\nSecond",
+			wantLen:     3,
 			wantPrompts: []string{"First", "---", "Second"},
 		},
 		{
-			name:     "four consecutive delimiters",
-			input:    "A\n---\n---\n---\n---\nB",
-			wantLen:  3,
+			name:        "four consecutive delimiters",
+			input:       "A\n---\n---\n---\n---\nB",
+			wantLen:     3,
 			wantPrompts: []string{"A", "---", "---\nB"},
 		},
 		// Consecutive delimiters at the start
 		{
-			name:     "two consecutive delimiters at start",
-			input:    "\n---\n---\ntext",
-			wantLen:  1,
+			name:        "two consecutive delimiters at start",
+			input:       "\n---\n---\ntext",
+			wantLen:     1,
 			wantPrompts: []string{"text"},
 		},
 		{
-			name:     "three consecutive delimiters at start",
-			input:    "\n---\n---\n---\ntext",
-			wantLen:  1,
+			name:        "three consecutive delimiters at start",
+			input:       "\n---\n---\n---\ntext",
+			wantLen:     1,
 			wantPrompts: []string{"text"},
 		},
 		{
-			name:     "four consecutive delimiters at start",
-			input:    "\n---\n---\n---\n---\ntext",
-			wantLen:  1,
+			name:        "four consecutive delimiters at start",
+			input:       "\n---\n---\n---\n---\ntext",
+			wantLen:     1,
 			wantPrompts: []string{"text"},
 		},
 		// Consecutive delimiters at the end
 		{
-			name:     "two consecutive delimiters at end",
-			input:    "text\n---\n---\n",
-			wantLen:  1,
+			name:        "two consecutive delimiters at end",
+			input:       "text\n---\n---\n",
+			wantLen:     1,
 			wantPrompts: []string{"text"},
 		},
 		{
-			name:     "three consecutive delimiters at end",
-			input:    "text\n---\n---\n---\n",
-			wantLen:  1,
+			name:        "three consecutive delimiters at end",
+			input:       "text\n---\n---\n---\n",
+			wantLen:     1,
 			wantPrompts: []string{"text"},
 		},
 		{
-			name:     "four consecutive delimiters at end",
-			input:    "text\n---\n---\n---\n---\n",
-			wantLen:  1,
+			name:        "four consecutive delimiters at end",
+			input:       "text\n---\n---\n---\n---\n",
+			wantLen:     1,
 			wantPrompts: []string{"text"},
 		},
 		// Consecutive delimiters with whitespace between them
 		{
-			name:     "consecutive delimiters with whitespace",
-			input:    "First\n---\n  \n---\nSecond",
-			wantLen:  2,
+			name:        "consecutive delimiters with whitespace",
+			input:       "First\n---\n  \n---\nSecond",
+			wantLen:     2,
 			wantPrompts: []string{"First", "Second"},
 		},
 		{
-			name:     "consecutive delimiters with more whitespace",
-			input:    "First\n---\n   \t   \n---\nSecond",
-			wantLen:  2,
+			name:        "consecutive delimiters with more whitespace",
+			input:       "First\n---\n   \t   \n---\nSecond",
+			wantLen:     2,
 			wantPrompts: []string{"First", "Second"},
 		},
 		{
-			name:     "consecutive delimiters with whitespace at start",
-			input:    "\n---\n  \n---\ntext",
-			wantLen:  1,
+			name:        "consecutive delimiters with whitespace at start",
+			input:       "\n---\n  \n---\ntext",
+			wantLen:     1,
 			wantPrompts: []string{"text"},
 		},
 		// Consecutive delimiters throughout
 		{
-			name:     "consecutive delimiters throughout input",
-			input:    "\n---\n---\n---\n",
-			wantLen:  0,
+			name:        "consecutive delimiters throughout input",
+			input:       "\n---\n---\n---\n",
+			wantLen:     0,
 			wantPrompts: nil,
 		},
 		// Mixed consecutive patterns
 		{
-			name:     "two delimiters, text, two more delimiters",
-			input:    "\n---\n---\ntext\n---\n---\n",
-			wantLen:  1,
+			name:        "two delimiters, text, two more delimiters",
+			input:       "\n---\n---\ntext\n---\n---\n",
+			wantLen:     1,
 			wantPrompts: []string{"text"},
 		},
 		{
-			name:     "consecutive delimiters between valid splits",
-			input:    "First\n---\n---\nSecond\n---\n---\nThird",
-			wantLen:  3,
+			name:        "consecutive delimiters between valid splits",
+			input:       "First\n---\n---\nSecond\n---\n---\nThird",
+			wantLen:     3,
 			wantPrompts: []string{"First", "Second", "Third"},
 		},
 	}
@@ -268,39 +268,39 @@ func TestSplitParallelPrompts_ConsecutiveDelimiters(t *testing.T) {
 // The function only splits on exact "\n---\n", not on variants with extra whitespace.
 func TestSplitParallelPrompts_MixedDelimiterPatterns(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantLen  int
+		name        string
+		input       string
+		wantLen     int
 		wantPrompts []string
 	}{
 		{
-			name:     "spaces before delimiter",
-			input:    "First  \n ---\nSecond",
-			wantLen:  1,
+			name:        "spaces before delimiter",
+			input:       "First  \n ---\nSecond",
+			wantLen:     1,
 			wantPrompts: []string{"First  \n ---\nSecond"},
 		},
 		{
-			name:     "spaces after delimiter",
-			input:    "First\n---  \nSecond",
-			wantLen:  1,
+			name:        "spaces after delimiter",
+			input:       "First\n---  \nSecond",
+			wantLen:     1,
 			wantPrompts: []string{"First\n---  \nSecond"},
 		},
 		{
-			name:     "tabs around delimiter",
-			input:    "First\t\n---\t\nSecond",
-			wantLen:  1,
+			name:        "tabs around delimiter",
+			input:       "First\t\n---\t\nSecond",
+			wantLen:     1,
 			wantPrompts: []string{"First\t\n---\t\nSecond"},
 		},
 		{
-			name:     "no newline just dashes",
-			input:    "First---Second",
-			wantLen:  1,
+			name:        "no newline just dashes",
+			input:       "First---Second",
+			wantLen:     1,
 			wantPrompts: []string{"First---Second"},
 		},
 		{
-			name:     "different whitespace each time",
-			input:    "First\n ---\nSecond\n  ---\nThird\n\t---\nFourth",
-			wantLen:  1,
+			name:        "different whitespace each time",
+			input:       "First\n ---\nSecond\n  ---\nThird\n\t---\nFourth",
+			wantLen:     1,
 			wantPrompts: []string{"First\n ---\nSecond\n  ---\nThird\n\t---\nFourth"},
 		},
 	}
@@ -325,10 +325,10 @@ func TestSplitParallelPrompts_MixedDelimiterPatterns(t *testing.T) {
 // TestSplitParallelPrompts_UnicodeEdgeCases tests Unicode and emoji preservation edge cases.
 func TestSplitParallelPrompts_UnicodeEdgeCases(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantLen  int
-		verify   func([]string) bool
+		name    string
+		input   string
+		wantLen int
+		verify  func([]string) bool
 	}{
 		{
 			name:    "emoji throughout",
@@ -418,21 +418,21 @@ func TestSplitParallelPrompts_UnicodeEdgeCases(t *testing.T) {
 // TestSplitParallelPrompts_LongInputs tests handling of very long prompts.
 func TestSplitParallelPrompts_LongInputs(t *testing.T) {
 	tests := []struct {
-	 name       string
- input       string
- wantLen     int
- minPromptLen int
+		name         string
+		input        string
+		wantLen      int
+		minPromptLen int
 	}{
 		{
-			name:        "single long prompt (10000 chars)",
-			input:       strings.Repeat("This is a very long prompt. ", 357), // ~10008 chars
-			wantLen:     1,
+			name:         "single long prompt (10000 chars)",
+			input:        strings.Repeat("This is a very long prompt. ", 357), // ~10008 chars
+			wantLen:      1,
 			minPromptLen: 10000,
 		},
 		{
-			name: "two long prompts (5000 chars each)",
-			input: strings.Repeat("AAAA", 1250) + "\n---\n" + strings.Repeat("BBBB", 1250),
-			wantLen: 2,
+			name:         "two long prompts (5000 chars each)",
+			input:        strings.Repeat("AAAA", 1250) + "\n---\n" + strings.Repeat("BBBB", 1250),
+			wantLen:      2,
 			minPromptLen: 5000,
 		},
 		{
@@ -444,7 +444,7 @@ func TestSplitParallelPrompts_LongInputs(t *testing.T) {
 				strings.Repeat("D", 300),
 				strings.Repeat("E", 300),
 			}, "\n---\n"),
-			wantLen: 5,
+			wantLen:      5,
 			minPromptLen: 300,
 		},
 	}
@@ -467,10 +467,10 @@ func TestSplitParallelPrompts_LongInputs(t *testing.T) {
 // TestSplitParallelPrompts_WhitespacePreservation tests internal whitespace is preserved.
 func TestSplitParallelPrompts_WhitespacePreservation(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantLen  int
-		verify   func([]string) bool
+		name    string
+		input   string
+		wantLen int
+		verify  func([]string) bool
 	}{
 		{
 			name:    "multi-line prompt preserved",
@@ -523,10 +523,10 @@ func TestSplitParallelPrompts_WhitespacePreservation(t *testing.T) {
 // TestSplitParallelPrompts_SpecialCharsEdgeCases tests special characters in prompts edge cases.
 func TestSplitParallelPrompts_SpecialCharsEdgeCases(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantLen  int
-		verify   func([]string) bool
+		name    string
+		input   string
+		wantLen int
+		verify  func([]string) bool
 	}{
 		{
 			name:    "code blocks with backticks",
@@ -586,9 +586,9 @@ func TestSplitParallelPrompts_SpecialCharsEdgeCases(t *testing.T) {
 // TestSplitParallelPrompts_MaxPrompts tests the maximum practical limit.
 func TestSplitParallelPrompts_MaxPrompts(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantLen  int
+		name    string
+		input   string
+		wantLen int
 	}{
 		{
 			name:    "six prompts",
@@ -703,9 +703,9 @@ func TestSplitParallelPrompts_NonDelimiterDashes(t *testing.T) {
 // TestSplitParallelPrompts_EmptySegments tests that empty segments are filtered out.
 func TestSplitParallelPrompts_EmptySegments(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantLen  int
+		name    string
+		input   string
+		wantLen int
 	}{
 		{
 			name:    "empty segment between delimiters",
@@ -748,10 +748,10 @@ func TestSplitParallelPrompts_EmptySegments(t *testing.T) {
 // multiline content (where they should NOT split).
 func TestSplitParallelPrompts_DelimiterInContent(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantLen  int
-		verify   func([]string) bool
+		name    string
+		input   string
+		wantLen int
+		verify  func([]string) bool
 	}{
 		{
 			name:    "dashes within a code block",
@@ -797,10 +797,10 @@ func TestSplitParallelPrompts_DelimiterInContent(t *testing.T) {
 // adjacent to delimiters to ensure they're preserved correctly.
 func TestSplitParallelPrompts_UnicodeAtBoundaries(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantLen  int
-		verify   func([]string) bool
+		name    string
+		input   string
+		wantLen int
+		verify  func([]string) bool
 	}{
 		{
 			name:    "emoji immediately before delimiter",
@@ -862,8 +862,8 @@ func TestSplitParallelPrompts_UnicodeAtBoundaries(t *testing.T) {
 // TestSplitParallelPrompts_VeryLongSinglePrompt tests extremely long single prompts.
 func TestSplitParallelPrompts_VeryLongSinglePrompt(t *testing.T) {
 	tests := []struct {
-		name         string
-		minLength    int
+		name      string
+		minLength int
 	}{
 		{
 			name:      "1000 character prompt",
@@ -889,6 +889,189 @@ func TestSplitParallelPrompts_VeryLongSinglePrompt(t *testing.T) {
 			}
 			if len(prompts[0]) < tt.minLength {
 				t.Errorf("got prompt length %d, want >= %d", len(prompts[0]), tt.minLength)
+			}
+		})
+	}
+}
+
+// TestSplitParallelPrompts_WhitespaceAroundDelimiters tests whitespace preservation around delimiters.
+// These tests verify that whitespace BEFORE/AFTER delimiters prevents splitting (only exact "\n---\n"
+// is recognized), and that whitespace within segments is preserved (except outer trim).
+func TestSplitParallelPrompts_WhitespaceAroundDelimiters(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+		verify      func([]string) bool
+	}{
+		// Whitespace BEFORE delimiter (prevents split)
+		{
+			name:        "whitespace before delimiter - spaces",
+			input:       "text\n  ---\nmore",
+			wantLen:     1,
+			wantPrompts: []string{"text\n  ---\nmore"},
+		},
+		{
+			name:        "whitespace before delimiter - tabs",
+			input:       "text\n\t---\nmore",
+			wantLen:     1,
+			wantPrompts: []string{"text\n\t---\nmore"},
+		},
+		{
+			name:        "whitespace before delimiter - mixed",
+			input:       "text\n \t ---\nmore",
+			wantLen:     1,
+			wantPrompts: []string{"text\n \t ---\nmore"},
+		},
+		{
+			name:        "whitespace before delimiter - multiple lines with spaces",
+			input:       "first line\n  \n---\nmore text",
+			wantLen:     1,
+			wantPrompts: []string{"first line\n  \n---\nmore text"},
+		},
+		// Whitespace AFTER delimiter (prevents split)
+		{
+			name:        "whitespace after delimiter - spaces",
+			input:       "text\n---  \nmore",
+			wantLen:     1,
+			wantPrompts: []string{"text\n---  \nmore"},
+		},
+		{
+			name:        "whitespace after delimiter - tabs",
+			input:       "text\n---\t\nmore",
+			wantLen:     1,
+			wantPrompts: []string{"text\n---\t\nmore"},
+		},
+		{
+			name:        "whitespace after delimiter - mixed",
+			input:       "text\n--- \t \nmore",
+			wantLen:     1,
+			wantPrompts: []string{"text\n--- \t \nmore"},
+		},
+		{
+			name:        "whitespace after delimiter - multiple lines with spaces",
+			input:       "text\n---\n  \nmore text",
+			wantLen:     1,
+			wantPrompts: []string{"text\n---\n  \nmore text"},
+		},
+		// Whitespace AROUND delimiters (prevents split)
+		{
+			name:        "whitespace around delimiter - both sides",
+			input:       "text  \n --- \n  more",
+			wantLen:     1,
+			wantPrompts: []string{"text  \n --- \n  more"},
+		},
+		{
+			name:        "whitespace around delimiter - tabs",
+			input:       "text\t\n\t---\t\n\tmore",
+			wantLen:     1,
+			wantPrompts: []string{"text\t\n\t---\t\n\tmore"},
+		},
+		{
+			name:        "whitespace around delimiter - mixed space and tabs",
+			input:       "text \t\n \t---\t \n\t more",
+			wantLen:     1,
+			wantPrompts: []string{"text \t\n \t---\t \n\t more"},
+		},
+		// Leading/trailing whitespace in segments (trimmed by splitParallelPrompts)
+		{
+			name:        "leading whitespace in segment is trimmed",
+			input:       "  \n---\nnext",
+			wantLen:     1,
+			wantPrompts: []string{"next"},
+		},
+		{
+			name:        "trailing whitespace in segment is trimmed",
+			input:       "first\n---\n  ",
+			wantLen:     1,
+			wantPrompts: []string{"first"},
+		},
+		{
+			name:        "whitespace around both segments is trimmed",
+			input:       "  first  \n---\n  second  ",
+			wantLen:     2,
+			wantPrompts: []string{"first", "second"},
+		},
+		{
+			name:        "tabs around segments are trimmed",
+			input:       "\t\tfirst\t\t\n---\n\t\tsecond\t\t",
+			wantLen:     2,
+			wantPrompts: []string{"first", "second"},
+		},
+		// Internal whitespace is preserved
+		{
+			name:    "internal spaces in segment are preserved",
+			input:   "words with    spaces\n---\nnext",
+			wantLen: 2,
+			verify: func(prompts []string) bool {
+				return prompts[0] == "words with    spaces" && prompts[1] == "next"
+			},
+		},
+		{
+			name:    "internal tabs in segment are preserved",
+			input:   "col1\tcol2\tcol3\n---\nnext",
+			wantLen: 2,
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "\t") && prompts[0] == "col1\tcol2\tcol3"
+			},
+		},
+		{
+			name:    "internal newlines are preserved",
+			input:   "line1\nline2\nline3\n---\nnext",
+			wantLen: 2,
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "\n") && prompts[0] == "line1\nline2\nline3"
+			},
+		},
+		{
+			name:    "internal indentation is preserved",
+			input:   "  indented\n    more\n---\nnext",
+			wantLen: 2,
+			verify: func(prompts []string) bool {
+				return prompts[0] == "  indented\n    more"
+			},
+		},
+		// Mixed valid and invalid delimiters (whitespace prevents some splits)
+		{
+			name:        "valid delimiter then invalid (with whitespace)",
+			input:       "first\n---\nsecond\n ---\nthird",
+			wantLen:     2,
+			wantPrompts: []string{"first", "second\n ---\nthird"},
+		},
+		{
+			name:        "invalid delimiter (with whitespace) then valid",
+			input:       "first\n ---\nsecond\n---\nthird",
+			wantLen:     2,
+			wantPrompts: []string{"first\n ---\nsecond", "third"},
+		},
+		{
+			name:        "valid delimiters with whitespace between",
+			input:       "first\n---\n  \n---\nsecond",
+			wantLen:     2,
+			wantPrompts: []string{"first", "second"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			if len(prompts) != tt.wantLen {
+				t.Errorf("got %d prompts, want %d", len(prompts), tt.wantLen)
+			}
+			if tt.wantPrompts != nil && len(prompts) > 0 {
+				for i, want := range tt.wantPrompts {
+					if i >= len(prompts) {
+						t.Errorf("expected prompt[%d] = %q but got only %d prompts", i, want, len(prompts))
+						break
+					}
+					if prompts[i] != want {
+						t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
+					}
+				}
+			}
+			if tt.verify != nil && !tt.verify(prompts) {
+				t.Errorf("verification failed for prompts: %v", prompts)
 			}
 		})
 	}
