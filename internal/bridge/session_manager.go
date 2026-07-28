@@ -3278,6 +3278,23 @@ func (m *SessionManager) detectGeneratedMedia(cwd string, startTime time.Time, o
 			return nil
 		}
 
+		// Check for image files
+		if imageExts[ext] {
+			// Skip if already in the list
+			for _, img := range out.ImageFiles {
+				if img.Path == path {
+					return nil
+				}
+			}
+			out.ImageFiles = append(out.ImageFiles, imageAttachment{
+				Path:     path,
+				Filename: baseName,
+				Caption:  "", // No caption by default
+			})
+			log.Printf("[session_mgr] detected generated image file: %s", path)
+			return nil
+		}
+
 		return nil
 	})
 
