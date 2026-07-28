@@ -8,7 +8,8 @@ import (
 	"testing"
 )
 
-// TestSplitParallelPrompts_EmptyInputs tests empty and null-like inputs.
+// TestSplitParallelPrompts_EmptyInputs tests empty and whitespace-only inputs.
+// Verifies fallback behavior: empty/whitespace inputs return 1 prompt (trimmed original) instead of 0.
 func TestSplitParallelPrompts_EmptyInputs(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -17,40 +18,40 @@ func TestSplitParallelPrompts_EmptyInputs(t *testing.T) {
 		wantPrompts []string
 	}{
 		{
-			name:     "empty string",
+			name:     "empty string returns empty prompt",
 			input:    "",
-			wantLen:  0,
-			wantPrompts: nil,
+			wantLen:  1,
+			wantPrompts: []string{""},
 		},
 		{
-			name:     "single newline",
+			name:     "single newline returns empty prompt",
 			input:    "\n",
-			wantLen:  0,
-			wantPrompts: nil,
+			wantLen:  1,
+			wantPrompts: []string{""},
 		},
 		{
-			name:     "multiple newlines only",
+			name:     "multiple newlines only returns empty prompt",
 			input:    "\n\n\n",
-			wantLen:  0,
-			wantPrompts: nil,
+			wantLen:  1,
+			wantPrompts: []string{""},
 		},
 		{
-			name:     "spaces only",
+			name:     "spaces only returns empty prompt",
 			input:    "     ",
-			wantLen:  0,
-			wantPrompts: nil,
+			wantLen:  1,
+			wantPrompts: []string{""},
 		},
 		{
-			name:     "tabs and spaces",
+			name:     "tabs and spaces returns empty prompt",
 			input:    "\t\t  \t  ",
-			wantLen:  0,
-			wantPrompts: nil,
+			wantLen:  1,
+			wantPrompts: []string{""},
 		},
 		{
-			name:     "mixed whitespace",
+			name:     "mixed whitespace returns empty prompt",
 			input:    "   \n  \t\n   ",
-			wantLen:  0,
-			wantPrompts: nil,
+			wantLen:  1,
+			wantPrompts: []string{""},
 		},
 	}
 

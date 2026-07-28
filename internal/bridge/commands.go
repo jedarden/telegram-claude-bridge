@@ -2069,7 +2069,7 @@ func (h *CommandHandler) cmdParallel(ctx context.Context, update contract.Update
 }
 
 // splitParallelPrompts splits text by --- delimiter (surrounded by optional whitespace).
-// Empty prompts are filtered out.
+// Empty prompts are filtered out. If no prompts remain, returns a single prompt with the trimmed original text.
 func splitParallelPrompts(text string) []string {
 	// Split by --- on its own line (with optional surrounding whitespace)
 	parts := strings.Split(text, "\n---\n")
@@ -2079,6 +2079,10 @@ func splitParallelPrompts(text string) []string {
 		if prompt != "" {
 			prompts = append(prompts, prompt)
 		}
+	}
+	// Fallback to single prompt if all parts were empty/whitespace
+	if len(prompts) == 0 && len(parts) > 0 {
+		return []string{strings.TrimSpace(text)}
 	}
 	return prompts
 }
