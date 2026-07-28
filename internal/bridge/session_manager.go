@@ -228,7 +228,7 @@ var helpPhrases = []string{
 // colorPhrases is a table of known color-setting phrases with their target colors.
 // Checked case-insensitively; first match wins.
 type colorPhrase struct {
-	phrase     string
+	phrase      string
 	targetColor int
 }
 
@@ -396,15 +396,15 @@ type SessionManager struct {
 	eventPublisher events.Publishable
 	ptyMgr         *PTYManager
 
-	mu                    sync.Mutex
-	topics                map[topicKey]*topicWorker
-	pinnedUpdateLastSeen  map[topicKey]time.Time         // debounce: track last pinned msg update time
-	pendingContext        map[topicKey]string            // pending context to inject into next prompt
-	pendingWorkerResults  map[topicKey][]WorkerResult    // completed worker results to inject into next prompt
-	pendingTranscripts    map[topicKey]map[int64]string   // pending approved transcripts (messageID -> transcript) to inject into next prompt
-	activeInvocations     map[topicKey]*activeInvocation // tracks running commands for cancellation
-	approvalChans         map[topicKey]chan toolApproval // tool approval channels for plan mode
-	paneNames             map[topicKey]string            // topicKey → active tmux pane target
+	mu                   sync.Mutex
+	topics               map[topicKey]*topicWorker
+	pinnedUpdateLastSeen map[topicKey]time.Time         // debounce: track last pinned msg update time
+	pendingContext       map[topicKey]string            // pending context to inject into next prompt
+	pendingWorkerResults map[topicKey][]WorkerResult    // completed worker results to inject into next prompt
+	pendingTranscripts   map[topicKey]map[int64]string  // pending approved transcripts (messageID -> transcript) to inject into next prompt
+	activeInvocations    map[topicKey]*activeInvocation // tracks running commands for cancellation
+	approvalChans        map[topicKey]chan toolApproval // tool approval channels for plan mode
+	paneNames            map[topicKey]string            // topicKey → active tmux pane target
 }
 
 type topicKey struct {
@@ -475,17 +475,18 @@ func sessionToMap(sess *Session) map[string]interface{} {
 // the subprocess run; processBatch edits it with the final canonical text.
 // PlaceholderID is the "Thinking…" message ID for summary/quiet mode handling.
 type claudeOutput struct {
-	Type         string     `json:"type"`
-	SessionID    string     `json:"session_id"`
-	Result       string     `json:"result"`
-	IsError      bool       `json:"is_error"`
-	TotalCostUSD float64    `json:"total_cost_usd"`
-	Usage        *UsageInfo `json:"usage,omitempty"`
-	StreamMsgID  int64      // non-zero when streaming edits were posted
-	PlaceholderID int64     // non-zero when placeholder was sent (used in summary mode)
-	// File attachments for outbound media (audio/video)
+	Type          string     `json:"type"`
+	SessionID     string     `json:"session_id"`
+	Result        string     `json:"result"`
+	IsError       bool       `json:"is_error"`
+	TotalCostUSD  float64    `json:"total_cost_usd"`
+	Usage         *UsageInfo `json:"usage,omitempty"`
+	StreamMsgID   int64      // non-zero when streaming edits were posted
+	PlaceholderID int64      // non-zero when placeholder was sent (used in summary mode)
+	// File attachments for outbound media (audio/video/images)
 	AudioFiles []audioAttachment `json:"audio_files,omitempty"`
 	VideoFiles []videoAttachment `json:"video_files,omitempty"`
+	ImageFiles []imageAttachment `json:"image_files,omitempty"`
 }
 
 // audioAttachment represents an audio file to be sent to Telegram.
@@ -500,6 +501,13 @@ type videoAttachment struct {
 	Path     string // Path to the video file
 	Filename string // Filename to use when sending
 	Caption  string // Optional caption for the video
+}
+
+// imageAttachment represents an image file to be sent to Telegram.
+type imageAttachment struct {
+	Path     string // Path to the image file
+	Filename string // Filename to use when sending
+	Caption  string // Optional caption for the image
 }
 
 // streamLine is the envelope for each NDJSON line emitted by
@@ -2821,9 +2829,9 @@ func (m *SessionManager) SubmitApprovedTranscript(chatID, threadID int64, messag
 	// Create a synthetic update with the approved transcript as text
 	// This will be processed as if the user typed the transcript
 	syntheticUpdate := contract.Update{
-		UpdateID: int64(time.Now().UnixNano()),
-		ChatID:   chatID,
-		ThreadID: &threadID,
+		UpdateID:  int64(time.Now().UnixNano()),
+		ChatID:    chatID,
+		ThreadID:  &threadID,
 		MessageID: messageID,
 		Content: &contract.Content{
 			Type: contract.ContentTypeText,
