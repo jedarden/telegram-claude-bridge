@@ -330,7 +330,7 @@ func TestProcessAudio_Args(t *testing.T) {
 			// Verify command was called with correct name
 			assert.Equal(t, tt.wantCmdName, capturedCmd.name, "command name should be whisper")
 
-			// Verify command structure: whisper [audioPath] --model turbo --output_format txt --output_dir [chatDir]
+			// Verify command structure: whisper audioPath --model turbo --output_format txt --output_dir chatDir
 			// args contains: [audioPath, "--model", "turbo", "--output_format", "txt", "--output_dir", chatDir]
 			assert.Len(t, capturedCmd.args, 7, "whisper command should have 7 arguments")
 			assert.Equal(t, "--model", capturedCmd.args[1], "second arg should be --model")
