@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -43,7 +42,7 @@ func (m *SessionManager) processAudio(
 	txtPath := filepath.Join(dir, stem+".txt")
 	cleanupPaths = append(cleanupPaths, txtPath)
 
-	cmd := exec.CommandContext(ctx, "whisper",
+	cmd := m.commandExec.CommandContext(ctx, "whisper",
 		audioPath,
 		"--model", "turbo",
 		"--output_format", "txt",
