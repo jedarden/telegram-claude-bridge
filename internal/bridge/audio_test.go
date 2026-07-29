@@ -35,8 +35,13 @@ func (m *mockCommandExec) addCommand(key string, cmd command) {
 }
 
 func (m *mockCommandExec) CommandContext(ctx context.Context, name string, args ...string) command {
+	// Try exact match first
 	key := commandKey(name, args...)
 	if cmd, ok := m.commands[key]; ok {
+		return cmd
+	}
+	// Try command name only match (for wildcard mocking)
+	if cmd, ok := m.commands[name]; ok {
 		return cmd
 	}
 	return &mockCommand{err: fmt.Errorf("no mock for command: %s", key)}
@@ -820,6 +825,369 @@ func TestCleanupPathTracking(t *testing.T) {
 			if cleanupPaths[1] != txtPath {
 				t.Errorf("second cleanup path: got %q, want %q", cleanupPaths[1], txtPath)
 			}
+		})
+	}
+}
+
+// ── processAudio Error Path Tests ─────────────────────────────────────────────
+
+func TestProcessAudio_ErrorPaths(t *testing.T) {
+	t.Run("whisper binary not found", func(t *testing.T) {
+		ctx := context.Background()
+		db := openTestDB(t)
+		defer db.Close()
+
+		chatID := int64(12345)
+		messageID := int64(67890)
+		fileID := "voice_123"
+
+		// Create the directory that processAudio will use
+		testChatDir := filepath.Join(imageTempDir, fmt.Sprintf("%d", chatID))
+		require.NoError(t, os.MkdirAll(testChatDir, 0o755), "create chat directory")
+		t.Cleanup(func() { os.RemoveAll(testChatDir) })
+
+		// Create mock command exec that simulates Whisper binary not found
+		mockExec := newMockCommandExec()
+		mockExec.addCommand("whisper", &mockCommand{
+			output: []byte("whisper: command not found"),
+			err:    &exec.Error{Name: "whisper", Err: exec.ErrNotFound},
+		})
+
+		// Create test HTTP server - serve downloads successfully
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/file/") {
+				w.Header().Set("Content-Type", "audio/ogg")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("fake audio data"))
+			}
+		}))
+		defer server.Close()
+
+		sender, err := NewSender(server.URL, filepath.Join(t.TempDir(), "sender.db"))
+		require.NoError(t, err, "failed to create sender")
+		t.Cleanup(func() { sender.Close() })
+
+		sm := &SessionManager{
+			db:          db,
+			sender:      sender,
+			proxyURL:    server.URL,
+			commandExec: mockExec,
+		}
+
+		mime := "audio/ogg"
+		content := &contract.Content{
+			Type:     contract.ContentTypeVoice,
+			FileID:   &fileID,
+			MimeType: &mime,
+		}
+
+		_, cleanupPaths, err := sm.processAudio(ctx, chatID, messageID, content)
+
+		// Verify error occurred
+		assert.Error(t, err, "processAudio should return error")
+		assert.Contains(t, err.Error(), "whisper:", "error message should mention whisper")
+
+		// Verify cleanup paths are returned (both audio and txt paths tracked before Whisper runs)
+		assert.Len(t, cleanupPaths, 2, "should track both cleanup paths on error")
+	})
+
+	t.Run("whisper command execution error", func(t *testing.T) {
+		ctx := context.Background()
+		db := openTestDB(t)
+		defer db.Close()
+
+		chatID := int64(12345)
+		messageID := int64(67890)
+		fileID := "voice_456"
+
+		// Create the directory that processAudio will use
+		testChatDir := filepath.Join(imageTempDir, fmt.Sprintf("%d", chatID))
+		require.NoError(t, os.MkdirAll(testChatDir, 0o755), "create chat directory")
+		t.Cleanup(func() { os.RemoveAll(testChatDir) })
+
+		// Create mock command exec that simulates Whisper execution error
+		mockExec := newMockCommandExec()
+		mockExec.addCommand("whisper", &mockCommand{
+			output: []byte("whisper: audio format not supported"),
+			err:    fmt.Errorf("whisper processing failed"),
+		})
+
+		// Create test HTTP server - serve downloads successfully
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/file/") {
+				w.Header().Set("Content-Type", "audio/ogg")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("fake audio data"))
+			}
+		}))
+		defer server.Close()
+
+		sender, err := NewSender(server.URL, filepath.Join(t.TempDir(), "sender.db"))
+		require.NoError(t, err, "failed to create sender")
+		t.Cleanup(func() { sender.Close() })
+
+		sm := &SessionManager{
+			db:          db,
+			sender:      sender,
+			proxyURL:    server.URL,
+			commandExec: mockExec,
+		}
+
+		mime := "audio/ogg"
+		content := &contract.Content{
+			Type:     contract.ContentTypeVoice,
+			FileID:   &fileID,
+			MimeType: &mime,
+		}
+
+		_, cleanupPaths, err := sm.processAudio(ctx, chatID, messageID, content)
+
+		// Verify error occurred
+		assert.Error(t, err, "processAudio should return error")
+		assert.Contains(t, err.Error(), "whisper:", "error message should mention whisper")
+
+		// Verify cleanup paths are returned (both audio and txt paths tracked before Whisper runs)
+		assert.Len(t, cleanupPaths, 2, "should track both cleanup paths on error")
+	})
+
+	t.Run("download failure", func(t *testing.T) {
+		ctx := context.Background()
+		db := openTestDB(t)
+		defer db.Close()
+
+		chatID := int64(12345)
+		messageID := int64(67890)
+		fileID := "audio_789"
+
+		// Create mock command exec
+		mockExec := newMockCommandExec()
+
+		// Create test HTTP server - fail downloads
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/file/") {
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte("download failed"))
+			}
+		}))
+		defer server.Close()
+
+		sender, err := NewSender(server.URL, filepath.Join(t.TempDir(), "sender.db"))
+		require.NoError(t, err, "failed to create sender")
+		t.Cleanup(func() { sender.Close() })
+
+		sm := &SessionManager{
+			db:          db,
+			sender:      sender,
+			proxyURL:    server.URL,
+			commandExec: mockExec,
+		}
+
+		mime := "audio/mpeg"
+		content := &contract.Content{
+			Type:     contract.ContentTypeAudio,
+			FileID:   &fileID,
+			MimeType: &mime,
+		}
+
+		_, cleanupPaths, err := sm.processAudio(ctx, chatID, messageID, content)
+
+		// Verify error occurred
+		assert.Error(t, err, "processAudio should return error")
+		assert.Contains(t, err.Error(), "download audio:", "error message should mention download")
+
+		// Verify no cleanup paths on download failure
+		assert.Len(t, cleanupPaths, 0, "should have no cleanup paths on download failure")
+	})
+}
+
+func TestProcessAudio_InvalidOutput(t *testing.T) {
+	// Test behavior when Whisper output file cannot be read
+	t.Run("transcription file read failure", func(t *testing.T) {
+		ctx := context.Background()
+		db := openTestDB(t)
+		defer db.Close()
+
+		chatID := int64(12345)
+		messageID := int64(67890)
+		fileID := "voice_readfail"
+
+		// Create the directory that processAudio will use
+		testChatDir := filepath.Join(imageTempDir, fmt.Sprintf("%d", chatID))
+		require.NoError(t, os.MkdirAll(testChatDir, 0o755), "create chat directory")
+		t.Cleanup(func() { os.RemoveAll(testChatDir) })
+
+		// Create mock command exec that succeeds but doesn't create output file
+		mockExec := newMockCommandExec()
+		mockExec.addCommand(
+			commandKey("whisper", filepath.Join(testChatDir, fmt.Sprintf("%d.ogg", messageID)), "--model", "turbo", "--output_format", "txt", "--output_dir", testChatDir),
+			&mockCommand{
+				output: []byte("whisper processing complete"),
+				err:    nil,
+			},
+		)
+
+		// Create test HTTP server
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/file/") {
+				w.Header().Set("Content-Type", "audio/ogg")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("fake audio data"))
+			}
+		}))
+		defer server.Close()
+
+		sender, err := NewSender(server.URL, filepath.Join(t.TempDir(), "sender.db"))
+		require.NoError(t, err, "failed to create sender")
+		t.Cleanup(func() { sender.Close() })
+
+		sm := &SessionManager{
+			db:          db,
+			sender:      sender,
+			proxyURL:    server.URL,
+			commandExec: mockExec,
+		}
+
+		mime := "audio/ogg"
+		content := &contract.Content{
+			Type:     contract.ContentTypeVoice,
+			FileID:   &fileID,
+			MimeType: &mime,
+		}
+
+		_, cleanupPaths, err := sm.processAudio(ctx, chatID, messageID, content)
+
+		// Verify error occurred
+		assert.Error(t, err, "processAudio should return error when transcription file is missing")
+		assert.Contains(t, err.Error(), "read transcription", "error should mention reading transcription")
+
+		// Verify cleanup paths are returned even on error
+		assert.Len(t, cleanupPaths, 2, "should track both cleanup paths on error")
+
+		// Verify audio file path is in cleanup
+		expectedAudioPath := filepath.Join(testChatDir, fmt.Sprintf("%d.ogg", messageID))
+		assert.Contains(t, cleanupPaths, expectedAudioPath, "audio path should be in cleanup")
+	})
+}
+
+func TestProcessAudio_TranscriptionParsing(t *testing.T) {
+	// Test successful transcription result parsing with various Whisper outputs
+	tests := []struct {
+		name          string
+		transcription string // content written to .txt file
+		expectedText  string // expected parsed result
+	}{
+		{
+			name:          "simple transcription",
+			transcription: "Hello world, this is a test transcription.",
+			expectedText:  "Hello world, this is a test transcription.",
+		},
+		{
+			name:          "transcription with leading/trailing whitespace",
+			transcription: "  \n\n  Text with spaces  \n  ",
+			expectedText:  "Text with spaces",
+		},
+		{
+			name:          "transcription with newlines preserved",
+			transcription: "Line one\nLine two\nLine three",
+			expectedText:  "Line one\nLine two\nLine three",
+		},
+		{
+			name:          "transcription with tabs",
+			transcription: "\tTabbed text\t",
+			expectedText:  "Tabbed text",
+		},
+		{
+			name:          "empty transcription",
+			transcription: "",
+			expectedText:  "",
+		},
+		{
+			name:          "whitespace only transcription",
+			transcription: "   \n\t\n   ",
+			expectedText:  "",
+		},
+		{
+			name:          "multilingual transcription",
+			transcription: "Hello 你好 مرحبا",
+			expectedText:  "Hello 你好 مرحبا",
+		},
+		{
+			name:          "transcription with punctuation",
+			transcription: "Hello! How are you? I'm fine.",
+			expectedText:  "Hello! How are you? I'm fine.",
+		},
+		{
+			name:          "transcription with numbers",
+			transcription: "The answer is 42. The date is 2024-07-29.",
+			expectedText:  "The answer is 42. The date is 2024-07-29.",
+		},
+		{
+			name:          "transcription with special characters",
+			transcription: "Special chars: @#$%^&*()_+-=[]{}|;':\",./<>?",
+			expectedText:  "Special chars: @#$%^&*()_+-=[]{}|;':\",./<>?",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openTestDB(t)
+			defer db.Close()
+
+			chatID := int64(12345)
+			messageID := int64(67890)
+			fileID := "voice_success"
+
+			// Create the directory that processAudio will use
+			testChatDir := filepath.Join(imageTempDir, fmt.Sprintf("%d", chatID))
+			require.NoError(t, os.MkdirAll(testChatDir, 0o755), "create chat directory")
+			t.Cleanup(func() { os.RemoveAll(testChatDir) })
+
+			// Create mock command exec that creates output file
+			mockExec := newMockCommandExec()
+			audioPath := filepath.Join(testChatDir, fmt.Sprintf("%d.ogg", messageID))
+
+			mockExec.addCommand(
+				commandKey("whisper", audioPath, "--model", "turbo", "--output_format", "txt", "--output_dir", testChatDir),
+				createMockWhisperSuccess(t, testChatDir, fmt.Sprintf("%d", messageID), tt.transcription),
+			)
+
+			// Create test HTTP server
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/file/") {
+					w.Header().Set("Content-Type", "audio/ogg")
+					w.WriteHeader(http.StatusOK)
+					w.Write([]byte("fake audio data"))
+				}
+			}))
+			defer server.Close()
+
+			sender, err := NewSender(server.URL, filepath.Join(t.TempDir(), "sender.db"))
+			require.NoError(t, err, "failed to create sender")
+			t.Cleanup(func() { sender.Close() })
+
+			sm := &SessionManager{
+				db:          db,
+				sender:      sender,
+				proxyURL:    server.URL,
+				commandExec: mockExec,
+			}
+
+			mime := "audio/ogg"
+			content := &contract.Content{
+				Type:     contract.ContentTypeVoice,
+				FileID:   &fileID,
+				MimeType: &mime,
+			}
+
+			transcription, cleanupPaths, err := sm.processAudio(ctx, chatID, messageID, content)
+
+			// Verify success
+			assert.NoError(t, err, "processAudio should succeed")
+			assert.Equal(t, tt.expectedText, transcription, "transcription should match expected result")
+
+			// Verify cleanup paths are tracked
+			assert.Len(t, cleanupPaths, 2, "should track 2 cleanup paths")
 		})
 	}
 }
