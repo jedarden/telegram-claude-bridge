@@ -65,10 +65,10 @@ func (m *mockCommand) Run() error {
 
 // testAudioContext holds common test dependencies for audio tests.
 type testAudioContext struct {
-	ctx        context.Context
-	tempDir    string
-	chatID     int64
-	messageID  int64
+	ctx       context.Context
+	tempDir   string
+	chatID    int64
+	messageID int64
 }
 
 // newTestAudioContext creates a fresh test context for audio tests.
@@ -79,10 +79,10 @@ func newTestAudioContext(t *testing.T) testAudioContext {
 	tempDir := t.TempDir()
 
 	return testAudioContext{
-		ctx:        ctx,
-		tempDir:    tempDir,
-		chatID:     12345,
-		messageID:  67890,
+		ctx:       ctx,
+		tempDir:   tempDir,
+		chatID:    12345,
+		messageID: 67890,
 	}
 }
 
@@ -327,7 +327,7 @@ func TestProcessAudio_Args(t *testing.T) {
 			transcription: "Negative chat ID transcription.",
 			wantCmdName:   "whisper",
 		},
-			{
+		{
 			name:          "whisper with special characters in chat ID path",
 			chatID:        54321,
 			messageID:     100,
@@ -336,8 +336,8 @@ func TestProcessAudio_Args(t *testing.T) {
 			fileID:        "voice_special_chars",
 			transcription: "Special characters path test.",
 			wantCmdName:   "whisper",
-			},
-			{
+		},
+		{
 			name:          "whisper with simple /tmp/test.ogg path",
 			chatID:        99999,
 			messageID:     777,
@@ -346,8 +346,8 @@ func TestProcessAudio_Args(t *testing.T) {
 			fileID:        "voice_simple_path",
 			transcription: "Simple path transcription test.",
 			wantCmdName:   "whisper",
-			},
-			{
+		},
+		{
 			name:          "whisper with complex path separators",
 			chatID:        88888,
 			messageID:     555,
@@ -356,8 +356,8 @@ func TestProcessAudio_Args(t *testing.T) {
 			fileID:        "audio_complex_path",
 			transcription: "Complex path separators test.",
 			wantCmdName:   "whisper",
-			},
-			{
+		},
+		{
 			name:          "whisper with unicode characters in path",
 			chatID:        77777,
 			messageID:     333,
@@ -366,7 +366,7 @@ func TestProcessAudio_Args(t *testing.T) {
 			fileID:        "voice_unicode",
 			transcription: "Unicode characters path test.",
 			wantCmdName:   "whisper",
-			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -591,11 +591,11 @@ func TestWhisperArgs(t *testing.T) {
 func TestWhisperOutputPaths(t *testing.T) {
 	// Test that output file paths are constructed correctly
 	tests := []struct {
-		name           string
-		messageID      int64
-		dir            string
-		expectedTxt    string
-		expectedAudio  string
+		name          string
+		messageID     int64
+		dir           string
+		expectedTxt   string
+		expectedAudio string
 	}{
 		{
 			name:          "standard path construction",
@@ -640,10 +640,10 @@ func TestTranscriptionParsing(t *testing.T) {
 	// Test parsing of transcription results from whisper output
 
 	tests := []struct {
-		name          string
-		rawOutput     string
-		expectedText  string
-		shouldTrim    bool
+		name         string
+		rawOutput    string
+		expectedText string
+		shouldTrim   bool
 	}{
 		{
 			name:         "simple transcription",
@@ -752,10 +752,10 @@ func TestCleanupPathTracking(t *testing.T) {
 	// Test that cleanup paths are correctly tracked for removal
 
 	tests := []struct {
-		name           string
-		messageID      int64
-		chatID         int64
-		expectedPaths  int
+		name          string
+		messageID     int64
+		chatID        int64
+		expectedPaths int
 	}{
 		{
 			name:          "audio and txt files tracked",
