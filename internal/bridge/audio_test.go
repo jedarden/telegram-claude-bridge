@@ -832,6 +832,65 @@ func TestCleanupPathTracking(t *testing.T) {
 // ── processAudio Error Path Tests ─────────────────────────────────────────────
 
 func TestProcessAudio_ErrorPaths(t *testing.T) {
+	t.Run("mkdir failure", func(t *testing.T) {
+		ctx := context.Background()
+		db := openTestDB(t)
+		defer db.Close()
+
+		chatID := int64(12345)
+		messageID := int64(67890)
+		fileID := "voice_mkdir_fail"
+
+		// Create mock command exec (won't be reached due to mkdir failure)
+		mockExec := newMockCommandExec()
+
+		// Create test HTTP server (won't be reached due to mkdir failure)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/file/") {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("fake audio data"))
+			}
+		}))
+		defer server.Close()
+
+		sender, err := NewSender(server.URL, filepath.Join(t.TempDir(), "sender.db"))
+		require.NoError(t, err, "failed to create sender")
+		t.Cleanup(func() { sender.Close() })
+
+		sm := &SessionManager{
+			db:          db,
+			sender:      sender,
+			proxyURL:    server.URL,
+			commandExec: mockExec,
+		}
+
+		mime := "audio/ogg"
+		content := &contract.Content{
+			Type:     contract.ContentTypeVoice,
+			FileID:   &fileID,
+			MimeType: &mime,
+		}
+
+		// Make imageTempDir read-only to force mkdir failure
+		originalMode, err := os.Stat(imageTempDir)
+		require.NoError(t, err, "stat imageTempDir")
+
+		// Make imageTempDir read-only
+		os.Chmod(imageTempDir, 0o444)
+		t.Cleanup(func() {
+			os.Chmod(imageTempDir, originalMode.Mode()) // restore permissions
+		})
+
+		_, cleanupPaths, err := sm.processAudio(ctx, chatID, messageID, content)
+
+		// Verify error occurred
+		assert.Error(t, err, "processAudio should return error on mkdir failure")
+		assert.Contains(t, err.Error(), "mkdir", "error message should mention mkdir")
+
+		// Verify no cleanup paths on mkdir failure (nothing created yet)
+		assert.Len(t, cleanupPaths, 0, "should have no cleanup paths on mkdir failure")
+	})
+
 	t.Run("whisper binary not found", func(t *testing.T) {
 		ctx := context.Background()
 		db := openTestDB(t)
