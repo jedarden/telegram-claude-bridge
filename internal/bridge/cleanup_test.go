@@ -14,8 +14,9 @@ func TestNewSessionCleanup(t *testing.T) {
 	interval := 1 * time.Hour
 	ttl := 7 * 24 * time.Hour
 	closeTopics := true
+	workerTTL := 5 * time.Minute
 
-	sc := NewSessionCleanup(db, sender, ptyMgr, interval, ttl, closeTopics)
+	sc := NewSessionCleanup(db, sender, ptyMgr, interval, ttl, closeTopics, workerTTL)
 
 	if sc == nil {
 		t.Fatal("NewSessionCleanup() returned nil")
@@ -87,7 +88,7 @@ func TestNewSessionCleanupConfigurations(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			sc := NewSessionCleanup(&DB{}, &Sender{}, &PTYManager{}, tc.interval, tc.ttl, tc.closeTopics)
+			sc := NewSessionCleanup(&DB{}, &Sender{}, &PTYManager{}, tc.interval, tc.ttl, tc.closeTopics, 5*time.Minute)
 
 			if sc.interval != tc.interval {
 				t.Errorf("interval = %v, want %v", sc.interval, tc.interval)
@@ -106,7 +107,7 @@ func TestNewSessionCleanupConfigurations(t *testing.T) {
 
 func TestNewSessionCleanupNilDependencies(t *testing.T) {
 	// Constructor should accept nil dependencies for testing purposes
-	sc := NewSessionCleanup(nil, nil, nil, 1*time.Hour, 24*time.Hour, false)
+	sc := NewSessionCleanup(nil, nil, nil, 1*time.Hour, 24*time.Hour, false, 5*time.Minute)
 
 	if sc.db != nil {
 		t.Error("db should be nil")
@@ -159,7 +160,7 @@ func TestSessionCleanupTTLValues(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			sc := NewSessionCleanup(&DB{}, &Sender{}, &PTYManager{}, 1*time.Hour, tc.ttl, false)
+			sc := NewSessionCleanup(&DB{}, &Sender{}, &PTYManager{}, 1*time.Hour, tc.ttl, false, 5*time.Minute)
 
 			if sc.ttl != tc.expected {
 				t.Errorf("ttl = %v, want %v", sc.ttl, tc.expected)
@@ -187,7 +188,7 @@ func TestSessionCleanupCloseTopicsFlag(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			sc := NewSessionCleanup(&DB{}, &Sender{}, &PTYManager{}, 1*time.Hour, 24*time.Hour, tc.closeTopics)
+			sc := NewSessionCleanup(&DB{}, &Sender{}, &PTYManager{}, 1*time.Hour, 24*time.Hour, tc.closeTopics, 5*time.Minute)
 
 			if sc.closeTopics != tc.closeTopics {
 				t.Errorf("closeTopics = %v, want %v", sc.closeTopics, tc.closeTopics)
@@ -199,7 +200,7 @@ func TestSessionCleanupCloseTopicsFlag(t *testing.T) {
 // ── SessionCleanup done channel initialization ───────────────────────────────
 
 func TestSessionCleanupDoneChannel(t *testing.T) {
-	sc := NewSessionCleanup(&DB{}, &Sender{}, &PTYManager{}, 10*time.Millisecond, 1*time.Hour, false)
+	sc := NewSessionCleanup(&DB{}, &Sender{}, &PTYManager{}, 10*time.Millisecond, 1*time.Hour, false, 5*time.Minute)
 
 	// done channel should exist and be buffered
 	if sc.done == nil {
@@ -222,7 +223,7 @@ func TestSessionCleanupFields(t *testing.T) {
 	ttl := 14 * 24 * time.Hour
 	closeTopics := true
 
-	sc := NewSessionCleanup(&DB{}, &Sender{}, &PTYManager{}, interval, ttl, closeTopics)
+	sc := NewSessionCleanup(&DB{}, &Sender{}, &PTYManager{}, interval, ttl, closeTopics, 5*time.Minute)
 
 	// Verify all fields are set correctly
 	if sc.interval != interval {
@@ -248,7 +249,7 @@ func TestSessionCleanupFields(t *testing.T) {
 // ── SessionCleanup zero vs non-zero values ───────────────────────────────────
 
 func TestSessionCleanupZeroValues(t *testing.T) {
-	sc := NewSessionCleanup(nil, nil, nil, 0, 0, false)
+	sc := NewSessionCleanup(nil, nil, nil, 0, 0, false, 5*time.Minute)
 
 	if sc.interval != 0 {
 		t.Errorf("interval should be 0, got %v", sc.interval)
