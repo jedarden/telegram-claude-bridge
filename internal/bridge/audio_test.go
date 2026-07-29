@@ -367,6 +367,16 @@ func TestProcessAudio_Args(t *testing.T) {
 			transcription: "Unicode characters path test.",
 			wantCmdName:   "whisper",
 		},
+		{
+			name:          "whisper with simple path pattern /tmp/test.ogg equivalent",
+			chatID:        0,
+			messageID:     1,
+			contentType:   contract.ContentTypeVoice,
+			mimeType:      "audio/ogg",
+			fileID:        "voice_simple_test",
+			transcription: "Simple path test - minimal chat and message IDs.",
+			wantCmdName:   "whisper",
+		},
 	}
 
 	for _, tt := range tests {

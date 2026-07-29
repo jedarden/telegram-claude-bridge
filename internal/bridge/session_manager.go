@@ -395,6 +395,7 @@ type SessionManager struct {
 	workerPool     *WorkerPool
 	eventPublisher events.Publishable
 	ptyMgr         *PTYManager
+	commandExec    commandExec // for executing external commands (whisper, ffmpeg, etc.)
 
 	mu                   sync.Mutex
 	topics               map[topicKey]*topicWorker
@@ -615,6 +616,7 @@ func NewSessionManager(db *DB, sender *Sender, proxyURL string, eventPublisher e
 		proxyURL:             proxyURL,
 		eventPublisher:       eventPublisher,
 		ptyMgr:               NewPTYManager(),
+		commandExec:          realCommandExec{},
 		topics:               make(map[topicKey]*topicWorker),
 		pinnedUpdateLastSeen: make(map[topicKey]time.Time),
 		pendingContext:       make(map[topicKey]string),
