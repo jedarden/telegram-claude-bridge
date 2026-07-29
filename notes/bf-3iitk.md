@@ -264,9 +264,86 @@ This is less clean because it requires global state management.
 
 ---
 
-## Similar Patterns in the Codebase
+## Other Mock/Testing Patterns in the Codebase
 
-### 1. Sender Mock Pattern
+### 1. Real Execution Helpers (updater_test.go)
+
+**Pattern:** Execute real git commands in test helpers for acceptance testing
+
+```go
+// Helper function that executes real git commands
+func runGitCommand(t *testing.T, dir string, args ...string) {
+    t.Helper()
+
+    cmd := exec.Command("git", args...)
+    cmd.Dir = dir
+    output, err := cmd.CombinedOutput()
+    if err != nil {
+        t.Fatalf("git %v failed: %v\n%s", args, err, string(output))
+    }
+}
+
+// Test repository setup
+func initTestRepo(t *testing.T, tempDir string) {
+    runGitCommand(t, tempDir, "init")
+    runGitCommand(t, tempDir, "config", "user.name", "Test User")
+}
+```
+
+**Use case:** Git operations in updater tests  
+**Status:** Working - uses real git in isolated test repos
+
+### 2. Command Capture and Validation (pty_manager_test.go)
+
+**Pattern:** Validate command structure without actual execution
+
+```go
+// Mock structure to capture intended commands
+type mockExecCommand struct {
+    cmd  string
+    args []string
+}
+
+// Test validates command structure matches expectations
+func TestTmuxCommandCapture(t *testing.T) {
+    tests := []struct {
+        name         string
+        wantCmd      string
+        wantArgs     []string
+    }{
+        {
+            name:     "spawn pane command",
+            wantCmd:  "tmux",
+            wantArgs: []string{"new-window", "-t", "telegram-bridge", "-n", "t100-120"},
+        },
+    }
+
+    for _, tt := range tests {
+        // Validate command construction logic
+        // No actual execution
+    }
+}
+```
+
+**Use case:** tmux command testing  
+**Status:** Working - documentation-focused validation
+
+### 3. Untested Production Code
+
+The following files use `exec.Command` directly with **NO test coverage**:
+
+- **`internal/bridge/video.go`** - ffmpeg for keyframe/audio extraction, whisper for transcription
+- **`internal/bridge/background_jobs.go`** - shell command execution
+- **`internal/bridge/pty_manager.go`** - tmux commands
+- **`internal/bridge/cleanup.go`** - tmux list-panes
+
+These would benefit from applying the interface-based pattern once it's integrated.
+
+---
+
+## Dependency Injection Patterns Already in Use
+
+### Sender Mock Pattern
 
 The `Sender` struct (proxy client) is already injected via a field:
 
@@ -282,7 +359,7 @@ Tests create mock senders:
 sender, err := NewSender(server.URL, filepath.Join(t.TempDir(), "sender.db"))
 ```
 
-### 2. Event Publisher Mock Pattern
+### Event Publisher Mock Pattern
 
 Uses a `Publishable` interface with a `NullPublisher` fallback (bf-2co6 learning):
 
@@ -378,3 +455,26 @@ type mockCommandExec struct { ... }
 📋 **Work remaining:** Update `audio.go` and `video.go` to use the field instead of direct `exec.CommandContext` calls
 
 The pattern is solid and comprehensive. It just needs the final integration step to be functional.
+
+---
+
+## Complete Pattern Summary
+
+| Pattern | File(s) | Status | Use Case |
+|---------|---------|--------|----------|
+| **Interface injection** | `audio_test.go` | ⚠️ **Broken** (field missing) | Whisper transcription |
+| **Real execution helpers** | `updater_test.go` | ✅ Working | Git operations |
+| **Command validation** | `pty_manager_test.go` | ✅ Working | tmux commands |
+| **No mocking** | `video.go`, `background_jobs.go`, `cleanup.go`, `pty_manager.go` | ❌ Untested | ffmpeg, shell, tmux |
+
+---
+
+## Key Takeaway
+
+**The codebase lacks a consistent, working pattern for subprocess testing.** The most sophisticated pattern (interface-based injection in `audio_test.go`) is **not integrated** into the production code, and most external command execution has **no test coverage at all**.
+
+To make the tests functional:
+1. Add `commandExec commandExec` field to `SessionManager` struct
+2. Initialize with `realCommandExec{}` in production
+3. Update `audio.go` and `video.go` to use `m.commandExec.CommandContext()` instead of `exec.CommandContext()`
+4. Tests will then be able to inject `mockCommandExec` for verification
