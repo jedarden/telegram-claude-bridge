@@ -274,7 +274,7 @@ Pane alive for topic?
    └── No  (cold) → spawn pane:
                      tmux new-window -t telegram-bridge -n "topic-<thread_id>"
                        "claude --resume <session_id>
-                               --dangerously-skip-permissions
+                               <permission_flags>   # from group permission_mode
                                --model <topic_model>
                                --cwd <project_dir>
                                --append-system-prompt '<dispatcher context>'
@@ -298,7 +298,7 @@ Cold-start latency is ~3–4s (claude startup + PTY handshake). Warm injection i
 ```
 # Fresh pane per worker, torn down on completion
 tmux new-window -t telegram-bridge -n "worker-<worker_id>" \
-  "claude --dangerously-skip-permissions \
+  "claude <permission_flags> \
           --model <worker_model_or_default> \
           --cwd <project_dir> \
           --disallowed-tools spawn_worker"
@@ -558,7 +558,7 @@ CREATE TABLE groups (
     default_model           TEXT NOT NULL DEFAULT 'claude-sonnet-4-6',
     max_budget              REAL NOT NULL DEFAULT 5.0,
     timeout_sec             INTEGER NOT NULL DEFAULT 1800,
-    permission_mode         TEXT NOT NULL DEFAULT 'acceptEdits',  -- Stored but not wired to CLI flags (see Security section)
+    permission_mode         TEXT NOT NULL DEFAULT 'acceptEdits',  -- Resolved to CLI flags at spawn (see Security section)
     allowed_tools           TEXT,                              -- JSON array of tool names
     disallowed_tools        TEXT,                              -- JSON array of tool names
     max_subtasks            INTEGER NOT NULL DEFAULT 5,        -- Max concurrent /parallel subtasks
@@ -718,10 +718,13 @@ CREATE TABLE processed_updates (
 
 #### Claude Code Permissions
 
-- **Default runtime behavior:** Every Claude invocation passes `--dangerously-skip-permissions` flag (effectively `bypassPermissions`). The `permission_mode` is stored in the database (`groups.permission_mode`, `sessions.permission_mode`) but does not affect runtime behavior in the current implementation due to the pervasive skip-permissions flag.
-- **Stored permission modes:** `acceptEdits` (default), `bypassPermissions`, `plan`, `dontAsk` — configurable per group and per topic via `/permission` or `/config permission_mode`, but not wired to CLI flags (tracked open issue).
+- **Runtime behavior:** The stored `permission_mode` is wired to CLI flags at every Claude spawn site via `resolvePermissionArgs()` in `internal/bridge/session_manager.go` (the source of truth):
+  - `bypassPermissions` → `--dangerously-skip-permissions`
+  - `acceptEdits`, `plan`, `dontAsk` → `--permission-mode <mode>`
+- **Permission modes:** `acceptEdits`, `bypassPermissions`, `plan`, `dontAsk` — configurable per group and per topic via `/permission` or `/config permission_mode`, and applied at the next spawn. The `groups.permission_mode` column defaults to `acceptEdits`; if it is empty, the Go-side fallback (`defaultPermissionMode`) is `bypassPermissions`.
+- **Spawn sites covered:** topic panes (`session_manager.go`), workers (`worker_pool.go`), `/parallel` subtasks (`subtask_orchestrator.go`), command-driven spawns (`commands.go`), and the service handler (`service_handler.go`).
 - `--allowed-tools` and `--disallowed-tools` are configurable per group to restrict what Claude can do.
-- **Note:** Wiring the stored `permission_mode` value to actual CLI flags is a tracked open issue (see related bead about permission mode integration).
+- **Not implemented:** interactive per-tool approval from Telegram. Only the CLI flag reflects the configured mode — there is no PTY-output prompt detection, so a `plan`-mode approval prompt is never surfaced as an inline keyboard. `SendToolApprovalPrompt` in `sender.go` and the `approve_tool`/`deny_tool` callback handlers exist but are unreachable.
 
 ### Topic Lifecycle Management
 
@@ -826,9 +829,9 @@ Goal: Send a text message in a Telegram topic, get a Claude response back.
 - Oversized code blocks sent as document attachments
 
 ### 2.3 — Permission Handling
-- **Default runtime behavior:** Every Claude invocation passes `--dangerously-skip-permissions` flag (effectively `bypassPermissions`).
-- The stored `permission_mode` in the database is configurable per group and per topic (`bypassPermissions`, `acceptEdits`, `plan`, `dontAsk`) via `/permission` or `/config permission_mode`, but is not currently wired to CLI flags (tracked open issue).
-- Alternative modes available in storage require manual wiring to affect runtime behavior.
+- **Runtime behavior:** The stored `permission_mode` is resolved to CLI flags by `resolvePermissionArgs()` at every Claude spawn site — `bypassPermissions` → `--dangerously-skip-permissions`, and `acceptEdits` / `plan` / `dontAsk` → `--permission-mode <mode>`.
+- The mode is configurable per group and per topic via `/permission` or `/config permission_mode`, and applies to the next spawn.
+- Interactive per-tool approval (inline approve/deny keyboard driven by PTY prompt detection) is **not** implemented; only the CLI flag reflects the configured mode.
 
 **Deliverable:** Streamed responses with proper formatting.
 
@@ -1563,7 +1566,7 @@ The bridge queries the proxy's `/health` endpoint (which returns `contract_versi
 | Whisper model | turbo vs base vs small | turbo | Best accuracy-to-speed ratio |
 | Private chat topics | Support vs groups only | Groups only (initially) | Bot API 9.4 supports private chat topics, but groups are the primary use case |
 | Response format | HTML vs MarkdownV2 | HTML | MarkdownV2 escaping is unreliable — universal consensus from existing implementations |
-| Permission mode | plan vs acceptEdits vs dontAsk | acceptEdits (default stored) | **Default runtime:** Every invocation passes `--dangerously-skip-permissions`. Stored `permission_mode` configurable (`acceptEdits`, `bypassPermissions`, `plan`, `dontAsk`) but not wired to CLI flags (tracked open issue). |
+| Permission mode | plan vs acceptEdits vs dontAsk | acceptEdits (`groups.permission_mode` default) | **Decided and wired.** `resolvePermissionArgs()` maps the configured mode to CLI flags at every spawn site: `bypassPermissions` → `--dangerously-skip-permissions`, others → `--permission-mode <mode>`. Interactive per-tool approval from Telegram remains unimplemented. |
 
 ---
 
