@@ -6,6 +6,7 @@ package bridge
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // TestSplitParallelPrompts_EmptyInputs tests empty and whitespace-only inputs.
@@ -1165,6 +1166,270 @@ func TestSplitParallelPrompts_DelimiterPositionEdgeCases(t *testing.T) {
 					if prompts[i] != want {
 						t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
 					}
+				}
+			}
+		})
+	}
+}
+
+// TestSplitParallelPrompts_UnicodeCharacterPreservation verifies that non-ASCII
+// characters survive splitting byte-for-byte. Covers Latin Extended (accents,
+// ligatures), Cyrillic and Greek (including polytonic and final sigma).
+// Prompts are compared for exact equality, then checked for UTF-8 validity and
+// absence of the replacement character, which is what corruption would look like.
+func TestSplitParallelPrompts_UnicodeCharacterPreservation(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+	}{
+		// ── Latin Extended ────────────────────────────────────────────────────
+		{
+			name:        "latin extended-A accented letters",
+			input:       "Přeložit dokument\n---\nSzöveg átírása\n---\nĞünlük rapor",
+			wantLen:     3,
+			wantPrompts: []string{"Přeložit dokument", "Szöveg átírása", "Ğünlük rapor"},
+		},
+		{
+			name:        "latin extended ligatures and eszett",
+			input:       "Cœur et æther\n---\nStraße in Weißenburg\n---\nĲsselmeer",
+			wantLen:     3,
+			wantPrompts: []string{"Cœur et æther", "Straße in Weißenburg", "Ĳsselmeer"},
+		},
+		{
+			name:        "latin-1 supplement punctuation and symbols",
+			input:       "¿Qué tal? ¡Hola!\n---\nPreço: 50€ ou £40\n---\nSección №5 · ½ kg",
+			wantLen:     3,
+			wantPrompts: []string{"¿Qué tal? ¡Hola!", "Preço: 50€ ou £40", "Sección №5 · ½ kg"},
+		},
+		// ── Cyrillic ──────────────────────────────────────────────────────────
+		{
+			name:        "cyrillic uppercase and lowercase",
+			input:       "АБВГДЕЁЖЗИЙ\n---\nабвгдеёжзий\n---\nЪЫЬЭЮЯ ъыьэюя",
+			wantLen:     3,
+			wantPrompts: []string{"АБВГДЕЁЖЗИЙ", "абвгдеёжзий", "ЪЫЬЭЮЯ ъыьэюя"},
+		},
+		{
+			name:        "cyrillic non-russian letters",
+			input:       "Українська: їєґі\n---\nСрпски: ђћџњљ\n---\nБългарски: щъ",
+			wantLen:     3,
+			wantPrompts: []string{"Українська: їєґі", "Српски: ђћџњљ", "Български: щъ"},
+		},
+		// ── Greek ─────────────────────────────────────────────────────────────
+		{
+			name:        "greek alphabet uppercase and lowercase",
+			input:       "ΑΒΓΔΕΖΗΘΙΚΛΜ\n---\nαβγδεζηθικλμ\n---\nΝΞΟΠΡΣΤΥΦΧΨΩ",
+			wantLen:     3,
+			wantPrompts: []string{"ΑΒΓΔΕΖΗΘΙΚΛΜ", "αβγδεζηθικλμ", "ΝΞΟΠΡΣΤΥΦΧΨΩ"},
+		},
+		{
+			name:        "greek final sigma and accented vowels",
+			input:       "Ὀδυσσεύς\n---\nΆλφα βήτα γάμμα\n---\nΤο κείμενος τέλος",
+			wantLen:     3,
+			wantPrompts: []string{"Ὀδυσσεύς", "Άλφα βήτα γάμμα", "Το κείμενος τέλος"},
+		},
+		{
+			name:        "greek polytonic with breathing marks",
+			input:       "Ἄνθρωπος ᾠδή\n---\nἙλλάς ῥόδον\n---\nαἰών ᾅδης",
+			wantLen:     3,
+			wantPrompts: []string{"Ἄνθρωπος ᾠδή", "Ἑλλάς ῥόδον", "αἰών ᾅδης"},
+		},
+		// ── Mixed scripts and normalization ───────────────────────────────────
+		{
+			name:        "all three scripts in one prompt each",
+			input:       "Café Ångström\n---\nМосква Київ\n---\nΑθήνα Θεσσαλονίκη",
+			wantLen:     3,
+			wantPrompts: []string{"Café Ångström", "Москва Київ", "Αθήνα Θεσσαλονίκη"},
+		},
+		{
+			name:        "scripts mixed within a single prompt",
+			input:       "Ünïcödë + Кириллица + Ελληνικά\n---\nsecond",
+			wantLen:     2,
+			wantPrompts: []string{"Ünïcödë + Кириллица + Ελληνικά", "second"},
+		},
+		{
+			name:        "decomposed combining marks are not normalized",
+			input:       "café naïve\n---\nΆλφα",
+			wantLen:     2,
+			wantPrompts: []string{"café naïve", "Άλφα"},
+		},
+		{
+			name:        "precomposed and decomposed forms stay distinct",
+			input:       "é\n---\né",
+			wantLen:     2,
+			wantPrompts: []string{"é", "é"},
+		},
+		// ── Single prompt (no delimiter) preserves Unicode ─────────────────────
+		{
+			name:        "single unicode prompt without delimiter",
+			input:       "Ελληνικά κείμενο με Ünïcödë και Кириллицей",
+			wantLen:     1,
+			wantPrompts: []string{"Ελληνικά κείμενο με Ünïcödë και Кириллицей"},
+		},
+		{
+			name:        "unicode preserved across many segments",
+			input:       "α\n---\nβ\n---\nγ\n---\nδ\n---\nε",
+			wantLen:     5,
+			wantPrompts: []string{"α", "β", "γ", "δ", "ε"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			if len(prompts) != tt.wantLen {
+				t.Fatalf("got %d prompts, want %d: %q", len(prompts), tt.wantLen, prompts)
+			}
+			for i, want := range tt.wantPrompts {
+				if prompts[i] != want {
+					t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
+				}
+				if got, wantCount := utf8.RuneCountInString(prompts[i]), utf8.RuneCountInString(want); got != wantCount {
+					t.Errorf("prompt[%d] has %d runes, want %d", i, got, wantCount)
+				}
+			}
+			for i, p := range prompts {
+				if !utf8.ValidString(p) {
+					t.Errorf("prompt[%d] = %q is not valid UTF-8", i, p)
+				}
+				if strings.ContainsRune(p, utf8.RuneError) {
+					t.Errorf("prompt[%d] = %q contains the replacement character U+FFFD", i, p)
+				}
+			}
+		})
+	}
+
+	// Splitting must not normalize: the precomposed and decomposed spellings of
+	// the same grapheme have to come back as the distinct byte sequences they
+	// went in as.
+	t.Run("no unicode normalization is applied", func(t *testing.T) {
+		prompts := splitParallelPrompts("é\n---\né")
+		if len(prompts) != 2 {
+			t.Fatalf("got %d prompts, want 2: %q", len(prompts), prompts)
+		}
+		if prompts[0] != "é" || utf8.RuneCountInString(prompts[0]) != 1 {
+			t.Errorf("precomposed prompt = %q (%d runes), want %q (1 rune)", prompts[0], utf8.RuneCountInString(prompts[0]), "é")
+		}
+		if prompts[1] != "é" || utf8.RuneCountInString(prompts[1]) != 2 {
+			t.Errorf("decomposed prompt = %q (%d runes), want %q (2 runes)", prompts[1], utf8.RuneCountInString(prompts[1]), "é")
+		}
+		if prompts[0] == prompts[1] {
+			t.Errorf("precomposed and decomposed prompts were normalized to the same value %q", prompts[0])
+		}
+	})
+}
+
+// TestSplitParallelPrompts_UnicodeDelimiterBoundaries verifies behavior when
+// non-ASCII characters sit directly against the "\n---\n" delimiter, and that
+// Unicode dash lookalikes are never mistaken for the ASCII delimiter.
+func TestSplitParallelPrompts_UnicodeDelimiterBoundaries(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+	}{
+		{
+			name:        "multibyte rune immediately before and after delimiter",
+			input:       "Ω\n---\nα",
+			wantLen:     2,
+			wantPrompts: []string{"Ω", "α"},
+		},
+		{
+			name:        "cyrillic touching both sides of delimiter",
+			input:       "Первый\n---\nВторой\n---\nТретий",
+			wantLen:     3,
+			wantPrompts: []string{"Первый", "Второй", "Третий"},
+		},
+		{
+			name:        "latin extended touching both sides of delimiter",
+			input:       "Ærø\n---\nŽižkov\n---\nÑuñoa",
+			wantLen:     3,
+			wantPrompts: []string{"Ærø", "Žižkov", "Ñuñoa"},
+		},
+		{
+			name:        "combining mark is last rune before delimiter",
+			input:       "ά\n---\nβ",
+			wantLen:     2,
+			wantPrompts: []string{"ά", "β"},
+		},
+		{
+			name:        "combining mark is first sequence after delimiter",
+			input:       "first\n---\nöffnen",
+			wantLen:     2,
+			wantPrompts: []string{"first", "öffnen"},
+		},
+		{
+			name:        "unicode non-breaking space around delimiter is trimmed",
+			input:       "Ελληνικά \n---\n Кириллица",
+			wantLen:     2,
+			wantPrompts: []string{"Ελληνικά", "Кириллица"},
+		},
+		{
+			name:        "ideographic space around delimiter is trimmed",
+			input:       "Ünïcödë　\n---\n　Ελληνικά",
+			wantLen:     2,
+			wantPrompts: []string{"Ünïcödë", "Ελληνικά"},
+		},
+		{
+			name:        "em dashes are not a delimiter",
+			input:       "Πρώτο\n———\nΔεύτερο",
+			wantLen:     1,
+			wantPrompts: []string{"Πρώτο\n———\nΔεύτερο"},
+		},
+		{
+			name:        "en dashes are not a delimiter",
+			input:       "Ünïcödë\n–––\nтекст",
+			wantLen:     1,
+			wantPrompts: []string{"Ünïcödë\n–––\nтекст"},
+		},
+		{
+			name:        "horizontal bar lookalike is not a delimiter",
+			input:       "Άλφα\n―――\nΒήτα",
+			wantLen:     1,
+			wantPrompts: []string{"Άλφα\n―――\nΒήτα"},
+		},
+		{
+			name:        "unicode content adjacent to leading delimiter",
+			input:       "---\nΓάμμα\n---\nΔέλτα",
+			wantLen:     2,
+			wantPrompts: []string{"---\nΓάμμα", "Δέλτα"},
+		},
+		{
+			name:        "unicode content adjacent to trailing delimiter",
+			input:       "Γάμμα\n---\nΔέλτα\n---",
+			wantLen:     2,
+			wantPrompts: []string{"Γάμμα", "Δέλτα\n---"},
+		},
+		{
+			name:        "unicode segment between consecutive delimiters",
+			input:       "Ένα\n---\n\n---\nΔύο",
+			wantLen:     2,
+			wantPrompts: []string{"Ένα", "Δύο"},
+		},
+		{
+			name:        "delimiter embedded in unicode line does not split",
+			input:       "Κείμενο---κείμενο\n---\nтекст---текст",
+			wantLen:     2,
+			wantPrompts: []string{"Κείμενο---κείμενο", "текст---текст"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			if len(prompts) != tt.wantLen {
+				t.Fatalf("got %d prompts, want %d: %q", len(prompts), tt.wantLen, prompts)
+			}
+			for i, want := range tt.wantPrompts {
+				if prompts[i] != want {
+					t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
+				}
+			}
+			for i, p := range prompts {
+				if !utf8.ValidString(p) {
+					t.Errorf("prompt[%d] = %q is not valid UTF-8", i, p)
 				}
 			}
 		})
