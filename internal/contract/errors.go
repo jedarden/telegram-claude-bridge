@@ -20,4 +20,8 @@ const (
 	ErrCodeNotPolling          = 503 // Proxy not connected to Telegram (polling not started)
 	ErrCodeTelegramTimeout     = 504 // Telegram API timeout
 	ErrCodeRateLimit           = 429 // Too Many Requests
+	ErrCodeForbidden           = 403 // Telegram API returned Forbidden (e.g. bot blocked by user)
+	ErrCodeBadRequest          = 400 // Telegram API returned Bad Request
+	ErrCodeUnauthorized        = 401 // Telegram API returned Unauthorized
+	ErrCodeConflict            = 409 // Telegram API returned Conflict (e.g. message not modified)
 )

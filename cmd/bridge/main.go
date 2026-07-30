@@ -100,7 +100,7 @@ func main() {
 	cmdHandler.SetBackgroundJobManager(bgJobMgr)
 
 	// Create session cleanup (disabled if interval is 0)
-	cleanup := bridge.NewSessionCleanup(db, sender, ptyMgr, cfg.SessionCleanupInterval, cfg.SessionTTL, cfg.CloseInactiveTopics)
+	cleanup := bridge.NewSessionCleanup(db, sender, ptyMgr, cfg.SessionCleanupInterval, cfg.SessionTTL, cfg.CloseInactiveTopics, 10*time.Minute)
 	cleanup.Start()
 	defer cleanup.Stop()
 

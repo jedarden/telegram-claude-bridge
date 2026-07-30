@@ -3234,3 +3234,493 @@ func TestWorkerPool_SpawnWorker_IndexPerTopic(t *testing.T) {
 		t.Errorf("topic 20 worker 2 index = %d, want 2", idx4)
 	}
 }
+func TestCommandHandler_cmdParallel_ZeroPromptsAfterSplit(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	session := &Session{
+		ChatID:    100,
+		ThreadID:  10,
+		CWD:       "/tmp/test",
+		Status:    "active",
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	so := NewSubtaskOrchestrator(db, sender, newTestSessionManager(t, db, sender))
+
+	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	h.SetSubtaskOrchestrator(so)
+
+	threadID := int64(10)
+	update := contract.Update{
+		ChatID:    100,
+		ThreadID:  &threadID,
+		MessageID: 1000,
+		FromUser: contract.FromUser{
+			ID: 12345,
+		},
+	}
+
+	// All prompts are empty after trimming
+	args := "   \n---\n   "
+	reply, err := h.cmdParallel(ctx, update, group, args)
+	if err != nil {
+		t.Fatalf("cmdParallel with all empty prompts: %v", err)
+	}
+	if !containsSubstring(reply, "No prompts found") {
+		t.Errorf("reply = %q, want to contain 'No prompts found'", reply)
+	}
+}
+
+func TestCommandHandler_cmdParallel_FivePromptsHardLimit(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  100, // High limit, but hard limit is 5
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	session := &Session{
+		ChatID:    100,
+		ThreadID:  10,
+		CWD:       "/tmp/test",
+		Status:    "active",
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	so := NewSubtaskOrchestrator(db, sender, newTestSessionManager(t, db, sender))
+
+	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	h.SetSubtaskOrchestrator(so)
+
+	threadID := int64(10)
+	update := contract.Update{
+		ChatID:    100,
+		ThreadID:  &threadID,
+		MessageID: 1000,
+		FromUser: contract.FromUser{
+			ID: 12345,
+		},
+	}
+
+	// 6 prompts exceeds hard limit of 5
+	args := "1\n---\n2\n---\n3\n---\n4\n---\n5\n---\n6"
+	reply, err := h.cmdParallel(ctx, update, group, args)
+	if err != nil {
+		t.Fatalf("cmdParallel with 6 prompts: %v", err)
+	}
+	if !containsSubstring(reply, "Maximum 5 prompts") {
+		t.Errorf("reply = %q, want to contain 'Maximum 5 prompts'", reply)
+	}
+}
+
+func TestCommandHandler_cmdParallel_GetSessionError(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	// Don't create a session - GetSession will return error
+
+	sender := newIntegrationTestSender(t)
+	so := NewSubtaskOrchestrator(db, sender, newTestSessionManager(t, db, sender))
+
+	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	h.SetSubtaskOrchestrator(so)
+
+	threadID := int64(10)
+	update := contract.Update{
+		ChatID:    100,
+		ThreadID:  &threadID,
+		MessageID: 1000,
+		FromUser: contract.FromUser{
+			ID: 12345,
+		},
+	}
+
+	_, err := h.cmdParallel(ctx, update, group, "test")
+	if err == nil {
+		t.Error("expected error when GetSession fails, got nil")
+	}
+	if err != nil && !containsSubstring(err.Error(), "get session") {
+		t.Errorf("error = %q, want to contain 'get session'", err.Error())
+	}
+}
+
+func TestCommandHandler_cmdParallel_SubtaskRunError(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  1, // Very low limit
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	session := &Session{
+		ChatID:    100,
+		ThreadID:  10,
+		CWD:       "/tmp/test",
+		Status:    "active",
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	so := NewSubtaskOrchestrator(db, sender, newTestSessionManager(t, db, sender))
+
+	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	h.SetSubtaskOrchestrator(so)
+
+	threadID := int64(10)
+	update := contract.Update{
+		ChatID:    100,
+		ThreadID:  &threadID,
+		MessageID: 1000,
+		FromUser: contract.FromUser{
+			ID: 12345,
+		},
+	}
+
+	// 2 prompts exceeds max_subtasks of 1
+	args := "task1\n---\ntask2"
+	_, err := h.cmdParallel(ctx, update, group, args)
+	if err == nil {
+		t.Error("expected error when SubtaskOrchestrator.Run fails, got nil")
+	}
+	if err != nil && !containsSubstring(err.Error(), "start parallel tasks") {
+		t.Errorf("error = %q, want to contain 'start parallel tasks'", err.Error())
+	}
+}
+
+// ── Additional splitParallelPrompts Edge Case Tests ─────────────────────────────────────
+
+func TestSplitParallelPrompts_UnicodeCharacters(t *testing.T) {
+	input := "Calculate: ∑(n²) for n=1 to 10\n---\n翻译这段文字\n---\n🎉 Emoji test 🚀"
+	prompts := splitParallelPrompts(input)
+
+	if len(prompts) != 3 {
+		t.Fatalf("got %d prompts, want 3", len(prompts))
+	}
+	if prompts[0] != "Calculate: ∑(n²) for n=1 to 10" {
+		t.Errorf("prompt 0 = %q, want unicode math expression", prompts[0])
+	}
+	if prompts[1] != "翻译这段文字" {
+		t.Errorf("prompt 1 = %q, want chinese text", prompts[1])
+	}
+	if prompts[2] != "🎉 Emoji test 🚀" {
+		t.Errorf("prompt 2 = %q, want emoji text", prompts[2])
+	}
+}
+
+func TestSplitParallelPrompts_LongPrompt(t *testing.T) {
+	// Create a very long prompt (10KB)
+	longPrompt := strings.Repeat("This is a long prompt line. ", 200)
+	input := longPrompt + "\n---\nShort prompt"
+	prompts := splitParallelPrompts(input)
+
+	if len(prompts) != 2 {
+		t.Fatalf("got %d prompts, want 2", len(prompts))
+	}
+	if len(prompts[0]) != len(longPrompt) {
+		t.Errorf("long prompt length = %d, want %d (preserved)", len(prompts[0]), len(longPrompt))
+	}
+	if prompts[1] != "Short prompt" {
+		t.Errorf("prompt 1 = %q, want 'Short prompt'", prompts[1])
+	}
+}
+
+func TestSplitParallelPrompts_MixedNewlines(t *testing.T) {
+	// Test that only \n---\n is recognized as delimiter
+	input := "First\r\n---\r\nSecond\r---\rThird\n---\nFourth"
+	prompts := splitParallelPrompts(input)
+
+	// \r\n---\r\n and \r---\r should NOT split (only \n---\n works)
+	// Only "Third\n---\nFourth" should split
+	if len(prompts) != 2 {
+		t.Logf("prompts: %v", prompts)
+		t.Fatalf("got %d prompts, want 2 (only \\n---\\n delimiter recognized)", len(prompts))
+	}
+}
+
+func TestSplitParallelPrompts_TabCharacters(t *testing.T) {
+	// Test that tabs around delimiter are NOT recognized (only exact "\n---\n" works)
+	input := "First prompt\n\t---\t\nSecond prompt"
+	prompts := splitParallelPrompts(input)
+
+	// Should NOT split - only exact "\n---\n" is recognized
+	if len(prompts) != 1 {
+		t.Fatalf("got %d prompts, want 1 (tabs not recognized)", len(prompts))
+	}
+}
+
+func TestSplitParallelPrompts_FourDashes(t *testing.T) {
+	// Test that ---- is NOT recognized as delimiter (only --- works)
+	input := "First prompt\n----\nSecond prompt"
+	prompts := splitParallelPrompts(input)
+
+	// Should NOT split - only "---" is recognized
+	if len(prompts) != 1 {
+		t.Fatalf("got %d prompts, want 1 (---- not recognized as delimiter)", len(prompts))
+	}
+}
+
+func TestSplitParallelPrompts_TwoDashes(t *testing.T) {
+	// Test that -- is NOT recognized as delimiter
+	input := "First prompt\n--\nSecond prompt"
+	prompts := splitParallelPrompts(input)
+
+	// Should NOT split - only "---" is recognized
+	if len(prompts) != 1 {
+		t.Fatalf("got %d prompts, want 1 (-- not recognized as delimiter)", len(prompts))
+	}
+}
+
+func TestSplitParallelPrompts_OnlyDashes(t *testing.T) {
+	// Test that "---" alone (no newlines) is treated as content, not delimiter
+	input := "---"
+	prompts := splitParallelPrompts(input)
+
+	if len(prompts) != 1 {
+		t.Fatalf("got %d prompts, want 1", len(prompts))
+	}
+	if prompts[0] != "---" {
+		t.Errorf("prompt = %q, want '---' (treated as content)", prompts[0])
+	}
+}
+
+func TestSplitParallelPrompts_NewlineOnlyDelimiters(t *testing.T) {
+	// Test edge case: input is just newlines and delimiter
+	// Verifies the filter handles empty prompts after trimming
+	input := "\n---\n"
+	prompts := splitParallelPrompts(input)
+
+	// Empty prompts should be filtered out, leaving 0 prompts
+	if len(prompts) != 0 {
+		t.Fatalf("got %d prompts, want 0 (empty prompts filtered)", len(prompts))
+	}
+}
+
+func TestSplitParallelPrompts_MultipleNewlineOnlyDelimiters(t *testing.T) {
+	// Test edge case: multiple consecutive delimiters with only whitespace
+	input := "\n---\n---\n---\n"
+	prompts := splitParallelPrompts(input)
+
+	// All empty prompts should be filtered out
+	if len(prompts) != 0 {
+		t.Fatalf("got %d prompts, want 0 (all empty)", len(prompts))
+	}
+}
+
+func TestSplitParallelPrompts_WhitespaceOnlyPrompts(t *testing.T) {
+	// Test edge case: prompts with only whitespace characters
+	input := "   \n---\n\t\t\n---\n  \n  "
+	prompts := splitParallelPrompts(input)
+
+	// Whitespace-only prompts should be trimmed and filtered as empty
+	if len(prompts) != 0 {
+		t.Fatalf("got %d prompts, want 0 (whitespace-only prompts filtered)", len(prompts))
+	}
+}
+
+func TestCommandHandler_cmdParallel_SessionDifferentChatID(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	// Create a session for a different chat ID
+	session := &Session{
+		ChatID:    999, // Different chat ID
+		ThreadID:  10,
+		SessionID: "test-session-999",
+		CWD:       "/tmp/test",
+		Model:     "claude-opus-4-6",
+		Status:    "active",
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	so := NewSubtaskOrchestrator(db, sender, newTestSessionManager(t, db, sender))
+
+	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	h.SetSubtaskOrchestrator(so)
+
+	threadID := int64(10)
+	update := contract.Update{
+		ChatID:    100, // Update is for chat 100, but session is for chat 999
+		ThreadID:  &threadID,
+		MessageID: 1000,
+		FromUser: contract.FromUser{
+			ID: 12345,
+		},
+	}
+
+	// GetSession should return session for chat 100, thread 10
+	// Since we only created a session for chat 999, this should return nil/error
+	_, err := h.cmdParallel(ctx, update, group, "test")
+	if err == nil {
+		t.Error("expected error when session not found for chat, got nil")
+	}
+}
+
+func TestCommandHandler_cmdParallel_ClosedSession(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	// Create a closed session
+	session := &Session{
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "closed-session",
+		CWD:       "/tmp/test",
+		Model:     "claude-opus-4-6",
+		Status:    "closed",
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	so := NewSubtaskOrchestrator(db, sender, newTestSessionManager(t, db, sender))
+
+	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	h.SetSubtaskOrchestrator(so)
+
+	threadID := int64(10)
+	update := contract.Update{
+		ChatID:    100,
+		ThreadID:  &threadID,
+		MessageID: 1000,
+		FromUser: contract.FromUser{
+			ID: 12345,
+		},
+	}
+
+	// cmdParallel should work even with closed session (it just reads the session record)
+	_, err := h.cmdParallel(ctx, update, group, "test")
+	if err != nil {
+		t.Errorf("cmdParallel with closed session should work (only reads session): %v", err)
+	}
+}
+
+func TestCommandHandler_cmdParallel_ZeroMessageID(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	session := &Session{
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "test-session",
+		CWD:       "/tmp/test",
+		Model:     "claude-opus-4-6",
+		Status:    "active",
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	so := NewSubtaskOrchestrator(db, sender, newTestSessionManager(t, db, sender))
+
+	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	h.SetSubtaskOrchestrator(so)
+
+	threadID := int64(10)
+	update := contract.Update{
+		ChatID:    100,
+		ThreadID:  &threadID,
+		MessageID: 0, // Zero message ID
+		FromUser: contract.FromUser{
+			ID: 12345,
+		},
+	}
+
+	// cmdParallel should work with zero message ID (uses whatever ID is provided)
+	_, err := h.cmdParallel(ctx, update, group, "test")
+	if err != nil {
+		t.Errorf("cmdParallel with zero message ID should work: %v", err)
+	}
+
+	// Verify subtask was created with parent_msg = 0
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 1 {
+		t.Fatalf("expected 1 subtask, got %d", len(subtasks))
+	}
+	if subtasks[0].ParentMsgID != 0 {
+		t.Errorf("subtask.ParentMsgID = %d, want 0", subtasks[0].ParentMsgID)
+	}
+}

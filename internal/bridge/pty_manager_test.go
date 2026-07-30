@@ -1,973 +1,744 @@
-package bridge_test
+package bridge
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
-// ---- paneInfo and parsePaneName Tests (Reconciliation Support) ----
+// ── Helper Function Tests ─────────────────────────────────────────────────────────
 
-// paneInfo describes a parsed pane name.
-// Mirrored from internal/bridge/pty_manager.go for testing.
-type paneInfo struct {
-	Type     string // "session", "worker", or "unknown"
-	ChatID   int64  // set for session panes
-	ThreadID int64  // set for session panes
-	WorkerID string // set for worker panes (partial ID)
-}
-
-// parsePaneName extracts the type and identifiers from a pane name.
-// Mirrored from internal/bridge/pty_manager.go for testing.
-func parsePaneName(name string) paneInfo {
-	if strings.HasPrefix(name, "t") && strings.Contains(name, "-") {
-		// Session pane: "t{chatID}-{threadID}"
-		parts := strings.SplitN(strings.TrimPrefix(name, "t"), "-", 2)
-		if len(parts) == 2 {
-			chatID, err1 := strconv.ParseInt(parts[0], 10, 64)
-			threadID, err2 := strconv.ParseInt(parts[1], 10, 64)
-			if err1 == nil && err2 == nil {
-				return paneInfo{Type: "session", ChatID: chatID, ThreadID: threadID}
-			}
-		}
-	}
-	if strings.HasPrefix(name, "w-") && strings.Count(name, "-") >= 2 {
-		// Worker pane: "w-{workerID[:8]}-{timestamp}"
-		parts := strings.SplitN(name, "-", 3)
-		if len(parts) >= 2 {
-			workerID := parts[1]
-			// Worker IDs start with "worker_" - validate that
-			if strings.HasPrefix(workerID, "worker_") {
-				return paneInfo{Type: "worker", WorkerID: workerID}
-			}
-		}
-	}
-	// Unknown pane type (includes "init-*" ephemeral subtask panes)
-	return paneInfo{Type: "unknown"}
-}
-
-// ---- Test Helpers ----
-
-// mockExecCommand captures the intended tmux command for inspection in tests.
-// In production, exec.Command would be called; in tests, we capture the args
-// to verify the correct command would be executed.
-type mockExecCommand struct {
-	cmd  string
-	args []string
-}
-
-// mockTmuxExec simulates tmux command execution for testing.
-// Returns (stdout, stderr, error) - simplified version for testing.
-func mockTmuxExec(cmd string, args ...string) (string, string, error) {
-	// This is a placeholder - actual implementation will be in specific tests
-	return "", "", nil
-}
-
-// ---- Pane Naming Tests ----
-
-// TestPaneNaming tests pane name formatting and parsing using table-driven tests.
-func TestPaneNaming(t *testing.T) {
-	tests := []struct {
-		name      string
-		paneName  string
-		wantValid bool
-		comment   string
-	}{
-		{
-			name:      "valid topic pane format with thread ID",
-			paneName:  "t1003602927203-120",
-			wantValid: true,
-			comment:   "Standard format: chat ID-thread ID",
-		},
-		{
-			name:      "valid general topic pane",
-			paneName:  "t1003602927203",
-			wantValid: true,
-			comment:   "General topic (no thread ID)",
-		},
-		{
-			name:      "valid large chat ID",
-			paneName:  "t9999999999999-999",
-			wantValid: true,
-			comment:   "Large chat and thread IDs",
-		},
-		{
-			name:      "valid small chat ID",
-			paneName:  "t123-5",
-			wantValid: true,
-			comment:   "Small IDs",
-		},
-		{
-			name:      "empty string",
-			paneName:  "",
-			wantValid: false,
-			comment:   "Empty pane name is invalid",
-		},
-		{
-			name:      "missing t prefix",
-			paneName:  "1003602927203-120",
-			wantValid: false,
-			comment:   "Must start with 't' prefix",
-		},
-		{
-			name:      "no hyphen in thread ID format",
-			paneName:  "t1003602927203120",
-			wantValid: true,
-			comment:   "Valid general topic (no thread separator)",
-		},
-		{
-			name:      "multiple hyphens",
-			paneName:  "t100-360-292",
-			wantValid: true,
-			comment:   "Multiple hyphens - still valid as general topic with hyphenated IDs",
-		},
-		{
-			name:      "with special characters",
-			paneName:  "t100_360-120",
-			wantValid: false,
-			comment:   "Underscore not valid in pane names",
-		},
-		{
-			name:      "with spaces",
-			paneName:  "t100 360-120",
-			wantValid: false,
-			comment:   "Spaces not valid in pane names",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Basic validation: pane names should be non-empty, start with 't',
-			// and contain only valid characters (alphanumeric, hyphen)
-			gotValid := tt.paneName != "" &&
-				strings.HasPrefix(tt.paneName, "t") &&
-				containsOnlyValidPaneChars(tt.paneName)
-
-			if gotValid != tt.wantValid {
-				t.Errorf("pane name validation: got %v, want %v (comment: %s)", gotValid, tt.wantValid, tt.comment)
-			}
-		})
-	}
-}
-
-// containsOnlyValidPaneChars checks if a pane name contains only valid characters.
-// Valid characters: alphanumeric (0-9, a-z, A-Z) and hyphen (-).
-func containsOnlyValidPaneChars(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, c := range s {
-		if !((c >= '0' && c <= '9') ||
-			(c >= 'a' && c <= 'z') ||
-			(c >= 'A' && c <= 'Z') ||
-			c == '-') {
-			return false
-		}
-	}
-	return true
-}
-
-// TestPaneTargetParsing tests parsing pane targets in the format "session:paneName".
-func TestPaneTargetParsing(t *testing.T) {
-	tests := []struct {
-		name             string
-		paneTarget       string
-		wantPaneName     string
-		wantSessionName  string
-		wantParseSucceed bool
-	}{
-		{
-			name:             "standard pane target",
-			paneTarget:       "telegram-bridge:t1003602927203-120",
-			wantPaneName:     "t1003602927203-120",
-			wantSessionName:  "telegram-bridge",
-			wantParseSucceed: true,
-		},
-		{
-			name:             "general topic pane target",
-			paneTarget:       "telegram-bridge:t1003602927203",
-			wantPaneName:     "t1003602927203",
-			wantSessionName:  "telegram-bridge",
-			wantParseSucceed: true,
-		},
-		{
-			name:             "pane target with no colon",
-			paneTarget:       "telegram-bridge",
-			wantPaneName:     "telegram-bridge", // Fallback to full string
-			wantSessionName:  "",
-			wantParseSucceed: false,
-		},
-		{
-			name:             "empty string",
-			paneTarget:       "",
-			wantPaneName:     "",
-			wantSessionName:  "",
-			wantParseSucceed: false,
-		},
-		{
-			name:             "multiple colons - uses last",
-			paneTarget:       "telegram:bridge:t100-120",
-			wantPaneName:     "t100-120",
-			wantSessionName:  "telegram:bridge",
-			wantParseSucceed: true,
-		},
-		{
-			name:             "colon at end",
-			paneTarget:       "telegram-bridge:",
-			wantPaneName:     "",
-			wantSessionName:  "telegram-bridge",
-			wantParseSucceed: false,
-		},
-		{
-			name:             "colon at start",
-			paneTarget:       ":t100-120",
-			wantPaneName:     "t100-120",
-			wantSessionName:  "",
-			wantParseSucceed: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Simulate the parsing logic from PTYManager methods
-			// This mimics: paneTarget[idx+1:] where idx is last ":"
-
-			gotPaneName := tt.paneTarget
-			gotSessionName := ""
-			gotParseSucceed := false
-
-			idx := strings.LastIndex(tt.paneTarget, ":")
-			if idx >= 0 && idx < len(tt.paneTarget)-1 {
-				gotPaneName = tt.paneTarget[idx+1:]
-				gotSessionName = tt.paneTarget[:idx]
-				gotParseSucceed = gotPaneName != "" && gotSessionName != ""
-			} else if idx == len(tt.paneTarget)-1 {
-				// Colon at end - pane name is empty
-				gotPaneName = ""
-				gotSessionName = tt.paneTarget[:idx]
-			}
-
-			if gotPaneName != tt.wantPaneName {
-				t.Errorf("pane name: got %q, want %q", gotPaneName, tt.wantPaneName)
-			}
-
-			// Only validate session name when parsing should succeed
-			if tt.wantParseSucceed && gotSessionName != tt.wantSessionName {
-				t.Errorf("session name: got %q, want %q", gotSessionName, tt.wantSessionName)
-			}
-
-			if gotParseSucceed != tt.wantParseSucceed {
-				t.Errorf("parse success: got %v, want %v", gotParseSucceed, tt.wantParseSucceed)
-			}
-		})
-	}
-}
-
-// TestPaneTargetFormatting tests formatting pane targets from components.
-func TestPaneTargetFormatting(t *testing.T) {
-	tests := []struct {
-		name        string
-		sessionName string
-		paneName    string
-		wantTarget  string
-		wantValid   bool
-	}{
-		{
-			name:        "standard format",
-			sessionName: "telegram-bridge",
-			paneName:    "t100-120",
-			wantTarget:  "telegram-bridge:t100-120",
-			wantValid:   true,
-		},
-		{
-			name:        "different session name",
-			sessionName: "my-session",
-			paneName:    "t999-1",
-			wantTarget:  "my-session:t999-1",
-			wantValid:   true,
-		},
-		{
-			name:        "empty session name",
-			sessionName: "",
-			paneName:    "t100-120",
-			wantTarget:  ":t100-120",
-			wantValid:   false,
-		},
-		{
-			name:        "empty pane name",
-			sessionName: "telegram-bridge",
-			paneName:    "",
-			wantTarget:  "telegram-bridge:",
-			wantValid:   false,
-		},
-		{
-			name:        "both empty",
-			sessionName: "",
-			paneName:    "",
-			wantTarget:  ":",
-			wantValid:   false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Simulate formatting logic from SpawnPane
-			gotTarget := tt.sessionName + ":" + tt.paneName
-
-			if gotTarget != tt.wantTarget {
-				t.Errorf("formatted target: got %q, want %q", gotTarget, tt.wantTarget)
-			}
-
-			gotValid := tt.sessionName != "" && tt.paneName != ""
-			if gotValid != tt.wantValid {
-				t.Errorf("validity: got %v, want %v", gotValid, tt.wantValid)
-			}
-		})
-	}
-}
-
-// ---- Pane Name File Path Tests ----
-
-// TestPaneNameFilePaths tests file path generation for pane-specific files.
-func TestPaneNameFilePaths(t *testing.T) {
-	// Create a temporary directory for testing
-	tempDir := t.TempDir()
-
-	tests := []struct {
-		name          string
-		paneName      string
-		wantRespFile  string
-		wantReadyFile string
-		wantTmpFile   string
-		wantValid     bool
-	}{
-		{
-			name:          "standard pane name",
-			paneName:      "t100-120",
-			wantRespFile:  "t100-120.resp",
-			wantReadyFile: "t100-120.resp.ready",
-			wantTmpFile:   "t100-120.resp.tmp",
-			wantValid:     true,
-		},
-		{
-			name:          "general topic pane",
-			paneName:      "t1003602927203",
-			wantRespFile:  "t1003602927203.resp",
-			wantReadyFile: "t1003602927203.resp.ready",
-			wantTmpFile:   "t1003602927203.resp.tmp",
-			wantValid:     true,
-		},
-		{
-			name:          "empty pane name",
-			paneName:      "",
-			wantRespFile:  ".resp",
-			wantReadyFile: ".resp.ready",
-			wantTmpFile:   ".resp.tmp",
-			wantValid:     false,
-		},
-		{
-			name:          "pane name with special chars",
-			paneName:      "t100_120",
-			wantRespFile:  "t100_120.resp",
-			wantReadyFile: "t100_120.resp.ready",
-			wantTmpFile:   "t100_120.resp.tmp",
-			wantValid:     true, // File system may accept it
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Simulate the file path generation logic
-			respDir := tempDir
-
-			gotRespFile := filepath.Join(respDir, tt.paneName+".resp")
-			gotReadyFile := filepath.Join(respDir, tt.paneName+".resp.ready")
-			gotTmpFile := filepath.Join(respDir, tt.paneName+".resp.tmp")
-
-			baseName := filepath.Base(gotRespFile)
-			if baseName != tt.wantRespFile {
-				t.Errorf("response file basename: got %q, want %q", baseName, tt.wantRespFile)
-			}
-
-			baseName = filepath.Base(gotReadyFile)
-			if baseName != tt.wantReadyFile {
-				t.Errorf("ready file basename: got %q, want %q", baseName, tt.wantReadyFile)
-			}
-
-			baseName = filepath.Base(gotTmpFile)
-			if baseName != tt.wantTmpFile {
-				t.Errorf("tmp file basename: got %q, want %q", baseName, tt.wantTmpFile)
-			}
-
-			// Basic validation check
-			gotValid := tt.paneName != ""
-			if gotValid != tt.wantValid {
-				t.Errorf("validity: got %v, want %v", gotValid, tt.wantValid)
-			}
-		})
-	}
-}
-
-// TestPaneNameUniqueness tests that different pane names generate different file paths.
-func TestPaneNameUniqueness(t *testing.T) {
-	tempDir := t.TempDir()
-
-	paneNames := []string{
-		"t100-1",
-		"t100-2",
-		"t101-1",
-		"t999-999",
-		"t1",
-	}
-
-	// Track generated file paths
-	paths := make(map[string]string)
-
-	for _, paneName := range paneNames {
-		respFile := filepath.Join(tempDir, paneName+".resp")
-
-		// Check for uniqueness
-		if existing, exists := paths[respFile]; exists {
-			t.Errorf("pane name %q generated same path as %q: %s", paneName, existing, respFile)
-		}
-		paths[respFile] = paneName
-	}
-
-	// Verify all paths are unique
-	if len(paths) != len(paneNames) {
-		t.Errorf("expected %d unique paths, got %d", len(paneNames), len(paths))
-	}
-}
-
-// ---- Shell Quoting Tests ----
-
-// TestShellQuote tests shell argument quoting for safety.
 func TestShellQuote(t *testing.T) {
 	tests := []struct {
-		name      string
-		input     string
-		wantQuote string
+		input    string
+		expected string
 	}{
-		{
-			name:      "simple word",
-			input:     "claude",
-			wantQuote: "'claude'",
-		},
-		{
-			name:      "with spaces",
-			input:     "hello world",
-			wantQuote: "'hello world'",
-		},
-		{
-			name:      "with single quote",
-			input:     "don't",
-			wantQuote: "'don'\\''t'",
-		},
-		{
-			name:      "multiple single quotes",
-			input:     "it's a test",
-			wantQuote: "'it'\\''s a test'",
-		},
-		{
-			name:      "empty string",
-			input:     "",
-			wantQuote: "''",
-		},
-		{
-			name:      "with special chars",
-			input:     "test$var",
-			wantQuote: "'test$var'",
-		},
-		{
-			name:      "with backtick",
-			input:     "cmd`pwd`",
-			wantQuote: "'cmd`pwd`'",
-		},
+		{"simple", "'simple'"},
+		{"with space", "'with space'"},
+		{"with'apostrophe", "'with'\\''apostrophe'"},
+		{"with'two'apostrophes", "'with'\\''two'\\''apostrophes'"},
+		{"path/to/file", "'path/to/file'"},
+		{"", "''"},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Simulate shellQuote logic: ' + replaceall(s, ', '\') + '
-			gotQuote := "'" + strings.ReplaceAll(tt.input, "'", "'\\''") + "'"
-
-			if gotQuote != tt.wantQuote {
-				t.Errorf("shell quote: got %q, want %q", gotQuote, tt.wantQuote)
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got := shellQuote(tc.input)
+			if got != tc.expected {
+				t.Errorf("shellQuote(%q) = %q, want %q", tc.input, got, tc.expected)
 			}
 		})
 	}
 }
 
-// ---- Tmux Command Mock Fixtures ----
-
-// TestTmuxCommandCapture tests that tmux commands are constructed correctly.
-// This test captures the command arguments that would be executed.
-func TestTmuxCommandCapture(t *testing.T) {
+func TestBridgeRespFile(t *testing.T) {
 	tests := []struct {
-		name         string
-		paneName     string
-		sessionName  string
-		cwd          string
-		wantCmd      string
-		wantArgs     []string
-		wantCmdValid bool
+		paneName  string
+		expected string
 	}{
-		{
-			name:         "spawn pane command",
-			paneName:     "t100-120",
-			sessionName:  "telegram-bridge",
-			cwd:          "/home/user/project",
-			wantCmd:      "tmux",
-			wantArgs:     []string{"new-window", "-t", "telegram-bridge", "-n", "t100-120", "-c", "/home/user/project"},
-			wantCmdValid: true,
-		},
-		{
-			name:         "capture pane command",
-			paneName:     "t100-120",
-			sessionName:  "telegram-bridge",
-			cwd:          "",
-			wantCmd:      "tmux",
-			wantArgs:     []string{"capture-pane", "-t", "telegram-bridge:t100-120", "-p", "-S", "-"},
-			wantCmdValid: true,
-		},
-		{
-			name:         "send keys command",
-			paneName:     "t100-120",
-			sessionName:  "telegram-bridge",
-			cwd:          "",
-			wantCmd:      "tmux",
-			wantArgs:     []string{"send-keys", "-t", "telegram-bridge:t100-120", "Enter"},
-			wantCmdValid: true,
-		},
-		{
-			name:         "kill pane command",
-			paneName:     "t100-120",
-			sessionName:  "telegram-bridge",
-			cwd:          "",
-			wantCmd:      "tmux",
-			wantArgs:     []string{"kill-window", "-t", "telegram-bridge:t100-120"},
-			wantCmdValid: true,
-		},
+		{"t100-10", "/tmp/telegram-bridge-resp/t100-10.resp"},
+		{"simple", "/tmp/telegram-bridge-resp/simple.resp"},
+		{"pane-with-dashes", "/tmp/telegram-bridge-resp/pane-with-dashes.resp"},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Capture the command that would be executed
-			capturedCmd := mockExecCommand{
-				cmd:  tt.wantCmd,
-				args: tt.wantArgs,
-			}
-
-			// Validate the captured command
-			if capturedCmd.cmd != tt.wantCmd {
-				t.Errorf("command: got %q, want %q", capturedCmd.cmd, tt.wantCmd)
-			}
-
-			if len(capturedCmd.args) != len(tt.wantArgs) {
-				t.Errorf("args length: got %d, want %d", len(capturedCmd.args), len(tt.wantArgs))
-			}
-
-			// Check key args match
-			for i, wantArg := range tt.wantArgs {
-				if i >= len(capturedCmd.args) {
-					t.Errorf("missing arg %d: want %q", i, wantArg)
-					continue
-				}
-				if capturedCmd.args[i] != wantArg {
-					t.Errorf("arg %d: got %q, want %q", i, capturedCmd.args[i], wantArg)
-				}
+	for _, tc := range tests {
+		t.Run(tc.paneName, func(t *testing.T) {
+			got := bridgeRespFile(tc.paneName)
+			if !strings.HasSuffix(got, tc.expected) {
+				t.Errorf("bridgeRespFile(%q) = %q, want ending with %q", tc.paneName, got, tc.expected)
 			}
 		})
 	}
 }
 
-// ---- Integration with Production Code ----
-
-// TestPaneNameExtraction tests the actual pane name extraction logic.
-// This uses a helper function that mirrors the production logic.
-func TestPaneNameExtraction(t *testing.T) {
-	// This helper function mirrors the logic in WaitForResponse
-	extractPaneName := func(paneTarget string) string {
-		paneName := paneTarget
-		if idx := strings.LastIndex(paneTarget, ":"); idx >= 0 {
-			paneName = paneTarget[idx+1:]
-		}
-		return paneName
-	}
-
+func TestIsUIChrome(t *testing.T) {
 	tests := []struct {
-		name         string
-		paneTarget   string
-		wantPaneName string
+		input    string
+		expected bool
 	}{
-		{
-			name:         "standard target",
-			paneTarget:   "telegram-bridge:t100-120",
-			wantPaneName: "t100-120",
-		},
-		{
-			name:         "no colon",
-			paneTarget:   "telegram-bridge",
-			wantPaneName: "telegram-bridge",
-		},
-		{
-			name:         "multiple colons",
-			paneTarget:   "session:prefix:t100-120",
-			wantPaneName: "t100-120",
-		},
-		{
-			name:         "empty",
-			paneTarget:   "",
-			wantPaneName: "",
-		},
+		{"──────────────────", true},
+		{"══════════════════", true},
+		{"━━━━━━━━━━━━━━━━", true},
+		{"───────────────", true},
+		{"────────text────", false}, // Has text mixed in
+		{"text", false},
+		{"", false},
+		{"─", true},
+		{"=", false},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := extractPaneName(tt.paneTarget)
-			if got != tt.wantPaneName {
-				t.Errorf("extractPaneName(%q): got %q, want %q", tt.paneTarget, got, tt.wantPaneName)
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got := isUIChrome(tc.input)
+			if got != tc.expected {
+				t.Errorf("isUIChrome(%q) = %v, want %v", tc.input, got, tc.expected)
 			}
 		})
 	}
 }
 
-// TestPaneNameFileCreation tests that file paths are correctly constructed
-// and files can be created in the expected locations.
-func TestPaneNameFileCreation(t *testing.T) {
-	tempDir := t.TempDir()
-
-	paneName := "t100-120"
-	respFile := filepath.Join(tempDir, paneName+".resp")
-
-	// Test file creation
-	if err := os.WriteFile(respFile, []byte("test response"), 0o600); err != nil {
-		t.Fatalf("failed to create response file: %v", err)
+func TestIsTimingLine(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		{"✻ Brewed for 5s", true},
+		{"✢ Contemplating…", true},
+		{"✽ Cooking… (5s · ↑ 1000 tokens)", true},
+		{"* Word… (2s · …)", true},
+		{"* Working... (10s)", true},
+		{"* Process started", true},
+		{"✻ Reading files", true},
+		{"✻ Done", true},
+		{"✻", true},
+		{"✢", true},
+		{"✽", true},
+		{"* not a timing line", false},
+		{"*no space", false},
+		{"regular text", false},
+		{"", false},
+		{"*", false},
 	}
 
-	// Verify file exists
-	if _, err := os.Stat(respFile); err != nil {
-		t.Errorf("response file does not exist: %v", err)
-	}
-
-	// Clean up and verify
-	os.Remove(respFile)
-	if _, err := os.Stat(respFile); !os.IsNotExist(err) {
-		t.Errorf("response file still exists after removal: %v", err)
-	}
-}
-
-// TestPaneNameRespDirStructure tests the response directory structure.
-func TestPaneNameRespDirStructure(t *testing.T) {
-	tempDir := t.TempDir()
-
-	// Test that the directory can be created
-	respDir := filepath.Join(tempDir, "telegram-bridge-resp")
-	if err := os.MkdirAll(respDir, 0o700); err != nil {
-		t.Fatalf("failed to create resp dir: %v", err)
-	}
-
-	// Verify directory exists
-	info, err := os.Stat(respDir)
-	if err != nil {
-		t.Errorf("resp dir does not exist: %v", err)
-	}
-
-	if !info.IsDir() {
-		t.Errorf("path is not a directory: %s", respDir)
-	}
-
-	// Test creating multiple pane files in the directory
-	paneNames := []string{"t100-1", "t100-2", "t101-1"}
-	for _, paneName := range paneNames {
-		respFile := filepath.Join(respDir, paneName+".resp")
-		if err := os.WriteFile(respFile, []byte("test"), 0o600); err != nil {
-			t.Errorf("failed to create file for %s: %v", paneName, err)
-		}
-	}
-
-	// Verify all files exist
-	entries, err := os.ReadDir(respDir)
-	if err != nil {
-		t.Fatalf("failed to read resp dir: %v", err)
-	}
-
-	gotCount := 0
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".resp") {
-			gotCount++
-		}
-	}
-
-	wantCount := len(paneNames)
-	if gotCount != wantCount {
-		t.Errorf("file count: got %d, want %d", gotCount, wantCount)
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got := isTimingLine(tc.input)
+			if got != tc.expected {
+				t.Errorf("isTimingLine(%q) = %v, want %v", tc.input, got, tc.expected)
+			}
+		})
 	}
 }
 
-// ---- Orphan Reconciliation Tests ----
+func TestIsActiveProgressLine(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		{"Reading 1 file…", true},
+		{"Reading 2 file…", true},
+		{"Reading 100 files…", true},
+		{"Reading 1 file… (ctrl+o to expand)", true},
+		{"Reading", false},
+		{"Reading something else", false},
+		{"reading 1 file…", false}, // Case sensitive
+		{"", false},
+	}
 
-// TestParsePaneName verifies the parsePaneName function correctly extracts
-// pane identifiers from different pane name formats for reconciliation.
-func TestParsePaneName(t *testing.T) {
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got := isActiveProgressLine(tc.input)
+			if got != tc.expected {
+				t.Errorf("isActiveProgressLine(%q) = %v, want %v", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestIsToolCallLine(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		// Valid tool calls
+		{"Bash(cmd)", true},
+		{"Read(path)", true},
+		{"Write(file)", true},
+		{"Edit(path)", true},
+		{"WebSearch(query)", true},
+		{"LSP(operation)", true},
+		{"Tool123_name(arg)", true},
+		{"MyTool(arg)", true},
+
+		// With spinner prefix (non-ASCII)
+		{"⠋ Bash(cmd)", true},
+		{"⠁⠁⠁ Read(file)", true},
+		{"⣶ Edit(path)", true},
+
+		// Invalid - not starting with capital letter
+		{"bash(cmd)", false},
+		{"read(path)", false},
+		{"123tool(arg)", false},
+
+		// Invalid - no parentheses
+		{"Bash", false},
+		{"Read", false},
+		{"Bash cmd", false},
+
+		// Invalid - empty parentheses
+		{"Bash()", false},
+
+		// Invalid - special chars in name
+		{"Bash-Test(cmd)", false},
+		{"Tool.Name(arg)", false},
+
+		// Edge cases
+		{"", false},
+		{"()", false},
+		{"Bash)(", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got := isToolCallLine(tc.input)
+			if got != tc.expected {
+				t.Errorf("isToolCallLine(%q) = %v, want %v", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestResponseComplete(t *testing.T) {
 	tests := []struct {
 		name     string
-		paneName string
-		want     paneInfo
+		screen   string
+		expected bool
 	}{
 		{
-			name:     "session pane with positive chat ID",
-			paneName: "t123456-789",
-			want: paneInfo{
-				Type:     "session",
-				ChatID:   123456,
-				ThreadID: 789,
-			},
+			name:     "complete with prompt after bullet",
+			screen:   "some text\n● Response here\n❯",
+			expected: true,
 		},
 		{
-			name:     "session pane with negative chat ID (abs value)",
-			paneName: "t123456789012-1",
-			want: paneInfo{
-				Type:     "session",
-				ChatID:   123456789012,
-				ThreadID: 1,
-			},
+			name:     "complete with extra spacing",
+			screen:   "text\n● Response\n  \n❯",
+			expected: true,
 		},
 		{
-			name:     "session pane with zero thread ID",
-			paneName: "t123456-0",
-			want: paneInfo{
-				Type:     "session",
-				ChatID:   123456,
-				ThreadID: 0,
-			},
+			name:     "no bullet present",
+			screen:   "some text\n❯",
+			expected: false,
 		},
 		{
-			name:     "worker pane with short ID",
-			paneName: "w-worker_1-1700000000",
-			want: paneInfo{
-				Type:     "worker",
-				WorkerID: "worker_1",
-			},
+			name:     "no prompt after bullet",
+			screen:   "text\n● Response\nmore text",
+			expected: false,
 		},
 		{
-			name:     "worker pane with longer ID",
-			paneName: "w-worker_100_200-1700000000",
-			want: paneInfo{
-				Type:     "worker",
-				WorkerID: "worker_100_200",
-			},
+			name:     "active timing line blocks completion",
+			screen:   "● Response\n✻ Brewed for 2s\n❯",
+			expected: false,
 		},
 		{
-			name:     "unknown pane - init subtask",
-			paneName: "init-1700000000",
-			want: paneInfo{
-				Type: "unknown",
-			},
+			name:     "active cooking line blocks completion",
+			screen:   "● Response\n✽ Cooking…\n❯",
+			expected: false,
 		},
 		{
-			name:     "unknown pane - malformed session",
-			paneName: "t-abc-def",
-			want: paneInfo{
-				Type: "unknown",
-			},
+			name:     "reading progress blocks completion",
+			screen:   "● Response\nReading 2 files…\n❯",
+			expected: false,
 		},
 		{
-			name:     "unknown pane - malformed worker",
-			paneName: "w-bad-worker-id",
-			want: paneInfo{
-				Type: "unknown",
-			},
+			name:     "prompt appears before bullet",
+			screen:   "❯\ntext\n● Response",
+			expected: false,
 		},
 		{
-			name:     "unknown pane - empty string",
-			paneName: "",
-			want: paneInfo{
-				Type: "unknown",
-			},
+			name:     "multiple bullets, last one has prompt",
+			screen:   "● First\n● Second\n❯",
+			expected: true,
 		},
 		{
-			name:     "unknown pane - session without dash",
-			paneName: "t123456",
-			want: paneInfo{
-				Type: "unknown",
-			},
-		},
-		{
-			name:     "unknown pane - worker without enough dashes",
-			paneName: "w-worker_1",
-			want: paneInfo{
-				Type: "unknown",
-			},
-		},
-		{
-			name:     "unknown pane - random name",
-			paneName: "some-random-window",
-			want: paneInfo{
-				Type: "unknown",
-			},
+			name:     "empty screen",
+			screen:   "",
+			expected: false,
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := parsePaneName(tt.paneName)
-			if got.Type != tt.want.Type {
-				t.Errorf("parsePaneName() Type = %v, want %v", got.Type, tt.want.Type)
-			}
-			if got.ChatID != tt.want.ChatID {
-				t.Errorf("parsePaneName() ChatID = %v, want %v", got.ChatID, tt.want.ChatID)
-			}
-			if got.ThreadID != tt.want.ThreadID {
-				t.Errorf("parsePaneName() ThreadID = %v, want %v", got.ThreadID, tt.want.ThreadID)
-			}
-			if got.WorkerID != tt.want.WorkerID {
-				t.Errorf("parsePaneName() WorkerID = %v, want %v", got.WorkerID, tt.want.WorkerID)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := responseComplete(tc.screen)
+			if got != tc.expected {
+				t.Errorf("responseComplete() = %v, want %v\nscreen was: %q", got, tc.expected, tc.screen)
 			}
 		})
 	}
 }
 
-// TestReconcileOrphanBehavior documents the expected behavior of orphan
-// reconciliation through descriptive test scenarios.
-func TestReconcileOrphanBehavior(t *testing.T) {
-	t.Run("scenario-crash-with-active-sessions", func(t *testing.T) {
-		// Scenario: Bridge crashes while sessions are active
-		//
-		// Before crash:
-		// - tmux has panes: t123-1 (active), t123-2 (active), t456-3 (active)
-		// - DB has sessions: (123,1) active, (123,2) active, (456,3) active
-		//
-		// During crash:
-		// - In-memory PTYManager.idleTimers is lost
-		// - Bridge process exits without cleanup
-		//
-		// After restart (with ReconcileOrphans):
-		// - ReconcileOrphans lists tmux windows: t123-1, t123-2, t456-3
-		// - ReconcileOrphans queries DB for active sessions: (123,1), (123,2), (456,3)
-		// - All panes match live DB records -> no panes killed
-		// - Sessions continue normally on next message
-		//
-		// This is the happy path - no orphaned panes to clean up.
-	})
-
-	t.Run("scenario-crash-with-stale-db-records", func(t *testing.T) {
-		// Scenario: Bridge crashes, then sessions are closed in DB before restart
-		//
-		// Before crash:
-		// - tmux has panes: t123-1 (active)
-		// - DB has session: (123,1) active
-		//
-		// Between crash and restart:
-		// - Session is marked as 'closed' in DB (e.g., by /close command)
-		//
-		// After restart (with ReconcileOrphans):
-		// - ReconcileOrphans lists tmux windows: t123-1
-		// - ReconcileOrphans queries DB for active sessions: empty (session is closed)
-		// - Pane t123-1 has no matching active DB record -> orphan detected
-		// - ReconcileOrphans calls KillPane("telegram-bridge:t123-1")
-		// - Orphaned pane is cleaned up
-		//
-		// This prevents stale panes from lingering after crashes.
-	})
-
-	t.Run("scenario-orphaned-worker-pane", func(t *testing.T) {
-		// Scenario: Worker spawned, then bridge crashes before worker completes
-		//
-		// Before crash:
-		// - tmux has pane: w-worker_1_123-1700000000
-		// - DB has worker: worker_1_123 with status='running'
-		//
-		// Between crash and restart:
-		// - Worker process exits (no parent to reap it)
-		// - Worker DB record still shows status='running'
-		//
-		// After restart (with ReconcileOrphans):
-		// - ReconcileOrphans lists tmux windows: w-worker_1_123-1700000000
-		// - ReconcileOrphans queries DB for running workers: worker_1_123
-		// - Pane name prefix matches worker ID prefix -> pane is valid
-		// - No panes killed (worker pane may still be useful)
-		//
-		// Note: If the worker DB record is updated to 'done'/'failed' before restart,
-		// the pane would be correctly identified as orphan and killed.
-	})
-
-	t.Run("scenario-multiple-orphans-cleaned", func(t *testing.T) {
-		// Scenario: Multiple orphaned panes from various sources
-		//
-		// Before crash:
-		// - tmux has panes: t100-1 (active), t200-2 (closed), w-worker_1-123 (done)
-		// - DB has: session (100,1) active, session (200,2) closed, worker_1 done
-		//
-		// After restart (with ReconcileOrphans):
-		// - ReconcileOrphans lists all three panes
-		// - Active session check: only (100,1) is active -> t100-1 is valid
-		// - Running worker check: none running -> w-worker_1-123 is orphan
-		// - Orphaned panes: t200-2 (session closed), w-worker_1-123 (worker done)
-		// - Both orphaned panes are killed
-		// - Only t100-1 remains active
-		//
-		// This demonstrates multi-pane cleanup in a single reconciliation pass.
-	})
-}
-
-// TestPaneKeyGeneration tests the pane key format used for matching
-// session panes against DB records during reconciliation.
-func TestPaneKeyGeneration(t *testing.T) {
+func TestExtractResponseText(t *testing.T) {
 	tests := []struct {
-		name        string
-		chatID      int64
-		threadID    int64
-		wantPaneKey string
+		name     string
+		screen   string
+		expected string
 	}{
 		{
-			name:        "positive chat ID",
-			chatID:      123456,
-			threadID:    789,
-			wantPaneKey: "t123456-789",
+			name:     "simple response after bullet",
+			screen:   "pre\n● Response text\n❯",
+			expected: "Response text",
 		},
 		{
-			name:        "negative chat ID (absolute value)",
-			chatID:      -123456,
-			threadID:    789,
-			wantPaneKey: "t123456-789",
+			name:     "multiline response",
+			screen:   "pre\n● Line 1\nLine 2\nLine 3\n❯",
+			expected: "Line 1\nLine 2\nLine 3",
 		},
 		{
-			name:        "zero thread ID",
-			chatID:      123456,
-			threadID:    0,
-			wantPaneKey: "t123456-0",
+			name:     "inline text on bullet line",
+			screen:   "pre\n● Response here\nmore\n❯",
+			expected: "Response here\nmore",
 		},
 		{
-			name:        "large negative chat ID",
-			chatID:      -1003602927203,
-			threadID:    120,
-			wantPaneKey: "t1003602927203-120",
+			name:     "filters timing lines",
+			screen:   "pre\n● Text\n✻ Brewed for 2s\nmore\n❯",
+			expected: "Text\nmore",
+		},
+		{
+			name:     "filters tool calls",
+			screen:   "pre\n● Response\nBash(do something)\nResult\n❯",
+			expected: "Response\nResult",
+		},
+		{
+			name:     "filters tool output",
+			screen:   "pre\n● Text\n⎿ tool output\nmore\n❯",
+			expected: "Text\nmore",
+		},
+		{
+			name:     "filters UI chrome",
+			screen:   "pre\n● Text\n──────────\nmore\n❯",
+			expected: "Text\nmore",
+		},
+		{
+			name:     "filters asterisk timing",
+			screen:   "pre\n● Text\n* Word… (2s)\nmore\n❯",
+			expected: "Text\nmore",
+		},
+		{
+			name:     "no bullet",
+			screen:   "some text\n❯",
+			expected: "",
+		},
+		{
+			name:     "bullet with no prompt",
+			screen:   "● Text\nmore",
+			expected: "Text\nmore",
+		},
+		{
+			name:     "empty screen",
+			screen:   "",
+			expected: "",
+		},
+		{
+			name:     "preserves empty lines",
+			screen:   "pre\n● Line 1\n\nLine 3\n❯",
+			expected: "Line 1\n\nLine 3",
+		},
+		{
+			name:     "trims whitespace",
+			screen:   "pre\n● Text  \n  more  \n❯",
+			expected: "Text\nmore",
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Simulate the pane key generation from ReconcileOrphans
-			absChatID := tt.chatID
-			if absChatID < 0 {
-				absChatID = -absChatID
-			}
-			gotPaneKey := fmt.Sprintf("t%d-%d", absChatID, tt.threadID)
-
-			if gotPaneKey != tt.wantPaneKey {
-				t.Errorf("pane key: got %q, want %q", gotPaneKey, tt.wantPaneKey)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractResponseText(tc.screen)
+			if got != tc.expected {
+				t.Errorf("extractResponseText() =\n%q\nwant:\n%q", got, tc.expected)
 			}
 		})
 	}
 }
 
-// TestPlaceholder is a minimal scaffolding test for pty_manager_test.go
-func TestPlaceholder(t *testing.T) {
-	// Placeholder test for basic scaffolding verification
-	if true != true {
-		t.Error("placeholder test failed")
+func TestReadStopHookResponse(t *testing.T) {
+	tempDir := t.TempDir()
+
+	tests := []struct {
+		name         string
+		setupReady   bool
+		setupContent string
+		expectedText string
+		expectedOK   bool
+	}{
+		{
+			name:         "ready file exists with content",
+			setupReady:   true,
+			setupContent: "response text",
+			expectedText: "response text",
+			expectedOK:   true,
+		},
+		{
+			name:         "ready file exists with multiline",
+			setupReady:   true,
+			setupContent: "line 1\nline 2\nline 3",
+			expectedText: "line 1\nline 2\nline 3",
+			expectedOK:   true,
+		},
+		{
+			name:         "ready file exists empty",
+			setupReady:   true,
+			setupContent: "",
+			expectedText: "",
+			expectedOK:   true,
+		},
+		{
+			name:         "ready file missing",
+			setupReady:   false,
+			expectedText: "",
+			expectedOK:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			respFile := filepath.Join(tempDir, "test.resp")
+			readyFile := respFile + ".ready"
+
+			if tc.setupReady {
+				if err := os.WriteFile(respFile, []byte(tc.setupContent), 0600); err != nil {
+					t.Fatalf("write resp file: %v", err)
+				}
+				if err := os.WriteFile(readyFile, []byte("ready"), 0600); err != nil {
+					t.Fatalf("write ready file: %v", err)
+				}
+			}
+
+			text, ok := readStopHookResponse(respFile, readyFile)
+			if text != tc.expectedText {
+				t.Errorf("text = %q, want %q", text, tc.expectedText)
+			}
+			if ok != tc.expectedOK {
+				t.Errorf("ok = %v, want %v", ok, tc.expectedOK)
+			}
+
+			// Files should be cleaned up after reading
+			if tc.setupReady {
+				if _, err := os.Stat(respFile); !os.IsNotExist(err) {
+					t.Error("resp file should be removed after reading")
+				}
+				if _, err := os.Stat(readyFile); !os.IsNotExist(err) {
+					t.Error("ready file should be removed after reading")
+				}
+			}
+		})
+	}
+}
+
+// ── PTYManager Tests ───────────────────────────────────────────────────────────────
+
+func TestNewPTYManager(t *testing.T) {
+	pm := NewPTYManager()
+	if pm == nil {
+		t.Fatal("NewPTYManager returned nil")
+	}
+	if pm.idleTimers == nil {
+		t.Error("idleTimers map not initialized")
+	}
+}
+
+func TestPTYManager_ScheduleIdleKill(t *testing.T) {
+	pm := NewPTYManager()
+	paneTarget := "test-session:123"
+
+	killed := false
+	pm.ScheduleIdleKill(paneTarget, 50*time.Millisecond, func() {
+		killed = true
+	})
+
+	// Timer should be set
+	if _, exists := pm.idleTimers[paneTarget]; !exists {
+		t.Error("timer not set for pane")
+	}
+
+	// Wait for kill
+	time.Sleep(150 * time.Millisecond)
+
+	if !killed {
+		t.Error("kill callback was not invoked")
+	}
+
+	// Timer should be removed
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if _, exists := pm.idleTimers[paneTarget]; exists {
+		t.Error("timer not removed after firing")
+	}
+}
+
+func TestPTYManager_ScheduleIdleKill_Cancel(t *testing.T) {
+	pm := NewPTYManager()
+	paneTarget := "test-session:456"
+
+	killed := false
+	pm.ScheduleIdleKill(paneTarget, 50*time.Millisecond, func() {
+		killed = true
+	})
+
+	// Cancel immediately
+	pm.CancelIdleTimer(paneTarget)
+
+	// Wait longer than the timer
+	time.Sleep(150 * time.Millisecond)
+
+	if killed {
+		t.Error("kill callback should not fire after cancellation")
+	}
+
+	// Timer should be removed
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if _, exists := pm.idleTimers[paneTarget]; exists {
+		t.Error("timer not removed after cancellation")
+	}
+}
+
+func TestPTYManager_ScheduleIdleKill_Replace(t *testing.T) {
+	pm := NewPTYManager()
+	paneTarget := "test-session:789"
+
+	firstKilled := false
+	secondKilled := false
+
+	pm.ScheduleIdleKill(paneTarget, 50*time.Millisecond, func() {
+		firstKilled = true
+	})
+
+	// Replace with new timer
+	pm.ScheduleIdleKill(paneTarget, 200*time.Millisecond, func() {
+		secondKilled = true
+	})
+
+	// First kill time
+	time.Sleep(100 * time.Millisecond)
+	if firstKilled {
+		t.Error("first timer should be cancelled by replacement")
+	}
+
+	// Second kill time
+	time.Sleep(150 * time.Millisecond)
+	if !secondKilled {
+		t.Error("second timer should fire")
+	}
+}
+
+func TestPTYManager_CancelIdleTimer_NoTimer(t *testing.T) {
+	pm := NewPTYManager()
+	// Should not panic
+	pm.CancelIdleTimer("nonexistent:pane")
+}
+
+// ── SnapshotSessionFiles Tests ───────────────────────────────────────────────────────
+
+func TestSnapshotSessionFiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Create test directory structure
+	cwdHash := strings.ReplaceAll("test/path", "/", "-")
+	projectDir := filepath.Join(home, ".claude", "projects", cwdHash)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+
+	// Create some session files
+	sessions := []string{"session-1", "session-2", "session-3"}
+	for _, sess := range sessions {
+		path := filepath.Join(projectDir, sess+".jsonl")
+		if err := os.WriteFile(path, []byte("data"), 0600); err != nil {
+			t.Fatalf("write session file: %v", err)
+		}
+	}
+
+	// Create other files (should be ignored)
+	otherFile := filepath.Join(projectDir, "other.txt")
+	if err := os.WriteFile(otherFile, []byte("data"), 0600); err != nil {
+		t.Fatalf("write other file: %v", err)
+	}
+
+	snap := SnapshotSessionFiles("test/path")
+
+	// Should have 3 session files
+	if len(snap) != 3 {
+		t.Errorf("got %d session files, want 3", len(snap))
+	}
+
+	// All expected sessions should be present
+	for _, sess := range sessions {
+		if !snap[sess] {
+			t.Errorf("snapshot missing session %q", sess)
+		}
+	}
+}
+
+func TestSnapshotSessionFiles_NonexistentDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	snap := SnapshotSessionFiles("/nonexistent/path")
+
+	// Should return empty map, not error
+	if len(snap) != 0 {
+		t.Errorf("got %d session files, want 0 for nonexistent dir", len(snap))
+	}
+}
+
+// ── FindNewSession Tests ──────────────────────────────────────────────────────────────
+
+func TestFindNewSession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cwd := "test/path"
+	cwdHash := strings.ReplaceAll(cwd, "/", "-")
+	projectDir := filepath.Join(home, ".claude", "projects", cwdHash)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+
+	// Create initial snapshot with existing sessions
+	existingSession := "existing-session"
+	path := filepath.Join(projectDir, existingSession+".jsonl")
+	if err := os.WriteFile(path, []byte("data"), 0600); err != nil {
+		t.Fatalf("write existing session: %v", err)
+	}
+
+	snap := SnapshotSessionFiles(cwd)
+	if len(snap) != 1 {
+		t.Fatalf("initial snapshot has %d files, want 1", len(snap))
+	}
+
+	// Add new session
+	newSessionID := "new-session-abc123"
+	newPath := filepath.Join(projectDir, newSessionID+".jsonl")
+	if err := os.WriteFile(newPath, []byte("new data"), 0600); err != nil {
+		t.Fatalf("write new session: %v", err)
+	}
+
+	found, err := FindNewSession(snap, cwd)
+	if err != nil {
+		t.Fatalf("FindNewSession: %v", err)
+	}
+
+	if found != newSessionID {
+		t.Errorf("found session %q, want %q", found, newSessionID)
+	}
+}
+
+func TestFindNewSession_NoNewSession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cwd := "test/path"
+	cwdHash := strings.ReplaceAll(cwd, "/", "-")
+	projectDir := filepath.Join(home, ".claude", "projects", cwdHash)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+
+	// Create a session
+	sess := "session-1"
+	path := filepath.Join(projectDir, sess+".jsonl")
+	if err := os.WriteFile(path, []byte("data"), 0600); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+
+	snap := SnapshotSessionFiles(cwd)
+
+	// Don't add any new sessions
+
+	_, err := FindNewSession(snap, cwd)
+	if err == nil {
+		t.Error("expected error when no new session found")
+	}
+}
+
+func TestFindNewSession_FilterNonJsonl(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cwd := "test/path"
+	cwdHash := strings.ReplaceAll(cwd, "/", "-")
+	projectDir := filepath.Join(home, ".claude", "projects", cwdHash)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+
+	snap := SnapshotSessionFiles(cwd)
+
+	// Add non-jsonl file (should be ignored)
+	txtFile := filepath.Join(projectDir, "not-session.txt")
+	if err := os.WriteFile(txtFile, []byte("data"), 0600); err != nil {
+		t.Fatalf("write txt file: %v", err)
+	}
+
+	// Add actual session
+	sess := "real-session"
+	sessPath := filepath.Join(projectDir, sess+".jsonl")
+	if err := os.WriteFile(sessPath, []byte("data"), 0600); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+
+	found, err := FindNewSession(snap, cwd)
+	if err != nil {
+		t.Fatalf("FindNewSession: %v", err)
+	}
+
+	if found != "real-session" {
+		t.Errorf("found session %q, want real-session", found)
+	}
+}
+
+// ── PrepareRespFile Tests ────────────────────────────────────────────────────────────
+
+func TestPrepareRespFile(t *testing.T) {
+	paneName := "test-pane-123"
+
+	path, err := prepareRespFile(paneName)
+	if err != nil {
+		t.Fatalf("prepareRespFile: %v", err)
+	}
+
+	// Path should be in temp dir
+	if !strings.Contains(path, "telegram-bridge-resp") {
+		t.Errorf("path %q does not contain expected dir", path)
+	}
+	if !strings.HasSuffix(path, paneName+".resp") {
+		t.Errorf("path %q does not end with %s.resp", path, paneName)
+	}
+
+	// Directory should exist
+	dir := filepath.Dir(path)
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		t.Errorf("resp dir %q does not exist", dir)
+	}
+}
+
+func TestPrepareRespFile_RemovesStale(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("TMPDIR", tempDir)
+
+	paneName := "test-pane-456"
+	dir := filepath.Join(tempDir, "telegram-bridge-resp")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Create stale files
+	staleResp := filepath.Join(dir, paneName+".resp")
+	staleReady := filepath.Join(dir, paneName+".resp.ready")
+	staleTmp := filepath.Join(dir, paneName+".resp.tmp")
+
+	os.WriteFile(staleResp, []byte("old"), 0600)
+	os.WriteFile(staleReady, []byte("ready"), 0600)
+	os.WriteFile(staleTmp, []byte("tmp"), 0600)
+
+	// Prepare should remove them
+	path, err := prepareRespFile(paneName)
+	if err != nil {
+		t.Fatalf("prepareRespFile: %v", err)
+	}
+
+	// Stale files should be gone
+	for _, stale := range []string{staleResp, staleReady, staleTmp} {
+		if _, err := os.Stat(stale); !os.IsNotExist(err) {
+			t.Errorf("stale file %q should be removed", stale)
+		}
+	}
+
+	// Returned path should match expected
+	expectedPath := filepath.Join(dir, paneName+".resp")
+	if path != expectedPath {
+		t.Errorf("path = %q, want %q", path, expectedPath)
 	}
 }

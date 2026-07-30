@@ -380,7 +380,7 @@ func (m *BackgroundJobManager) List(ctx context.Context, chatID, threadID int64)
 
 // generateJobID generates a unique 8-character hex job ID.
 func generateJobID() string {
-	return fmt.Sprintf("%08x", time.Now().UnixNano())[:8]
+	return fmt.Sprintf("%08x", uint32(time.Now().UnixNano()))
 }
 
 // parseCommand parses a command string into parts, respecting quoted strings.

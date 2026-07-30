@@ -34,7 +34,7 @@ func mockProxy(t *testing.T, batches [][]contract.Update) *httptest.Server {
 	}))
 }
 
-func makeUpdate(id int64) contract.Update {
+func makePollerUpdate(id int64) contract.Update {
 	return contract.Update{
 		UpdateID:  id,
 		Type:      "message",
@@ -63,7 +63,7 @@ func collect(t *testing.T, ch <-chan contract.Update, count int, timeout time.Du
 
 func TestPoller_DispatchesSingleBatch(t *testing.T) {
 	srv := mockProxy(t, [][]contract.Update{
-		{makeUpdate(100), makeUpdate(101)},
+		{makePollerUpdate(100), makePollerUpdate(101)},
 	})
 	defer srv.Close()
 
@@ -86,8 +86,8 @@ func TestPoller_DispatchesSingleBatch(t *testing.T) {
 
 func TestPoller_DispatchesMultipleBatches(t *testing.T) {
 	srv := mockProxy(t, [][]contract.Update{
-		{makeUpdate(1)},
-		{makeUpdate(2), makeUpdate(3)},
+		{makePollerUpdate(1)},
+		{makePollerUpdate(2), makePollerUpdate(3)},
 	})
 	defer srv.Close()
 
@@ -228,7 +228,7 @@ func TestPoller_DeduplicationFiltersDuplicateUpdateIDs(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a mock proxy that returns the same update batch multiple times.
-	updates := []contract.Update{makeUpdate(1), makeUpdate(2)}
+	updates := []contract.Update{makePollerUpdate(1), makePollerUpdate(2)}
 	var callCount int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&callCount, 1)

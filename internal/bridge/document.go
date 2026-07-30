@@ -155,16 +155,20 @@ func documentExtFromMime(mime *string) string {
 		return ".rs"
 	case strings.Contains(m, "java"):
 		return ".java"
+	case m == "application/x-c":
+		return ".c"
 	case strings.Contains(m, "c++") || strings.Contains(m, "cplusplus"):
 		return ".cpp"
 	case strings.Contains(m, "csharp"):
 		return ".cs"
+	case m == "application/x-bat":
+		return ".bat"
 	case strings.Contains(m, "php"):
 		return ".php"
-	case strings.Contains(m, "shell") || strings.Contains(m, "sh"):
-		return ".sh"
 	case strings.Contains(m, "powershell") || strings.Contains(m, "ps1"):
 		return ".ps1"
+	case strings.Contains(m, "shell") || strings.Contains(m, "sh"):
+		return ".sh"
 	case strings.Contains(m, "sql"):
 		return ".sql"
 	case strings.Contains(m, "markdown"):
