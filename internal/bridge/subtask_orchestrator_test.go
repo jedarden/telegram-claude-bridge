@@ -1435,3 +1435,385 @@ func TestSplitParallelPrompts_UnicodeDelimiterBoundaries(t *testing.T) {
 		})
 	}
 }
+
+// checkEmojiPrompts asserts that the split output matches wantPrompts exactly,
+// byte for byte and rune for rune, and that nothing was mangled into invalid
+// UTF-8 or the U+FFFD replacement character along the way.
+func checkEmojiPrompts(t *testing.T, prompts, wantPrompts []string, wantLen int) {
+	t.Helper()
+	if len(prompts) != wantLen {
+		t.Fatalf("got %d prompts, want %d: %q", len(prompts), wantLen, prompts)
+	}
+	for i, want := range wantPrompts {
+		if prompts[i] != want {
+			t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
+		}
+		if got := len(prompts[i]); got != len(want) {
+			t.Errorf("prompt[%d] has %d bytes, want %d", i, got, len(want))
+		}
+		if got, wantCount := utf8.RuneCountInString(prompts[i]), utf8.RuneCountInString(want); got != wantCount {
+			t.Errorf("prompt[%d] has %d runes, want %d", i, got, wantCount)
+		}
+	}
+	for i, p := range prompts {
+		if !utf8.ValidString(p) {
+			t.Errorf("prompt[%d] = %q is not valid UTF-8", i, p)
+		}
+		if strings.ContainsRune(p, utf8.RuneError) {
+			t.Errorf("prompt[%d] = %q contains the replacement character U+FFFD", i, p)
+		}
+	}
+}
+
+// TestSplitParallelPrompts_CommonEmojiPreservation verifies that everyday emoji
+// — faces, hands, symbols, objects — survive splitting unchanged.
+func TestSplitParallelPrompts_CommonEmojiPreservation(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+	}{
+		// ── Faces ─────────────────────────────────────────────────────────────
+		{
+			name:        "smiley faces one per prompt",
+			input:       "Grinning 😀\n---\nJoy 😂\n---\nWink 😉",
+			wantLen:     3,
+			wantPrompts: []string{"Grinning 😀", "Joy 😂", "Wink 😉"},
+		},
+		{
+			name:        "multiple faces within a single prompt",
+			input:       "😀😃😄😁😆😅\n---\n🙂🙃😉😊😇",
+			wantLen:     2,
+			wantPrompts: []string{"😀😃😄😁😆😅", "🙂🙃😉😊😇"},
+		},
+		{
+			name:        "cat faces and animal emoji",
+			input:       "😺😸😹\n---\n🐶🐱🐭\n---\n🦊🐻🐼",
+			wantLen:     3,
+			wantPrompts: []string{"😺😸😹", "🐶🐱🐭", "🦊🐻🐼"},
+		},
+		// ── Symbols ───────────────────────────────────────────────────────────
+		{
+			name:        "symbol emoji across prompts",
+			input:       "Check ✅\n---\nCross ❌\n---\nWarning ⚠️",
+			wantLen:     3,
+			wantPrompts: []string{"Check ✅", "Cross ❌", "Warning ⚠️"},
+		},
+		{
+			name:        "arrows and math-adjacent symbol emoji",
+			input:       "➡️⬅️⬆️⬇️\n---\n➕➖✖️➗\n---\n♻️🔱⚜️",
+			wantLen:     3,
+			wantPrompts: []string{"➡️⬅️⬆️⬇️", "➕➖✖️➗", "♻️🔱⚜️"},
+		},
+		{
+			name:        "text-presentation symbols without variation selector",
+			input:       "Sun ☀ and cloud ☁\n---\nPeace ☮ and yin yang ☯",
+			wantLen:     2,
+			wantPrompts: []string{"Sun ☀ and cloud ☁", "Peace ☮ and yin yang ☯"},
+		},
+		// ── Objects and activities ────────────────────────────────────────────
+		{
+			name:        "object emoji across prompts",
+			input:       "Ship it 🚀\n---\nFix the bug 🐛\n---\nCelebrate 🎉",
+			wantLen:     3,
+			wantPrompts: []string{"Ship it 🚀", "Fix the bug 🐛", "Celebrate 🎉"},
+		},
+		{
+			name:        "emoji-only prompts",
+			input:       "🚀\n---\n🔥\n---\n🎯",
+			wantLen:     3,
+			wantPrompts: []string{"🚀", "🔥", "🎯"},
+		},
+		// ── Mixed with text and other scripts ─────────────────────────────────
+		{
+			name:        "emoji interleaved with ascii text",
+			input:       "Run 🏃 the tests 🧪 now\n---\nShip 📦 the build 🛠️",
+			wantLen:     2,
+			wantPrompts: []string{"Run 🏃 the tests 🧪 now", "Ship 📦 the build 🛠️"},
+		},
+		{
+			name:        "emoji mixed with non-latin scripts",
+			input:       "日本語 🗾 テスト\n---\nΕλληνικά 🇬🇷 κείμενο\n---\nКириллица 📚 текст",
+			wantLen:     3,
+			wantPrompts: []string{"日本語 🗾 テスト", "Ελληνικά 🇬🇷 κείμενο", "Кириллица 📚 текст"},
+		},
+		{
+			name:        "emoji inside multiline prompt bodies",
+			input:       "Line one 🥇\nLine two 🥈\n---\nLine three 🥉\nLine four 🏅",
+			wantLen:     2,
+			wantPrompts: []string{"Line one 🥇\nLine two 🥈", "Line three 🥉\nLine four 🏅"},
+		},
+		// ── Single prompt / no delimiter ──────────────────────────────────────
+		{
+			name:        "single emoji prompt without delimiter",
+			input:       "Just one prompt with emoji 🌈🦄✨",
+			wantLen:     1,
+			wantPrompts: []string{"Just one prompt with emoji 🌈🦄✨"},
+		},
+		{
+			name:        "emoji preserved across many segments",
+			input:       "1️⃣ one\n---\n2️⃣ two\n---\n3️⃣ three\n---\n4️⃣ four\n---\n5️⃣ five",
+			wantLen:     5,
+			wantPrompts: []string{"1️⃣ one", "2️⃣ two", "3️⃣ three", "4️⃣ four", "5️⃣ five"},
+		},
+		{
+			name:        "whitespace around emoji prompts is trimmed",
+			input:       "   🚀 launch   \n---\n\t🔥 burn\t",
+			wantLen:     2,
+			wantPrompts: []string{"🚀 launch", "🔥 burn"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkEmojiPrompts(t, splitParallelPrompts(tt.input), tt.wantPrompts, tt.wantLen)
+		})
+	}
+}
+
+// TestSplitParallelPrompts_MultiByteEmojiSequences verifies that composite emoji
+// — ZWJ sequences, skin-tone modifiers, regional-indicator flags, keycaps,
+// variation selectors and tag sequences — are never broken apart by splitting.
+func TestSplitParallelPrompts_MultiByteEmojiSequences(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+		wantRunes   []int // rune count per prompt, guards against dropped joiners
+	}{
+		// ── ZWJ sequences ─────────────────────────────────────────────────────
+		{
+			name:        "family zwj sequence stays intact",
+			input:       "Family 👨‍👩‍👧‍👦\n---\nCouple 👩‍❤️‍👨",
+			wantLen:     2,
+			wantPrompts: []string{"Family 👨‍👩‍👧‍👦", "Couple 👩‍❤️‍👨"},
+			wantRunes:   []int{14, 13},
+		},
+		{
+			name:        "profession zwj sequences",
+			input:       "👩‍💻 codes\n---\n👨‍🚀 flies\n---\n🧑‍🍳 cooks",
+			wantLen:     3,
+			wantPrompts: []string{"👩‍💻 codes", "👨‍🚀 flies", "🧑‍🍳 cooks"},
+			wantRunes:   []int{9, 9, 9},
+		},
+		{
+			name:        "handshake zwj sequence between delimiters",
+			input:       "first\n---\n🧑‍🤝‍🧑\n---\nlast",
+			wantLen:     3,
+			wantPrompts: []string{"first", "🧑‍🤝‍🧑", "last"},
+			wantRunes:   []int{5, 5, 4},
+		},
+		// ── Skin tone modifiers ───────────────────────────────────────────────
+		{
+			name:        "skin tone modifiers on thumbs up",
+			input:       "👍🏻\n---\n👍🏽\n---\n👍🏿",
+			wantLen:     3,
+			wantPrompts: []string{"👍🏻", "👍🏽", "👍🏿"},
+			wantRunes:   []int{2, 2, 2},
+		},
+		{
+			name:        "skin tone modifier inside a zwj sequence",
+			input:       "👩🏽‍💻 reviews\n---\n👨🏿‍🔬 experiments",
+			wantLen:     2,
+			wantPrompts: []string{"👩🏽‍💻 reviews", "👨🏿‍🔬 experiments"},
+			wantRunes:   []int{12, 16},
+		},
+		// ── Regional indicator flags ──────────────────────────────────────────
+		{
+			name:        "regional indicator flags one per prompt",
+			input:       "🇫🇷\n---\n🇩🇪\n---\n🇯🇵",
+			wantLen:     3,
+			wantPrompts: []string{"🇫🇷", "🇩🇪", "🇯🇵"},
+			wantRunes:   []int{2, 2, 2},
+		},
+		{
+			name:        "adjacent flags are not regrouped across the delimiter",
+			input:       "🇺🇸🇬🇧\n---\n🇨🇦🇦🇺",
+			wantLen:     2,
+			wantPrompts: []string{"🇺🇸🇬🇧", "🇨🇦🇦🇺"},
+			wantRunes:   []int{4, 4},
+		},
+		{
+			name:        "tag sequence flag stays intact",
+			input:       "Scotland 🏴󠁧󠁢󠁳󠁣󠁴󠁿\n---\nEngland 🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+			wantLen:     2,
+			wantPrompts: []string{"Scotland 🏴󠁧󠁢󠁳󠁣󠁴󠁿", "England 🏴󠁧󠁢󠁥󠁮󠁧󠁿"},
+			wantRunes:   []int{16, 15},
+		},
+		// ── Keycaps and variation selectors ───────────────────────────────────
+		{
+			name:        "keycap sequences with combining enclosing keycap",
+			input:       "0️⃣\n---\n#️⃣\n---\n*️⃣",
+			wantLen:     3,
+			wantPrompts: []string{"0️⃣", "#️⃣", "*️⃣"},
+			wantRunes:   []int{3, 3, 3},
+		},
+		{
+			name:        "variation selector 16 is preserved",
+			input:       "❤️ heart\n---\n☂️ umbrella",
+			wantLen:     2,
+			wantPrompts: []string{"❤️ heart", "☂️ umbrella"},
+			wantRunes:   []int{8, 11},
+		},
+		{
+			name:        "emoji and text presentation of the same base char stay distinct",
+			input:       "❤️\n---\n❤",
+			wantLen:     2,
+			wantPrompts: []string{"❤️", "❤"},
+			wantRunes:   []int{2, 1},
+		},
+		// ── Mixed composite sequences ─────────────────────────────────────────
+		{
+			name:        "several composite sequences in one prompt",
+			input:       "👨‍👩‍👧 👍🏾 🇧🇷 7️⃣\n---\nplain",
+			wantLen:     2,
+			wantPrompts: []string{"👨‍👩‍👧 👍🏾 🇧🇷 7️⃣", "plain"},
+			wantRunes:   []int{15, 5},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			checkEmojiPrompts(t, prompts, tt.wantPrompts, tt.wantLen)
+			for i, want := range tt.wantRunes {
+				if i >= len(prompts) {
+					break
+				}
+				if got := utf8.RuneCountInString(prompts[i]); got != want {
+					t.Errorf("prompt[%d] = %q has %d runes, want %d", i, prompts[i], got, want)
+				}
+			}
+		})
+	}
+
+	// Joiners carry the meaning of a composite sequence: if splitting dropped a
+	// zero-width joiner or a variation selector the prompts would still compare
+	// as "looks like emoji" but render as separate glyphs.
+	t.Run("zero-width joiners and variation selectors survive", func(t *testing.T) {
+		prompts := splitParallelPrompts("👨‍👩‍👧‍👦\n---\n❤️\n---\n5️⃣")
+		if len(prompts) != 3 {
+			t.Fatalf("got %d prompts, want 3: %q", len(prompts), prompts)
+		}
+		if got := strings.Count(prompts[0], "‍"); got != 3 {
+			t.Errorf("family sequence has %d zero-width joiners, want 3", got)
+		}
+		if !strings.ContainsRune(prompts[1], '️') {
+			t.Errorf("prompt[1] = %q lost variation selector U+FE0F", prompts[1])
+		}
+		if !strings.ContainsRune(prompts[2], '⃣') {
+			t.Errorf("prompt[2] = %q lost combining enclosing keycap U+20E3", prompts[2])
+		}
+	})
+}
+
+// TestSplitParallelPrompts_EmojiAtDelimiterBoundaries verifies emoji sitting
+// directly against the "\n---\n" delimiter, including emoji-only segments and
+// literal "---" runs that are not delimiters.
+func TestSplitParallelPrompts_EmojiAtDelimiterBoundaries(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+	}{
+		{
+			name:        "emoji touching both sides of delimiter",
+			input:       "🚀\n---\n🔥",
+			wantLen:     2,
+			wantPrompts: []string{"🚀", "🔥"},
+		},
+		{
+			name:        "zwj sequence touching both sides of delimiter",
+			input:       "👨‍👩‍👧‍👦\n---\n👩‍💻",
+			wantLen:     2,
+			wantPrompts: []string{"👨‍👩‍👧‍👦", "👩‍💻"},
+		},
+		{
+			name:        "flag touching both sides of delimiter",
+			input:       "🇯🇵\n---\n🇰🇷",
+			wantLen:     2,
+			wantPrompts: []string{"🇯🇵", "🇰🇷"},
+		},
+		{
+			name:        "skin tone modifier is last rune before delimiter",
+			input:       "ship it 👍🏽\n---\nnext",
+			wantLen:     2,
+			wantPrompts: []string{"ship it 👍🏽", "next"},
+		},
+		{
+			name:        "keycap sequence is first thing after delimiter",
+			input:       "first\n---\n1️⃣ step one",
+			wantLen:     2,
+			wantPrompts: []string{"first", "1️⃣ step one"},
+		},
+		{
+			name:        "emoji adjacent to leading delimiter",
+			input:       "---\n🚀 launch\n---\n🔥 burn",
+			wantLen:     2,
+			wantPrompts: []string{"---\n🚀 launch", "🔥 burn"},
+		},
+		{
+			name:        "emoji adjacent to trailing delimiter",
+			input:       "🚀 launch\n---\n🔥 burn\n---",
+			wantLen:     2,
+			wantPrompts: []string{"🚀 launch", "🔥 burn\n---"},
+		},
+		{
+			name:        "emoji-only segment between consecutive delimiters",
+			input:       "first\n---\n🎉\n---\nlast",
+			wantLen:     3,
+			wantPrompts: []string{"first", "🎉", "last"},
+		},
+		{
+			name:        "empty segment between emoji segments is dropped",
+			input:       "🚀\n---\n\n---\n🔥",
+			wantLen:     2,
+			wantPrompts: []string{"🚀", "🔥"},
+		},
+		{
+			name:        "whitespace-only segment between emoji segments is dropped",
+			input:       "🚀\n---\n   \n---\n🔥",
+			wantLen:     2,
+			wantPrompts: []string{"🚀", "🔥"},
+		},
+		{
+			name:        "dashes on the same line as emoji do not split",
+			input:       "🚀---🔥\n---\n🎯---🎉",
+			wantLen:     2,
+			wantPrompts: []string{"🚀---🔥", "🎯---🎉"},
+		},
+		{
+			name:        "delimiter-like line flanked by emoji does not split",
+			input:       "🚀\n--- 🔥\nstill one prompt",
+			wantLen:     1,
+			wantPrompts: []string{"🚀\n--- 🔥\nstill one prompt"},
+		},
+		{
+			name:        "emoji dash lookalikes are not a delimiter",
+			input:       "🚀\n➖➖➖\n🔥",
+			wantLen:     1,
+			wantPrompts: []string{"🚀\n➖➖➖\n🔥"},
+		},
+		{
+			name:        "trailing whitespace after emoji before delimiter is trimmed",
+			input:       "🚀 launch  \n---\n  🔥 burn",
+			wantLen:     2,
+			wantPrompts: []string{"🚀 launch", "🔥 burn"},
+		},
+		{
+			name:        "blank lines around emoji segments are trimmed",
+			input:       "\n\n🚀\n\n---\n\n🔥\n\n",
+			wantLen:     2,
+			wantPrompts: []string{"🚀", "🔥"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkEmojiPrompts(t, splitParallelPrompts(tt.input), tt.wantPrompts, tt.wantLen)
+		})
+	}
+}
