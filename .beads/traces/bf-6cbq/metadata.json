@@ -1,5 +1,5 @@
 {
-  "bead_id": "bf-dozd",
+  "bead_id": "bf-6cbq",
   "agent": "echo-test",
   "provider": null,
   "model": null,
@@ -9,7 +9,7 @@
   "input_tokens": null,
   "output_tokens": null,
   "cost_usd": null,
-  "captured_at": "2026-07-19T21:18:31.150412430Z",
+  "captured_at": "2026-07-29T02:30:38.878568368Z",
   "trace_format": "raw_text",
   "pruned": false,
   "template_version": null
