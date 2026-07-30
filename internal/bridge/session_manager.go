@@ -484,10 +484,11 @@ type claudeOutput struct {
 	Usage         *UsageInfo `json:"usage,omitempty"`
 	StreamMsgID   int64      // non-zero when streaming edits were posted
 	PlaceholderID int64      // non-zero when placeholder was sent (used in summary mode)
-	// File attachments for outbound media (audio/video/images)
-	AudioFiles []audioAttachment `json:"audio_files,omitempty"`
-	VideoFiles []videoAttachment `json:"video_files,omitempty"`
-	ImageFiles []imageAttachment `json:"image_files,omitempty"`
+	// File attachments for outbound media (audio/video/images/documents)
+	AudioFiles    []audioAttachment `json:"audio_files,omitempty"`
+	VideoFiles    []videoAttachment `json:"video_files,omitempty"`
+	ImageFiles    []imageAttachment `json:"image_files,omitempty"`
+	DocumentFiles []docAttachment   `json:"document_files,omitempty"`
 }
 
 // audioAttachment represents an audio file to be sent to Telegram.
@@ -509,6 +510,13 @@ type imageAttachment struct {
 	Path     string // Path to the image file
 	Filename string // Filename to use when sending
 	Caption  string // Optional caption for the image
+}
+
+// docAttachment represents a generic document file to be sent to Telegram.
+type docAttachment struct {
+	Path     string // Path to the document file
+	Filename string // Filename to use when sending
+	Caption  string // Optional caption for the document
 }
 
 // streamLine is the envelope for each NDJSON line emitted by
@@ -3170,10 +3178,10 @@ func (m *SessionManager) createClaudeSession(ctx context.Context, group *Group, 
 	return sid, nil
 }
 
-// detectGeneratedMedia scans the working directory for audio and video files
-// created during the session invocation. It populates out.AudioFiles and out.VideoFiles
-// with any discovered media files. Only files created or modified after startTime
-// are considered.
+// detectGeneratedMedia scans the working directory for media and document files
+// created during the session invocation. It populates out.AudioFiles, out.VideoFiles,
+// out.ImageFiles and out.DocumentFiles with any discovered files. Only files created
+// or modified after startTime are considered.
 func (m *SessionManager) detectGeneratedMedia(cwd string, startTime time.Time, out *claudeOutput) error {
 	// Audio file extensions to look for
 	audioExts := map[string]bool{
@@ -3204,6 +3212,26 @@ func (m *SessionManager) detectGeneratedMedia(cwd string, startTime time.Time, o
 		".gif":  true,
 		".webp": true,
 		".svg":  true,
+	}
+
+	// Document file extensions to look for. These are sent as generic
+	// Telegram documents rather than as typed media.
+	docExts := map[string]bool{
+		".pdf":  true,
+		".csv":  true,
+		".zip":  true,
+		".txt":  true,
+		".md":   true,
+		".json": true,
+		".xml":  true,
+		".html": true,
+		".yaml": true,
+		".yml":  true,
+		".docx": true,
+		".xlsx": true,
+		".pptx": true,
+		".tsv":  true,
+		".log":  true,
 	}
 
 	// Walk the working directory looking for media files
@@ -3294,6 +3322,23 @@ func (m *SessionManager) detectGeneratedMedia(cwd string, startTime time.Time, o
 				Caption:  "", // No caption by default
 			})
 			log.Printf("[session_mgr] detected generated image file: %s", path)
+			return nil
+		}
+
+		// Check for document files
+		if docExts[ext] {
+			// Skip if already in the list
+			for _, doc := range out.DocumentFiles {
+				if doc.Path == path {
+					return nil
+				}
+			}
+			out.DocumentFiles = append(out.DocumentFiles, docAttachment{
+				Path:     path,
+				Filename: baseName,
+				Caption:  "", // No caption by default
+			})
+			log.Printf("[session_mgr] detected generated document file: %s", path)
 			return nil
 		}
 
