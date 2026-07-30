@@ -1695,6 +1695,33 @@ func (d *DB) DeleteWorkersForTopic(ctx context.Context, chatID, threadID int64) 
 	return err
 }
 
+// ListStaleWorkers returns workers stuck in 'running' status past the worker TTL.
+func (d *DB) ListStaleWorkers(ctx context.Context, ttl time.Duration) ([]*Worker, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT id, chat_id, thread_id, parent_msg, prompt, session_id, model,
+				        status, result, error, started_at, finished_at
+				 FROM workers
+				 WHERE status = 'running'
+				   AND datetime(started_at) < datetime('now', '-' || ? || ' seconds')
+				 ORDER BY started_at ASC`,
+		int64(ttl.Seconds()),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var workers []*Worker
+	for rows.Next() {
+		w, err := scanWorker(rows)
+		if err != nil {
+			return nil, err
+		}
+		workers = append(workers, w)
+	}
+	return workers, rows.Err()
+}
+
 type workerScanner interface {
 	Scan(dest ...any) error
 }

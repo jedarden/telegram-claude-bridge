@@ -2,6 +2,7 @@
 bin/
 /bridge
 /proxy
+/dashboard
 
 # Database files
 *.db

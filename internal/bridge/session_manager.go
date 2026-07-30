@@ -228,7 +228,7 @@ var helpPhrases = []string{
 // colorPhrases is a table of known color-setting phrases with their target colors.
 // Checked case-insensitively; first match wins.
 type colorPhrase struct {
-	phrase     string
+	phrase      string
 	targetColor int
 }
 
@@ -395,16 +395,17 @@ type SessionManager struct {
 	workerPool     *WorkerPool
 	eventPublisher events.Publishable
 	ptyMgr         *PTYManager
+	commandExec    commandExec // for executing external commands (whisper, ffmpeg, etc.)
 
-	mu                    sync.Mutex
-	topics                map[topicKey]*topicWorker
-	pinnedUpdateLastSeen  map[topicKey]time.Time         // debounce: track last pinned msg update time
-	pendingContext        map[topicKey]string            // pending context to inject into next prompt
-	pendingWorkerResults  map[topicKey][]WorkerResult    // completed worker results to inject into next prompt
-	pendingTranscripts    map[topicKey]map[int64]string   // pending approved transcripts (messageID -> transcript) to inject into next prompt
-	activeInvocations     map[topicKey]*activeInvocation // tracks running commands for cancellation
-	approvalChans         map[topicKey]chan toolApproval // tool approval channels for plan mode
-	paneNames             map[topicKey]string            // topicKey → active tmux pane target
+	mu                   sync.Mutex
+	topics               map[topicKey]*topicWorker
+	pinnedUpdateLastSeen map[topicKey]time.Time         // debounce: track last pinned msg update time
+	pendingContext       map[topicKey]string            // pending context to inject into next prompt
+	pendingWorkerResults map[topicKey][]WorkerResult    // completed worker results to inject into next prompt
+	pendingTranscripts   map[topicKey]map[int64]string  // pending approved transcripts (messageID -> transcript) to inject into next prompt
+	activeInvocations    map[topicKey]*activeInvocation // tracks running commands for cancellation
+	approvalChans        map[topicKey]chan toolApproval // tool approval channels for plan mode
+	paneNames            map[topicKey]string            // topicKey → active tmux pane target
 }
 
 type topicKey struct {
@@ -475,17 +476,18 @@ func sessionToMap(sess *Session) map[string]interface{} {
 // the subprocess run; processBatch edits it with the final canonical text.
 // PlaceholderID is the "Thinking…" message ID for summary/quiet mode handling.
 type claudeOutput struct {
-	Type         string     `json:"type"`
-	SessionID    string     `json:"session_id"`
-	Result       string     `json:"result"`
-	IsError      bool       `json:"is_error"`
-	TotalCostUSD float64    `json:"total_cost_usd"`
-	Usage        *UsageInfo `json:"usage,omitempty"`
-	StreamMsgID  int64      // non-zero when streaming edits were posted
-	PlaceholderID int64     // non-zero when placeholder was sent (used in summary mode)
-	// File attachments for outbound media (audio/video)
+	Type          string     `json:"type"`
+	SessionID     string     `json:"session_id"`
+	Result        string     `json:"result"`
+	IsError       bool       `json:"is_error"`
+	TotalCostUSD  float64    `json:"total_cost_usd"`
+	Usage         *UsageInfo `json:"usage,omitempty"`
+	StreamMsgID   int64      // non-zero when streaming edits were posted
+	PlaceholderID int64      // non-zero when placeholder was sent (used in summary mode)
+	// File attachments for outbound media (audio/video/images)
 	AudioFiles []audioAttachment `json:"audio_files,omitempty"`
 	VideoFiles []videoAttachment `json:"video_files,omitempty"`
+	ImageFiles []imageAttachment `json:"image_files,omitempty"`
 }
 
 // audioAttachment represents an audio file to be sent to Telegram.
@@ -500,6 +502,13 @@ type videoAttachment struct {
 	Path     string // Path to the video file
 	Filename string // Filename to use when sending
 	Caption  string // Optional caption for the video
+}
+
+// imageAttachment represents an image file to be sent to Telegram.
+type imageAttachment struct {
+	Path     string // Path to the image file
+	Filename string // Filename to use when sending
+	Caption  string // Optional caption for the image
 }
 
 // streamLine is the envelope for each NDJSON line emitted by
@@ -607,6 +616,7 @@ func NewSessionManager(db *DB, sender *Sender, proxyURL string, eventPublisher e
 		proxyURL:             proxyURL,
 		eventPublisher:       eventPublisher,
 		ptyMgr:               NewPTYManager(),
+		commandExec:          realCommandExec{},
 		topics:               make(map[topicKey]*topicWorker),
 		pinnedUpdateLastSeen: make(map[topicKey]time.Time),
 		pendingContext:       make(map[topicKey]string),
@@ -2821,9 +2831,9 @@ func (m *SessionManager) SubmitApprovedTranscript(chatID, threadID int64, messag
 	// Create a synthetic update with the approved transcript as text
 	// This will be processed as if the user typed the transcript
 	syntheticUpdate := contract.Update{
-		UpdateID: int64(time.Now().UnixNano()),
-		ChatID:   chatID,
-		ThreadID: &threadID,
+		UpdateID:  int64(time.Now().UnixNano()),
+		ChatID:    chatID,
+		ThreadID:  &threadID,
 		MessageID: messageID,
 		Content: &contract.Content{
 			Type: contract.ContentTypeText,
@@ -3186,6 +3196,16 @@ func (m *SessionManager) detectGeneratedMedia(cwd string, startTime time.Time, o
 		".flv":  true,
 	}
 
+	// Image file extensions to look for
+	imageExts := map[string]bool{
+		".png":  true,
+		".jpg":  true,
+		".jpeg": true,
+		".gif":  true,
+		".webp": true,
+		".svg":  true,
+	}
+
 	// Walk the working directory looking for media files
 	err := filepath.Walk(cwd, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -3257,6 +3277,23 @@ func (m *SessionManager) detectGeneratedMedia(cwd string, startTime time.Time, o
 				Caption:  "", // No caption by default
 			})
 			log.Printf("[session_mgr] detected generated video file: %s", path)
+			return nil
+		}
+
+		// Check for image files
+		if imageExts[ext] {
+			// Skip if already in the list
+			for _, img := range out.ImageFiles {
+				if img.Path == path {
+					return nil
+				}
+			}
+			out.ImageFiles = append(out.ImageFiles, imageAttachment{
+				Path:     path,
+				Filename: baseName,
+				Caption:  "", // No caption by default
+			})
+			log.Printf("[session_mgr] detected generated image file: %s", path)
 			return nil
 		}
 

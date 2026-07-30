@@ -1,8 +1,10 @@
 package bridge
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -450,5 +452,178 @@ func TestSender_Respects_RateLimit(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Errorf("expected 2 calls (1 rate-limited + 1 success), got %d", calls)
+	}
+}
+
+func TestSender_SendPhoto_MultipartForm(t *testing.T) {
+	var receivedChatID string
+	var receivedThreadID string
+	var receivedCaption string
+	var receivedReplyTo string
+	var receivedFilename string
+	var receivedContent []byte
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/send_photo" {
+			http.NotFound(w, r)
+			return
+		}
+
+		// Parse multipart form
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Extract form fields
+		receivedChatID = r.FormValue("chat_id")
+		receivedThreadID = r.FormValue("thread_id")
+		receivedCaption = r.FormValue("caption")
+		receivedReplyTo = r.FormValue("reply_to_message_id")
+
+		// Extract file
+		file, header, err := r.FormFile("photo")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+
+		receivedFilename = header.Filename
+		receivedContent = make([]byte, header.Size)
+		if _, err := file.Read(receivedContent); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		json.NewEncoder(w).Encode(contract.SendResponse{OK: true, MessageID: 42})
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, srv.URL)
+	ctx := context.Background()
+
+	// Test with all fields populated
+	chatID := int64(-1001234567890)
+	threadID := int64(123)
+	origMsgID := int64(99)
+	caption := "Test image"
+	filename := "test.png"
+	content := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A} // PNG header
+
+	err := s.SendPhoto(ctx, chatID, &threadID, origMsgID, caption, filename, content)
+	if err != nil {
+		t.Fatalf("SendPhoto failed: %v", err)
+	}
+
+	// Verify all fields were sent correctly
+	if receivedChatID != fmt.Sprintf("%d", chatID) {
+		t.Errorf("chat_id = %s, want %d", receivedChatID, chatID)
+	}
+	if receivedThreadID != fmt.Sprintf("%d", threadID) {
+		t.Errorf("thread_id = %s, want %d", receivedThreadID, threadID)
+	}
+	if receivedCaption != caption {
+		t.Errorf("caption = %s, want %s", receivedCaption, caption)
+	}
+	if receivedReplyTo != fmt.Sprintf("%d", origMsgID) {
+		t.Errorf("reply_to_message_id = %s, want %d", receivedReplyTo, origMsgID)
+	}
+	if receivedFilename != filename {
+		t.Errorf("filename = %s, want %s", receivedFilename, filename)
+	}
+	if !bytes.Equal(receivedContent, content) {
+		t.Errorf("content mismatch: got %v, want %v", receivedContent, content)
+	}
+}
+
+func TestSender_SendPhoto_WithoutOptionalFields(t *testing.T) {
+	var receivedChatID string
+	var receivedThreadID string
+	var receivedCaption string
+	var receivedReplyTo string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/send_photo" {
+			http.NotFound(w, r)
+			return
+		}
+
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		receivedChatID = r.FormValue("chat_id")
+		receivedThreadID = r.FormValue("thread_id")
+		receivedCaption = r.FormValue("caption")
+		receivedReplyTo = r.FormValue("reply_to_message_id")
+
+		// Verify file exists
+		file, _, err := r.FormFile("photo")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		file.Close()
+
+		json.NewEncoder(w).Encode(contract.SendResponse{OK: true, MessageID: 42})
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, srv.URL)
+	ctx := context.Background()
+
+	// Test with minimal fields (no threadID, no caption, no reply)
+	chatID := int64(-1001234567890)
+	content := []byte("minimal photo data")
+
+	err := s.SendPhoto(ctx, chatID, nil, 0, "", "photo.jpg", content)
+	if err != nil {
+		t.Fatalf("SendPhoto failed: %v", err)
+	}
+
+	if receivedChatID != fmt.Sprintf("%d", chatID) {
+		t.Errorf("chat_id = %s, want %d", receivedChatID, chatID)
+	}
+	if receivedThreadID != "" {
+		t.Errorf("thread_id should be empty when nil, got %s", receivedThreadID)
+	}
+	if receivedCaption != "" {
+		t.Errorf("caption should be empty when empty string, got %s", receivedCaption)
+	}
+	if receivedReplyTo != "" {
+		t.Errorf("reply_to_message_id should be empty when 0, got %s", receivedReplyTo)
+	}
+}
+
+func TestSender_SendPhoto_ErrorResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(contract.ErrorResponse{
+			ErrorCode:   400,
+			Description: "Bad Request",
+		})
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, srv.URL)
+	ctx := context.Background()
+
+	err := s.SendPhoto(ctx, -100, nil, 0, "", "photo.jpg", []byte("data"))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	apiErr, ok := err.(*contract.ErrorResponse)
+	if !ok {
+		t.Fatalf("expected *contract.ErrorResponse, got %T", err)
+	}
+	if apiErr.ErrorCode != 400 {
+		t.Errorf("error code = %d, want 400", apiErr.ErrorCode)
+	}
+	if apiErr.Description != "Bad Request" {
+		t.Errorf("description = %s, want 'Bad Request'", apiErr.Description)
 	}
 }
