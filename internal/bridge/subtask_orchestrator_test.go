@@ -1817,3 +1817,386 @@ func TestSplitParallelPrompts_EmojiAtDelimiterBoundaries(t *testing.T) {
 		})
 	}
 }
+
+// ── length limits and truncation ───────────────────────────────────────────────
+//
+// splitParallelPrompts applies no length limit of its own: it splits on
+// "\n---\n", trims each segment, and returns whatever remains. The package's
+// only length ceiling is maxMessageLen (4096), which belongs to the Telegram
+// sender and is applied downstream when *results* are posted back — never to
+// prompts on the way in. The tests below pin that contract down so a long
+// prompt reaches Claude whole instead of being silently clipped at a delimiter
+// or, worse, in the middle of a multi-byte rune.
+
+// checkNoTruncation asserts prompts match wantPrompts exactly — byte count,
+// rune count, and content — so silent clipping surfaces as a length mismatch
+// rather than an unreadable inequality on multi-kilobyte strings.
+func checkNoTruncation(t *testing.T, prompts, wantPrompts []string) {
+	t.Helper()
+	if len(prompts) != len(wantPrompts) {
+		t.Fatalf("got %d prompts, want %d", len(prompts), len(wantPrompts))
+	}
+	for i, want := range wantPrompts {
+		got := prompts[i]
+		if len(got) != len(want) {
+			t.Errorf("prompt[%d] has %d bytes, want %d (short by %d)", i, len(got), len(want), len(want)-len(got))
+		}
+		if g, w := utf8.RuneCountInString(got), utf8.RuneCountInString(want); g != w {
+			t.Errorf("prompt[%d] has %d runes, want %d", i, g, w)
+		}
+		if got != want {
+			// Report the divergence offset instead of dumping kilobytes.
+			t.Errorf("prompt[%d] diverges from want at byte offset %d", i, firstDiffOffset(got, want))
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("prompt[%d] is not valid UTF-8 — cut mid-rune?", i)
+		}
+		if strings.ContainsRune(got, utf8.RuneError) && !strings.ContainsRune(want, utf8.RuneError) {
+			t.Errorf("prompt[%d] gained the replacement character U+FFFD", i)
+		}
+	}
+}
+
+// firstDiffOffset returns the byte offset of the first difference between a and
+// b, or the length of the shorter string if one is a prefix of the other.
+func firstDiffOffset(a, b string) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
+}
+
+// TestSplitParallelPrompts_SinglePromptExceedsLengthLimit verifies that a single
+// prompt straddling maxMessageLen is returned whole — the sender's 4096-byte
+// ceiling is not applied to prompts.
+func TestSplitParallelPrompts_SinglePromptExceedsLengthLimit(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "one byte under the limit",
+			input: strings.Repeat("a", maxMessageLen-1),
+			want:  []string{strings.Repeat("a", maxMessageLen-1)},
+		},
+		{
+			name:  "exactly at the limit",
+			input: strings.Repeat("a", maxMessageLen),
+			want:  []string{strings.Repeat("a", maxMessageLen)},
+		},
+		{
+			name:  "one byte over the limit",
+			input: strings.Repeat("a", maxMessageLen+1),
+			want:  []string{strings.Repeat("a", maxMessageLen+1)},
+		},
+		{
+			name:  "ten times the limit",
+			input: strings.Repeat("a", maxMessageLen*10),
+			want:  []string{strings.Repeat("a", maxMessageLen*10)},
+		},
+		{
+			name:  "over the limit with distinct tail so a prefix cut is detectable",
+			input: strings.Repeat("a", maxMessageLen) + "TAIL-SENTINEL",
+			want:  []string{strings.Repeat("a", maxMessageLen) + "TAIL-SENTINEL"},
+		},
+		{
+			name:  "over the limit wrapped in whitespace trims only the edges",
+			input: "\n\n  " + strings.Repeat("b", maxMessageLen+500) + "  \n\n",
+			want:  []string{strings.Repeat("b", maxMessageLen+500)},
+		},
+		{
+			name:  "over the limit with embedded newlines stays one prompt",
+			input: strings.Repeat("line of text\n", 500),
+			want:  []string{strings.TrimSpace(strings.Repeat("line of text\n", 500))},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkNoTruncation(t, splitParallelPrompts(tt.input), tt.want)
+		})
+	}
+}
+
+// TestSplitParallelPrompts_MultipleLongPromptsNotTruncated verifies that every
+// segment of a multi-prompt input survives at full length, including inputs
+// whose combined size dwarfs maxMessageLen.
+func TestSplitParallelPrompts_MultipleLongPromptsNotTruncated(t *testing.T) {
+	var (
+		longA = strings.Repeat("A", maxMessageLen+1)
+		longB = strings.Repeat("B", maxMessageLen+1)
+		longC = strings.Repeat("C", maxMessageLen*3)
+	)
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "two prompts each over the limit",
+			input: longA + "\n---\n" + longB,
+			want:  []string{longA, longB},
+		},
+		{
+			name:  "five prompts each over the limit",
+			input: strings.Join([]string{longA, longB, longC, longA, longB}, "\n---\n"),
+			want:  []string{longA, longB, longC, longA, longB},
+		},
+		{
+			name: "each segment under the limit but the total is far over",
+			input: strings.Join([]string{
+				strings.Repeat("x", 2000),
+				strings.Repeat("y", 2000),
+				strings.Repeat("z", 2000),
+			}, "\n---\n"),
+			want: []string{
+				strings.Repeat("x", 2000),
+				strings.Repeat("y", 2000),
+				strings.Repeat("z", 2000),
+			},
+		},
+		{
+			name:  "long prompt followed by a short one",
+			input: longA + "\n---\nshort",
+			want:  []string{longA, "short"},
+		},
+		{
+			name:  "short prompt followed by a long one",
+			input: "short\n---\n" + longB,
+			want:  []string{"short", longB},
+		},
+		{
+			name:  "long prompts around a dropped empty segment",
+			input: longA + "\n---\n\n---\n" + longB,
+			want:  []string{longA, longB},
+		},
+		{
+			name:  "long prompts with padded segments trimmed at the edges only",
+			input: "  " + longA + "  \n---\n\t" + longB + "\t",
+			want:  []string{longA, longB},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkNoTruncation(t, splitParallelPrompts(tt.input), tt.want)
+		})
+	}
+}
+
+// TestSplitParallelPrompts_UnicodeExceedsLengthLimit verifies that oversized
+// multi-byte content is not clipped. A byte-oriented cut at maxMessageLen would
+// land mid-rune for most of these inputs, so the rune-count and validity checks
+// in checkNoTruncation are the real assertions here.
+func TestSplitParallelPrompts_UnicodeExceedsLengthLimit(t *testing.T) {
+	var (
+		// 3 bytes per rune: byte offset 4096 falls one byte into a rune.
+		cjk = strings.Repeat("日", 2000)
+		// 4 bytes per rune: byte offset 4096 falls on a rune boundary, so a
+		// naive cut would silently produce a shorter-but-valid string.
+		emoji = strings.Repeat("🚀", 1500)
+		// Decomposed sequences: a cut could strand a combining mark.
+		combining = strings.Repeat("é", 3000) // e + U+0301
+		// Mixed scripts, well past the limit.
+		mixed = strings.Repeat("aé日🚀Ω", 1200)
+	)
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "CJK prompt over the limit in bytes",
+			input: cjk,
+			want:  []string{cjk},
+		},
+		{
+			name:  "emoji prompt over the limit in bytes",
+			input: emoji,
+			want:  []string{emoji},
+		},
+		{
+			name:  "combining sequences over the limit",
+			input: combining,
+			want:  []string{combining},
+		},
+		{
+			name:  "mixed scripts over the limit",
+			input: mixed,
+			want:  []string{mixed},
+		},
+		{
+			name:  "prompt over the limit in runes as well as bytes",
+			input: strings.Repeat("日", maxMessageLen+1),
+			want:  []string{strings.Repeat("日", maxMessageLen+1)},
+		},
+		{
+			name:  "two oversized Unicode prompts",
+			input: cjk + "\n---\n" + emoji,
+			want:  []string{cjk, emoji},
+		},
+		{
+			name:  "oversized Unicode prompts with a ZWJ family sequence at the seam",
+			input: cjk + "👨‍👩‍👧‍👦\n---\n👨‍👩‍👧‍👦" + emoji,
+			want:  []string{cjk + "👨‍👩‍👧‍👦", "👨‍👩‍👧‍👦" + emoji},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			checkNoTruncation(t, prompts, tt.want)
+			for i, p := range prompts {
+				if r, size := utf8.DecodeLastRuneInString(p); r == utf8.RuneError && size <= 1 {
+					t.Errorf("prompt[%d] ends in a severed rune", i)
+				}
+				if r, size := utf8.DecodeRuneInString(p); r == utf8.RuneError && size <= 1 {
+					t.Errorf("prompt[%d] starts in a severed rune", i)
+				}
+			}
+		})
+	}
+}
+
+// TestSplitParallelPrompts_LimitBoundaryAtDelimiterVsMidPrompt places
+// maxMessageLen at a delimiter boundary and then in the middle of a segment.
+// Both must return whole prompts: the boundary is not a cut point either way.
+func TestSplitParallelPrompts_LimitBoundaryAtDelimiterVsMidPrompt(t *testing.T) {
+	const delim = "\n---\n"
+	tail := strings.Repeat("t", 500)
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "delimiter starts exactly at the limit",
+			input: strings.Repeat("h", maxMessageLen) + delim + tail,
+			want:  []string{strings.Repeat("h", maxMessageLen), tail},
+		},
+		{
+			name:  "delimiter ends exactly at the limit",
+			input: strings.Repeat("h", maxMessageLen-len(delim)) + delim + tail,
+			want:  []string{strings.Repeat("h", maxMessageLen-len(delim)), tail},
+		},
+		{
+			name:  "limit falls inside the delimiter itself",
+			input: strings.Repeat("h", maxMessageLen-2) + delim + tail,
+			want:  []string{strings.Repeat("h", maxMessageLen-2), tail},
+		},
+		{
+			name:  "limit falls mid-way through the first prompt",
+			input: strings.Repeat("h", maxMessageLen*2) + delim + tail,
+			want:  []string{strings.Repeat("h", maxMessageLen*2), tail},
+		},
+		{
+			name:  "limit falls mid-way through the second prompt",
+			input: strings.Repeat("h", 4000) + delim + strings.Repeat("s", 4000),
+			want:  []string{strings.Repeat("h", 4000), strings.Repeat("s", 4000)},
+		},
+		{
+			name:  "limit falls on the last byte of the first prompt",
+			input: strings.Repeat("h", maxMessageLen) + delim + strings.Repeat("s", maxMessageLen),
+			want:  []string{strings.Repeat("h", maxMessageLen), strings.Repeat("s", maxMessageLen)},
+		},
+		{
+			name:  "limit falls mid-rune inside an oversized Unicode prompt",
+			input: strings.Repeat("日", 2000) + delim + tail,
+			want:  []string{strings.Repeat("日", 2000), tail},
+		},
+		{
+			name:  "literal --- at the limit is content, not a delimiter",
+			input: strings.Repeat("h", maxMessageLen) + "---" + tail,
+			want:  []string{strings.Repeat("h", maxMessageLen) + "---" + tail},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkNoTruncation(t, splitParallelPrompts(tt.input), tt.want)
+		})
+	}
+}
+
+// TestSplitParallelPrompts_ManyDelimitersInLongInput verifies that delimiter
+// count and placement do not interact with input size: every segment of a
+// far-over-limit input comes back intact, and delimiter-lookalikes buried deep
+// in long prompts still do not split.
+func TestSplitParallelPrompts_ManyDelimitersInLongInput(t *testing.T) {
+	// Ten 1000-byte segments: ~10KB total, each segment individually small.
+	tenSegments := make([]string, 10)
+	for i := range tenSegments {
+		tenSegments[i] = strings.Repeat(string(rune('A'+i)), 1000)
+	}
+
+	// Three segments, each itself over the limit.
+	threeHuge := []string{
+		strings.Repeat("p", maxMessageLen+1),
+		strings.Repeat("q", maxMessageLen+7),
+		strings.Repeat("r", maxMessageLen+13),
+	}
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "ten delimited segments in a 10KB input",
+			input: strings.Join(tenSegments, "\n---\n"),
+			want:  tenSegments,
+		},
+		{
+			name:  "three oversized segments",
+			input: strings.Join(threeHuge, "\n---\n"),
+			want:  threeHuge,
+		},
+		{
+			name:  "consecutive delimiters between long segments collapse",
+			input: threeHuge[0] + "\n---\n\n---\n\n---\n" + threeHuge[1],
+			want:  []string{threeHuge[0], threeHuge[1]},
+		},
+		{
+			name:  "leading and trailing delimiters on a long input",
+			input: "\n---\n" + threeHuge[0] + "\n---\n" + threeHuge[1] + "\n---\n",
+			want:  []string{threeHuge[0], threeHuge[1]},
+		},
+		{
+			name:  "indented delimiters deep inside a long prompt do not split",
+			input: strings.Repeat("z", maxMessageLen) + "\n  ---  \n" + strings.Repeat("z", maxMessageLen),
+			want:  []string{strings.Repeat("z", maxMessageLen) + "\n  ---  \n" + strings.Repeat("z", maxMessageLen)},
+		},
+		{
+			name:  "long horizontal rules inside a long prompt do not split",
+			input: strings.Repeat("z", maxMessageLen) + "\n-----\n" + strings.Repeat("z", 1000),
+			want:  []string{strings.Repeat("z", maxMessageLen) + "\n-----\n" + strings.Repeat("z", 1000)},
+		},
+		{
+			name:  "many delimiters yield many prompts regardless of total size",
+			input: strings.Repeat(strings.Repeat("m", 200)+"\n---\n", 49) + strings.Repeat("m", 200),
+			want: func() []string {
+				out := make([]string, 50)
+				for i := range out {
+					out[i] = strings.Repeat("m", 200)
+				}
+				return out
+			}(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkNoTruncation(t, splitParallelPrompts(tt.input), tt.want)
+		})
+	}
+}
