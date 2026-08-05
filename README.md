@@ -26,7 +26,9 @@ Permission flags are determined by the group's `permission_mode` setting:
 - `bypassPermissions` → `--dangerously-skip-permissions`
 - `acceptEdits`, `plan`, `dontAsk` → `--permission-mode <mode>`
 
-**Note:** The current implementation always passes `--dangerously-skip-permissions` regardless of the stored `permission_mode` (tracked issue). The `permission_mode` is configurable via `/config permission_mode <mode>` or `/permission <mode>`, but does not yet affect runtime behavior.
+The mode is configurable via `/config permission_mode <mode>` or `/permission <mode>` and takes effect at the next Claude spawn. All spawn sites (topic panes, workers, `/parallel` subtasks, service handlers) resolve flags through `resolvePermissionArgs()` in `internal/bridge/session_manager.go`, which is the source of truth. New groups default to `acceptEdits` (the `groups.permission_mode` column default); if the column is empty the Go-side fallback is `bypassPermissions`.
+
+**Note:** Only the CLI flag reflects the configured mode. Interactive approval of individual tool calls from Telegram (inline approve/deny keyboard on a `plan`-mode prompt) is not implemented — there is no PTY-output prompt detection, so `plan` and `dontAsk` modes will block on Claude's own prompt rather than surfacing it to the chat.
 
 Panes stay warm between messages (45 s idle threshold). A Claude stop-hook writes the final response to a file that the bridge polls; it falls back to PTY screen-scraping if the hook is not configured. On session ID loss, up to 40 messages of history are prepended from SQLite to restore context.
 

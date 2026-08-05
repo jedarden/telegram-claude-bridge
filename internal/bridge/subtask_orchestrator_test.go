@@ -6,6 +6,7 @@ package bridge
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // TestSplitParallelPrompts_EmptyInputs tests empty and whitespace-only inputs.
@@ -1167,6 +1168,1035 @@ func TestSplitParallelPrompts_DelimiterPositionEdgeCases(t *testing.T) {
 					}
 				}
 			}
+		})
+	}
+}
+
+// TestSplitParallelPrompts_UnicodeCharacterPreservation verifies that non-ASCII
+// characters survive splitting byte-for-byte. Covers Latin Extended (accents,
+// ligatures), Cyrillic and Greek (including polytonic and final sigma).
+// Prompts are compared for exact equality, then checked for UTF-8 validity and
+// absence of the replacement character, which is what corruption would look like.
+func TestSplitParallelPrompts_UnicodeCharacterPreservation(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+	}{
+		// ── Latin Extended ────────────────────────────────────────────────────
+		{
+			name:        "latin extended-A accented letters",
+			input:       "Přeložit dokument\n---\nSzöveg átírása\n---\nĞünlük rapor",
+			wantLen:     3,
+			wantPrompts: []string{"Přeložit dokument", "Szöveg átírása", "Ğünlük rapor"},
+		},
+		{
+			name:        "latin extended ligatures and eszett",
+			input:       "Cœur et æther\n---\nStraße in Weißenburg\n---\nĲsselmeer",
+			wantLen:     3,
+			wantPrompts: []string{"Cœur et æther", "Straße in Weißenburg", "Ĳsselmeer"},
+		},
+		{
+			name:        "latin-1 supplement punctuation and symbols",
+			input:       "¿Qué tal? ¡Hola!\n---\nPreço: 50€ ou £40\n---\nSección №5 · ½ kg",
+			wantLen:     3,
+			wantPrompts: []string{"¿Qué tal? ¡Hola!", "Preço: 50€ ou £40", "Sección №5 · ½ kg"},
+		},
+		// ── Cyrillic ──────────────────────────────────────────────────────────
+		{
+			name:        "cyrillic uppercase and lowercase",
+			input:       "АБВГДЕЁЖЗИЙ\n---\nабвгдеёжзий\n---\nЪЫЬЭЮЯ ъыьэюя",
+			wantLen:     3,
+			wantPrompts: []string{"АБВГДЕЁЖЗИЙ", "абвгдеёжзий", "ЪЫЬЭЮЯ ъыьэюя"},
+		},
+		{
+			name:        "cyrillic non-russian letters",
+			input:       "Українська: їєґі\n---\nСрпски: ђћџњљ\n---\nБългарски: щъ",
+			wantLen:     3,
+			wantPrompts: []string{"Українська: їєґі", "Српски: ђћџњљ", "Български: щъ"},
+		},
+		// ── Greek ─────────────────────────────────────────────────────────────
+		{
+			name:        "greek alphabet uppercase and lowercase",
+			input:       "ΑΒΓΔΕΖΗΘΙΚΛΜ\n---\nαβγδεζηθικλμ\n---\nΝΞΟΠΡΣΤΥΦΧΨΩ",
+			wantLen:     3,
+			wantPrompts: []string{"ΑΒΓΔΕΖΗΘΙΚΛΜ", "αβγδεζηθικλμ", "ΝΞΟΠΡΣΤΥΦΧΨΩ"},
+		},
+		{
+			name:        "greek final sigma and accented vowels",
+			input:       "Ὀδυσσεύς\n---\nΆλφα βήτα γάμμα\n---\nΤο κείμενος τέλος",
+			wantLen:     3,
+			wantPrompts: []string{"Ὀδυσσεύς", "Άλφα βήτα γάμμα", "Το κείμενος τέλος"},
+		},
+		{
+			name:        "greek polytonic with breathing marks",
+			input:       "Ἄνθρωπος ᾠδή\n---\nἙλλάς ῥόδον\n---\nαἰών ᾅδης",
+			wantLen:     3,
+			wantPrompts: []string{"Ἄνθρωπος ᾠδή", "Ἑλλάς ῥόδον", "αἰών ᾅδης"},
+		},
+		// ── Mixed scripts and normalization ───────────────────────────────────
+		{
+			name:        "all three scripts in one prompt each",
+			input:       "Café Ångström\n---\nМосква Київ\n---\nΑθήνα Θεσσαλονίκη",
+			wantLen:     3,
+			wantPrompts: []string{"Café Ångström", "Москва Київ", "Αθήνα Θεσσαλονίκη"},
+		},
+		{
+			name:        "scripts mixed within a single prompt",
+			input:       "Ünïcödë + Кириллица + Ελληνικά\n---\nsecond",
+			wantLen:     2,
+			wantPrompts: []string{"Ünïcödë + Кириллица + Ελληνικά", "second"},
+		},
+		{
+			name:        "decomposed combining marks are not normalized",
+			input:       "café naïve\n---\nΆλφα",
+			wantLen:     2,
+			wantPrompts: []string{"café naïve", "Άλφα"},
+		},
+		{
+			name:        "precomposed and decomposed forms stay distinct",
+			input:       "é\n---\né",
+			wantLen:     2,
+			wantPrompts: []string{"é", "é"},
+		},
+		// ── Single prompt (no delimiter) preserves Unicode ─────────────────────
+		{
+			name:        "single unicode prompt without delimiter",
+			input:       "Ελληνικά κείμενο με Ünïcödë και Кириллицей",
+			wantLen:     1,
+			wantPrompts: []string{"Ελληνικά κείμενο με Ünïcödë και Кириллицей"},
+		},
+		{
+			name:        "unicode preserved across many segments",
+			input:       "α\n---\nβ\n---\nγ\n---\nδ\n---\nε",
+			wantLen:     5,
+			wantPrompts: []string{"α", "β", "γ", "δ", "ε"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			if len(prompts) != tt.wantLen {
+				t.Fatalf("got %d prompts, want %d: %q", len(prompts), tt.wantLen, prompts)
+			}
+			for i, want := range tt.wantPrompts {
+				if prompts[i] != want {
+					t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
+				}
+				if got, wantCount := utf8.RuneCountInString(prompts[i]), utf8.RuneCountInString(want); got != wantCount {
+					t.Errorf("prompt[%d] has %d runes, want %d", i, got, wantCount)
+				}
+			}
+			for i, p := range prompts {
+				if !utf8.ValidString(p) {
+					t.Errorf("prompt[%d] = %q is not valid UTF-8", i, p)
+				}
+				if strings.ContainsRune(p, utf8.RuneError) {
+					t.Errorf("prompt[%d] = %q contains the replacement character U+FFFD", i, p)
+				}
+			}
+		})
+	}
+
+	// Splitting must not normalize: the precomposed and decomposed spellings of
+	// the same grapheme have to come back as the distinct byte sequences they
+	// went in as.
+	t.Run("no unicode normalization is applied", func(t *testing.T) {
+		prompts := splitParallelPrompts("é\n---\né")
+		if len(prompts) != 2 {
+			t.Fatalf("got %d prompts, want 2: %q", len(prompts), prompts)
+		}
+		if prompts[0] != "é" || utf8.RuneCountInString(prompts[0]) != 1 {
+			t.Errorf("precomposed prompt = %q (%d runes), want %q (1 rune)", prompts[0], utf8.RuneCountInString(prompts[0]), "é")
+		}
+		if prompts[1] != "é" || utf8.RuneCountInString(prompts[1]) != 2 {
+			t.Errorf("decomposed prompt = %q (%d runes), want %q (2 runes)", prompts[1], utf8.RuneCountInString(prompts[1]), "é")
+		}
+		if prompts[0] == prompts[1] {
+			t.Errorf("precomposed and decomposed prompts were normalized to the same value %q", prompts[0])
+		}
+	})
+}
+
+// TestSplitParallelPrompts_UnicodeDelimiterBoundaries verifies behavior when
+// non-ASCII characters sit directly against the "\n---\n" delimiter, and that
+// Unicode dash lookalikes are never mistaken for the ASCII delimiter.
+func TestSplitParallelPrompts_UnicodeDelimiterBoundaries(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+	}{
+		{
+			name:        "multibyte rune immediately before and after delimiter",
+			input:       "Ω\n---\nα",
+			wantLen:     2,
+			wantPrompts: []string{"Ω", "α"},
+		},
+		{
+			name:        "cyrillic touching both sides of delimiter",
+			input:       "Первый\n---\nВторой\n---\nТретий",
+			wantLen:     3,
+			wantPrompts: []string{"Первый", "Второй", "Третий"},
+		},
+		{
+			name:        "latin extended touching both sides of delimiter",
+			input:       "Ærø\n---\nŽižkov\n---\nÑuñoa",
+			wantLen:     3,
+			wantPrompts: []string{"Ærø", "Žižkov", "Ñuñoa"},
+		},
+		{
+			name:        "combining mark is last rune before delimiter",
+			input:       "ά\n---\nβ",
+			wantLen:     2,
+			wantPrompts: []string{"ά", "β"},
+		},
+		{
+			name:        "combining mark is first sequence after delimiter",
+			input:       "first\n---\nöffnen",
+			wantLen:     2,
+			wantPrompts: []string{"first", "öffnen"},
+		},
+		{
+			name:        "unicode non-breaking space around delimiter is trimmed",
+			input:       "Ελληνικά \n---\n Кириллица",
+			wantLen:     2,
+			wantPrompts: []string{"Ελληνικά", "Кириллица"},
+		},
+		{
+			name:        "ideographic space around delimiter is trimmed",
+			input:       "Ünïcödë　\n---\n　Ελληνικά",
+			wantLen:     2,
+			wantPrompts: []string{"Ünïcödë", "Ελληνικά"},
+		},
+		{
+			name:        "em dashes are not a delimiter",
+			input:       "Πρώτο\n———\nΔεύτερο",
+			wantLen:     1,
+			wantPrompts: []string{"Πρώτο\n———\nΔεύτερο"},
+		},
+		{
+			name:        "en dashes are not a delimiter",
+			input:       "Ünïcödë\n–––\nтекст",
+			wantLen:     1,
+			wantPrompts: []string{"Ünïcödë\n–––\nтекст"},
+		},
+		{
+			name:        "horizontal bar lookalike is not a delimiter",
+			input:       "Άλφα\n―――\nΒήτα",
+			wantLen:     1,
+			wantPrompts: []string{"Άλφα\n―――\nΒήτα"},
+		},
+		{
+			name:        "unicode content adjacent to leading delimiter",
+			input:       "---\nΓάμμα\n---\nΔέλτα",
+			wantLen:     2,
+			wantPrompts: []string{"---\nΓάμμα", "Δέλτα"},
+		},
+		{
+			name:        "unicode content adjacent to trailing delimiter",
+			input:       "Γάμμα\n---\nΔέλτα\n---",
+			wantLen:     2,
+			wantPrompts: []string{"Γάμμα", "Δέλτα\n---"},
+		},
+		{
+			name:        "unicode segment between consecutive delimiters",
+			input:       "Ένα\n---\n\n---\nΔύο",
+			wantLen:     2,
+			wantPrompts: []string{"Ένα", "Δύο"},
+		},
+		{
+			name:        "delimiter embedded in unicode line does not split",
+			input:       "Κείμενο---κείμενο\n---\nтекст---текст",
+			wantLen:     2,
+			wantPrompts: []string{"Κείμενο---κείμενο", "текст---текст"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			if len(prompts) != tt.wantLen {
+				t.Fatalf("got %d prompts, want %d: %q", len(prompts), tt.wantLen, prompts)
+			}
+			for i, want := range tt.wantPrompts {
+				if prompts[i] != want {
+					t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
+				}
+			}
+			for i, p := range prompts {
+				if !utf8.ValidString(p) {
+					t.Errorf("prompt[%d] = %q is not valid UTF-8", i, p)
+				}
+			}
+		})
+	}
+}
+
+// checkEmojiPrompts asserts that the split output matches wantPrompts exactly,
+// byte for byte and rune for rune, and that nothing was mangled into invalid
+// UTF-8 or the U+FFFD replacement character along the way.
+func checkEmojiPrompts(t *testing.T, prompts, wantPrompts []string, wantLen int) {
+	t.Helper()
+	if len(prompts) != wantLen {
+		t.Fatalf("got %d prompts, want %d: %q", len(prompts), wantLen, prompts)
+	}
+	for i, want := range wantPrompts {
+		if prompts[i] != want {
+			t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
+		}
+		if got := len(prompts[i]); got != len(want) {
+			t.Errorf("prompt[%d] has %d bytes, want %d", i, got, len(want))
+		}
+		if got, wantCount := utf8.RuneCountInString(prompts[i]), utf8.RuneCountInString(want); got != wantCount {
+			t.Errorf("prompt[%d] has %d runes, want %d", i, got, wantCount)
+		}
+	}
+	for i, p := range prompts {
+		if !utf8.ValidString(p) {
+			t.Errorf("prompt[%d] = %q is not valid UTF-8", i, p)
+		}
+		if strings.ContainsRune(p, utf8.RuneError) {
+			t.Errorf("prompt[%d] = %q contains the replacement character U+FFFD", i, p)
+		}
+	}
+}
+
+// TestSplitParallelPrompts_CommonEmojiPreservation verifies that everyday emoji
+// — faces, hands, symbols, objects — survive splitting unchanged.
+func TestSplitParallelPrompts_CommonEmojiPreservation(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+	}{
+		// ── Faces ─────────────────────────────────────────────────────────────
+		{
+			name:        "smiley faces one per prompt",
+			input:       "Grinning 😀\n---\nJoy 😂\n---\nWink 😉",
+			wantLen:     3,
+			wantPrompts: []string{"Grinning 😀", "Joy 😂", "Wink 😉"},
+		},
+		{
+			name:        "multiple faces within a single prompt",
+			input:       "😀😃😄😁😆😅\n---\n🙂🙃😉😊😇",
+			wantLen:     2,
+			wantPrompts: []string{"😀😃😄😁😆😅", "🙂🙃😉😊😇"},
+		},
+		{
+			name:        "cat faces and animal emoji",
+			input:       "😺😸😹\n---\n🐶🐱🐭\n---\n🦊🐻🐼",
+			wantLen:     3,
+			wantPrompts: []string{"😺😸😹", "🐶🐱🐭", "🦊🐻🐼"},
+		},
+		// ── Symbols ───────────────────────────────────────────────────────────
+		{
+			name:        "symbol emoji across prompts",
+			input:       "Check ✅\n---\nCross ❌\n---\nWarning ⚠️",
+			wantLen:     3,
+			wantPrompts: []string{"Check ✅", "Cross ❌", "Warning ⚠️"},
+		},
+		{
+			name:        "arrows and math-adjacent symbol emoji",
+			input:       "➡️⬅️⬆️⬇️\n---\n➕➖✖️➗\n---\n♻️🔱⚜️",
+			wantLen:     3,
+			wantPrompts: []string{"➡️⬅️⬆️⬇️", "➕➖✖️➗", "♻️🔱⚜️"},
+		},
+		{
+			name:        "text-presentation symbols without variation selector",
+			input:       "Sun ☀ and cloud ☁\n---\nPeace ☮ and yin yang ☯",
+			wantLen:     2,
+			wantPrompts: []string{"Sun ☀ and cloud ☁", "Peace ☮ and yin yang ☯"},
+		},
+		// ── Objects and activities ────────────────────────────────────────────
+		{
+			name:        "object emoji across prompts",
+			input:       "Ship it 🚀\n---\nFix the bug 🐛\n---\nCelebrate 🎉",
+			wantLen:     3,
+			wantPrompts: []string{"Ship it 🚀", "Fix the bug 🐛", "Celebrate 🎉"},
+		},
+		{
+			name:        "emoji-only prompts",
+			input:       "🚀\n---\n🔥\n---\n🎯",
+			wantLen:     3,
+			wantPrompts: []string{"🚀", "🔥", "🎯"},
+		},
+		// ── Mixed with text and other scripts ─────────────────────────────────
+		{
+			name:        "emoji interleaved with ascii text",
+			input:       "Run 🏃 the tests 🧪 now\n---\nShip 📦 the build 🛠️",
+			wantLen:     2,
+			wantPrompts: []string{"Run 🏃 the tests 🧪 now", "Ship 📦 the build 🛠️"},
+		},
+		{
+			name:        "emoji mixed with non-latin scripts",
+			input:       "日本語 🗾 テスト\n---\nΕλληνικά 🇬🇷 κείμενο\n---\nКириллица 📚 текст",
+			wantLen:     3,
+			wantPrompts: []string{"日本語 🗾 テスト", "Ελληνικά 🇬🇷 κείμενο", "Кириллица 📚 текст"},
+		},
+		{
+			name:        "emoji inside multiline prompt bodies",
+			input:       "Line one 🥇\nLine two 🥈\n---\nLine three 🥉\nLine four 🏅",
+			wantLen:     2,
+			wantPrompts: []string{"Line one 🥇\nLine two 🥈", "Line three 🥉\nLine four 🏅"},
+		},
+		// ── Single prompt / no delimiter ──────────────────────────────────────
+		{
+			name:        "single emoji prompt without delimiter",
+			input:       "Just one prompt with emoji 🌈🦄✨",
+			wantLen:     1,
+			wantPrompts: []string{"Just one prompt with emoji 🌈🦄✨"},
+		},
+		{
+			name:        "emoji preserved across many segments",
+			input:       "1️⃣ one\n---\n2️⃣ two\n---\n3️⃣ three\n---\n4️⃣ four\n---\n5️⃣ five",
+			wantLen:     5,
+			wantPrompts: []string{"1️⃣ one", "2️⃣ two", "3️⃣ three", "4️⃣ four", "5️⃣ five"},
+		},
+		{
+			name:        "whitespace around emoji prompts is trimmed",
+			input:       "   🚀 launch   \n---\n\t🔥 burn\t",
+			wantLen:     2,
+			wantPrompts: []string{"🚀 launch", "🔥 burn"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkEmojiPrompts(t, splitParallelPrompts(tt.input), tt.wantPrompts, tt.wantLen)
+		})
+	}
+}
+
+// TestSplitParallelPrompts_MultiByteEmojiSequences verifies that composite emoji
+// — ZWJ sequences, skin-tone modifiers, regional-indicator flags, keycaps,
+// variation selectors and tag sequences — are never broken apart by splitting.
+func TestSplitParallelPrompts_MultiByteEmojiSequences(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+		wantRunes   []int // rune count per prompt, guards against dropped joiners
+	}{
+		// ── ZWJ sequences ─────────────────────────────────────────────────────
+		{
+			name:        "family zwj sequence stays intact",
+			input:       "Family 👨‍👩‍👧‍👦\n---\nCouple 👩‍❤️‍👨",
+			wantLen:     2,
+			wantPrompts: []string{"Family 👨‍👩‍👧‍👦", "Couple 👩‍❤️‍👨"},
+			wantRunes:   []int{14, 13},
+		},
+		{
+			name:        "profession zwj sequences",
+			input:       "👩‍💻 codes\n---\n👨‍🚀 flies\n---\n🧑‍🍳 cooks",
+			wantLen:     3,
+			wantPrompts: []string{"👩‍💻 codes", "👨‍🚀 flies", "🧑‍🍳 cooks"},
+			wantRunes:   []int{9, 9, 9},
+		},
+		{
+			name:        "handshake zwj sequence between delimiters",
+			input:       "first\n---\n🧑‍🤝‍🧑\n---\nlast",
+			wantLen:     3,
+			wantPrompts: []string{"first", "🧑‍🤝‍🧑", "last"},
+			wantRunes:   []int{5, 5, 4},
+		},
+		// ── Skin tone modifiers ───────────────────────────────────────────────
+		{
+			name:        "skin tone modifiers on thumbs up",
+			input:       "👍🏻\n---\n👍🏽\n---\n👍🏿",
+			wantLen:     3,
+			wantPrompts: []string{"👍🏻", "👍🏽", "👍🏿"},
+			wantRunes:   []int{2, 2, 2},
+		},
+		{
+			name:        "skin tone modifier inside a zwj sequence",
+			input:       "👩🏽‍💻 reviews\n---\n👨🏿‍🔬 experiments",
+			wantLen:     2,
+			wantPrompts: []string{"👩🏽‍💻 reviews", "👨🏿‍🔬 experiments"},
+			wantRunes:   []int{12, 16},
+		},
+		// ── Regional indicator flags ──────────────────────────────────────────
+		{
+			name:        "regional indicator flags one per prompt",
+			input:       "🇫🇷\n---\n🇩🇪\n---\n🇯🇵",
+			wantLen:     3,
+			wantPrompts: []string{"🇫🇷", "🇩🇪", "🇯🇵"},
+			wantRunes:   []int{2, 2, 2},
+		},
+		{
+			name:        "adjacent flags are not regrouped across the delimiter",
+			input:       "🇺🇸🇬🇧\n---\n🇨🇦🇦🇺",
+			wantLen:     2,
+			wantPrompts: []string{"🇺🇸🇬🇧", "🇨🇦🇦🇺"},
+			wantRunes:   []int{4, 4},
+		},
+		{
+			name:        "tag sequence flag stays intact",
+			input:       "Scotland 🏴󠁧󠁢󠁳󠁣󠁴󠁿\n---\nEngland 🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+			wantLen:     2,
+			wantPrompts: []string{"Scotland 🏴󠁧󠁢󠁳󠁣󠁴󠁿", "England 🏴󠁧󠁢󠁥󠁮󠁧󠁿"},
+			wantRunes:   []int{16, 15},
+		},
+		// ── Keycaps and variation selectors ───────────────────────────────────
+		{
+			name:        "keycap sequences with combining enclosing keycap",
+			input:       "0️⃣\n---\n#️⃣\n---\n*️⃣",
+			wantLen:     3,
+			wantPrompts: []string{"0️⃣", "#️⃣", "*️⃣"},
+			wantRunes:   []int{3, 3, 3},
+		},
+		{
+			name:        "variation selector 16 is preserved",
+			input:       "❤️ heart\n---\n☂️ umbrella",
+			wantLen:     2,
+			wantPrompts: []string{"❤️ heart", "☂️ umbrella"},
+			wantRunes:   []int{8, 11},
+		},
+		{
+			name:        "emoji and text presentation of the same base char stay distinct",
+			input:       "❤️\n---\n❤",
+			wantLen:     2,
+			wantPrompts: []string{"❤️", "❤"},
+			wantRunes:   []int{2, 1},
+		},
+		// ── Mixed composite sequences ─────────────────────────────────────────
+		{
+			name:        "several composite sequences in one prompt",
+			input:       "👨‍👩‍👧 👍🏾 🇧🇷 7️⃣\n---\nplain",
+			wantLen:     2,
+			wantPrompts: []string{"👨‍👩‍👧 👍🏾 🇧🇷 7️⃣", "plain"},
+			wantRunes:   []int{15, 5},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			checkEmojiPrompts(t, prompts, tt.wantPrompts, tt.wantLen)
+			for i, want := range tt.wantRunes {
+				if i >= len(prompts) {
+					break
+				}
+				if got := utf8.RuneCountInString(prompts[i]); got != want {
+					t.Errorf("prompt[%d] = %q has %d runes, want %d", i, prompts[i], got, want)
+				}
+			}
+		})
+	}
+
+	// Joiners carry the meaning of a composite sequence: if splitting dropped a
+	// zero-width joiner or a variation selector the prompts would still compare
+	// as "looks like emoji" but render as separate glyphs.
+	t.Run("zero-width joiners and variation selectors survive", func(t *testing.T) {
+		prompts := splitParallelPrompts("👨‍👩‍👧‍👦\n---\n❤️\n---\n5️⃣")
+		if len(prompts) != 3 {
+			t.Fatalf("got %d prompts, want 3: %q", len(prompts), prompts)
+		}
+		if got := strings.Count(prompts[0], "‍"); got != 3 {
+			t.Errorf("family sequence has %d zero-width joiners, want 3", got)
+		}
+		if !strings.ContainsRune(prompts[1], '️') {
+			t.Errorf("prompt[1] = %q lost variation selector U+FE0F", prompts[1])
+		}
+		if !strings.ContainsRune(prompts[2], '⃣') {
+			t.Errorf("prompt[2] = %q lost combining enclosing keycap U+20E3", prompts[2])
+		}
+	})
+}
+
+// TestSplitParallelPrompts_EmojiAtDelimiterBoundaries verifies emoji sitting
+// directly against the "\n---\n" delimiter, including emoji-only segments and
+// literal "---" runs that are not delimiters.
+func TestSplitParallelPrompts_EmojiAtDelimiterBoundaries(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+	}{
+		{
+			name:        "emoji touching both sides of delimiter",
+			input:       "🚀\n---\n🔥",
+			wantLen:     2,
+			wantPrompts: []string{"🚀", "🔥"},
+		},
+		{
+			name:        "zwj sequence touching both sides of delimiter",
+			input:       "👨‍👩‍👧‍👦\n---\n👩‍💻",
+			wantLen:     2,
+			wantPrompts: []string{"👨‍👩‍👧‍👦", "👩‍💻"},
+		},
+		{
+			name:        "flag touching both sides of delimiter",
+			input:       "🇯🇵\n---\n🇰🇷",
+			wantLen:     2,
+			wantPrompts: []string{"🇯🇵", "🇰🇷"},
+		},
+		{
+			name:        "skin tone modifier is last rune before delimiter",
+			input:       "ship it 👍🏽\n---\nnext",
+			wantLen:     2,
+			wantPrompts: []string{"ship it 👍🏽", "next"},
+		},
+		{
+			name:        "keycap sequence is first thing after delimiter",
+			input:       "first\n---\n1️⃣ step one",
+			wantLen:     2,
+			wantPrompts: []string{"first", "1️⃣ step one"},
+		},
+		{
+			name:        "emoji adjacent to leading delimiter",
+			input:       "---\n🚀 launch\n---\n🔥 burn",
+			wantLen:     2,
+			wantPrompts: []string{"---\n🚀 launch", "🔥 burn"},
+		},
+		{
+			name:        "emoji adjacent to trailing delimiter",
+			input:       "🚀 launch\n---\n🔥 burn\n---",
+			wantLen:     2,
+			wantPrompts: []string{"🚀 launch", "🔥 burn\n---"},
+		},
+		{
+			name:        "emoji-only segment between consecutive delimiters",
+			input:       "first\n---\n🎉\n---\nlast",
+			wantLen:     3,
+			wantPrompts: []string{"first", "🎉", "last"},
+		},
+		{
+			name:        "empty segment between emoji segments is dropped",
+			input:       "🚀\n---\n\n---\n🔥",
+			wantLen:     2,
+			wantPrompts: []string{"🚀", "🔥"},
+		},
+		{
+			name:        "whitespace-only segment between emoji segments is dropped",
+			input:       "🚀\n---\n   \n---\n🔥",
+			wantLen:     2,
+			wantPrompts: []string{"🚀", "🔥"},
+		},
+		{
+			name:        "dashes on the same line as emoji do not split",
+			input:       "🚀---🔥\n---\n🎯---🎉",
+			wantLen:     2,
+			wantPrompts: []string{"🚀---🔥", "🎯---🎉"},
+		},
+		{
+			name:        "delimiter-like line flanked by emoji does not split",
+			input:       "🚀\n--- 🔥\nstill one prompt",
+			wantLen:     1,
+			wantPrompts: []string{"🚀\n--- 🔥\nstill one prompt"},
+		},
+		{
+			name:        "emoji dash lookalikes are not a delimiter",
+			input:       "🚀\n➖➖➖\n🔥",
+			wantLen:     1,
+			wantPrompts: []string{"🚀\n➖➖➖\n🔥"},
+		},
+		{
+			name:        "trailing whitespace after emoji before delimiter is trimmed",
+			input:       "🚀 launch  \n---\n  🔥 burn",
+			wantLen:     2,
+			wantPrompts: []string{"🚀 launch", "🔥 burn"},
+		},
+		{
+			name:        "blank lines around emoji segments are trimmed",
+			input:       "\n\n🚀\n\n---\n\n🔥\n\n",
+			wantLen:     2,
+			wantPrompts: []string{"🚀", "🔥"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkEmojiPrompts(t, splitParallelPrompts(tt.input), tt.wantPrompts, tt.wantLen)
+		})
+	}
+}
+
+// ── length limits and truncation ───────────────────────────────────────────────
+//
+// splitParallelPrompts applies no length limit of its own: it splits on
+// "\n---\n", trims each segment, and returns whatever remains. The package's
+// only length ceiling is maxMessageLen (4096), which belongs to the Telegram
+// sender and is applied downstream when *results* are posted back — never to
+// prompts on the way in. The tests below pin that contract down so a long
+// prompt reaches Claude whole instead of being silently clipped at a delimiter
+// or, worse, in the middle of a multi-byte rune.
+
+// checkNoTruncation asserts prompts match wantPrompts exactly — byte count,
+// rune count, and content — so silent clipping surfaces as a length mismatch
+// rather than an unreadable inequality on multi-kilobyte strings.
+func checkNoTruncation(t *testing.T, prompts, wantPrompts []string) {
+	t.Helper()
+	if len(prompts) != len(wantPrompts) {
+		t.Fatalf("got %d prompts, want %d", len(prompts), len(wantPrompts))
+	}
+	for i, want := range wantPrompts {
+		got := prompts[i]
+		if len(got) != len(want) {
+			t.Errorf("prompt[%d] has %d bytes, want %d (short by %d)", i, len(got), len(want), len(want)-len(got))
+		}
+		if g, w := utf8.RuneCountInString(got), utf8.RuneCountInString(want); g != w {
+			t.Errorf("prompt[%d] has %d runes, want %d", i, g, w)
+		}
+		if got != want {
+			// Report the divergence offset instead of dumping kilobytes.
+			t.Errorf("prompt[%d] diverges from want at byte offset %d", i, firstDiffOffset(got, want))
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("prompt[%d] is not valid UTF-8 — cut mid-rune?", i)
+		}
+		if strings.ContainsRune(got, utf8.RuneError) && !strings.ContainsRune(want, utf8.RuneError) {
+			t.Errorf("prompt[%d] gained the replacement character U+FFFD", i)
+		}
+	}
+}
+
+// firstDiffOffset returns the byte offset of the first difference between a and
+// b, or the length of the shorter string if one is a prefix of the other.
+func firstDiffOffset(a, b string) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
+}
+
+// TestSplitParallelPrompts_SinglePromptExceedsLengthLimit verifies that a single
+// prompt straddling maxMessageLen is returned whole — the sender's 4096-byte
+// ceiling is not applied to prompts.
+func TestSplitParallelPrompts_SinglePromptExceedsLengthLimit(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "one byte under the limit",
+			input: strings.Repeat("a", maxMessageLen-1),
+			want:  []string{strings.Repeat("a", maxMessageLen-1)},
+		},
+		{
+			name:  "exactly at the limit",
+			input: strings.Repeat("a", maxMessageLen),
+			want:  []string{strings.Repeat("a", maxMessageLen)},
+		},
+		{
+			name:  "one byte over the limit",
+			input: strings.Repeat("a", maxMessageLen+1),
+			want:  []string{strings.Repeat("a", maxMessageLen+1)},
+		},
+		{
+			name:  "ten times the limit",
+			input: strings.Repeat("a", maxMessageLen*10),
+			want:  []string{strings.Repeat("a", maxMessageLen*10)},
+		},
+		{
+			name:  "over the limit with distinct tail so a prefix cut is detectable",
+			input: strings.Repeat("a", maxMessageLen) + "TAIL-SENTINEL",
+			want:  []string{strings.Repeat("a", maxMessageLen) + "TAIL-SENTINEL"},
+		},
+		{
+			name:  "over the limit wrapped in whitespace trims only the edges",
+			input: "\n\n  " + strings.Repeat("b", maxMessageLen+500) + "  \n\n",
+			want:  []string{strings.Repeat("b", maxMessageLen+500)},
+		},
+		{
+			name:  "over the limit with embedded newlines stays one prompt",
+			input: strings.Repeat("line of text\n", 500),
+			want:  []string{strings.TrimSpace(strings.Repeat("line of text\n", 500))},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkNoTruncation(t, splitParallelPrompts(tt.input), tt.want)
+		})
+	}
+}
+
+// TestSplitParallelPrompts_MultipleLongPromptsNotTruncated verifies that every
+// segment of a multi-prompt input survives at full length, including inputs
+// whose combined size dwarfs maxMessageLen.
+func TestSplitParallelPrompts_MultipleLongPromptsNotTruncated(t *testing.T) {
+	var (
+		longA = strings.Repeat("A", maxMessageLen+1)
+		longB = strings.Repeat("B", maxMessageLen+1)
+		longC = strings.Repeat("C", maxMessageLen*3)
+	)
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "two prompts each over the limit",
+			input: longA + "\n---\n" + longB,
+			want:  []string{longA, longB},
+		},
+		{
+			name:  "five prompts each over the limit",
+			input: strings.Join([]string{longA, longB, longC, longA, longB}, "\n---\n"),
+			want:  []string{longA, longB, longC, longA, longB},
+		},
+		{
+			name: "each segment under the limit but the total is far over",
+			input: strings.Join([]string{
+				strings.Repeat("x", 2000),
+				strings.Repeat("y", 2000),
+				strings.Repeat("z", 2000),
+			}, "\n---\n"),
+			want: []string{
+				strings.Repeat("x", 2000),
+				strings.Repeat("y", 2000),
+				strings.Repeat("z", 2000),
+			},
+		},
+		{
+			name:  "long prompt followed by a short one",
+			input: longA + "\n---\nshort",
+			want:  []string{longA, "short"},
+		},
+		{
+			name:  "short prompt followed by a long one",
+			input: "short\n---\n" + longB,
+			want:  []string{"short", longB},
+		},
+		{
+			name:  "long prompts around a dropped empty segment",
+			input: longA + "\n---\n\n---\n" + longB,
+			want:  []string{longA, longB},
+		},
+		{
+			name:  "long prompts with padded segments trimmed at the edges only",
+			input: "  " + longA + "  \n---\n\t" + longB + "\t",
+			want:  []string{longA, longB},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkNoTruncation(t, splitParallelPrompts(tt.input), tt.want)
+		})
+	}
+}
+
+// TestSplitParallelPrompts_UnicodeExceedsLengthLimit verifies that oversized
+// multi-byte content is not clipped. A byte-oriented cut at maxMessageLen would
+// land mid-rune for most of these inputs, so the rune-count and validity checks
+// in checkNoTruncation are the real assertions here.
+func TestSplitParallelPrompts_UnicodeExceedsLengthLimit(t *testing.T) {
+	var (
+		// 3 bytes per rune: byte offset 4096 falls one byte into a rune.
+		cjk = strings.Repeat("日", 2000)
+		// 4 bytes per rune: byte offset 4096 falls on a rune boundary, so a
+		// naive cut would silently produce a shorter-but-valid string.
+		emoji = strings.Repeat("🚀", 1500)
+		// Decomposed sequences: a cut could strand a combining mark.
+		combining = strings.Repeat("é", 3000) // e + U+0301
+		// Mixed scripts, well past the limit.
+		mixed = strings.Repeat("aé日🚀Ω", 1200)
+	)
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "CJK prompt over the limit in bytes",
+			input: cjk,
+			want:  []string{cjk},
+		},
+		{
+			name:  "emoji prompt over the limit in bytes",
+			input: emoji,
+			want:  []string{emoji},
+		},
+		{
+			name:  "combining sequences over the limit",
+			input: combining,
+			want:  []string{combining},
+		},
+		{
+			name:  "mixed scripts over the limit",
+			input: mixed,
+			want:  []string{mixed},
+		},
+		{
+			name:  "prompt over the limit in runes as well as bytes",
+			input: strings.Repeat("日", maxMessageLen+1),
+			want:  []string{strings.Repeat("日", maxMessageLen+1)},
+		},
+		{
+			name:  "two oversized Unicode prompts",
+			input: cjk + "\n---\n" + emoji,
+			want:  []string{cjk, emoji},
+		},
+		{
+			name:  "oversized Unicode prompts with a ZWJ family sequence at the seam",
+			input: cjk + "👨‍👩‍👧‍👦\n---\n👨‍👩‍👧‍👦" + emoji,
+			want:  []string{cjk + "👨‍👩‍👧‍👦", "👨‍👩‍👧‍👦" + emoji},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			checkNoTruncation(t, prompts, tt.want)
+			for i, p := range prompts {
+				if r, size := utf8.DecodeLastRuneInString(p); r == utf8.RuneError && size <= 1 {
+					t.Errorf("prompt[%d] ends in a severed rune", i)
+				}
+				if r, size := utf8.DecodeRuneInString(p); r == utf8.RuneError && size <= 1 {
+					t.Errorf("prompt[%d] starts in a severed rune", i)
+				}
+			}
+		})
+	}
+}
+
+// TestSplitParallelPrompts_LimitBoundaryAtDelimiterVsMidPrompt places
+// maxMessageLen at a delimiter boundary and then in the middle of a segment.
+// Both must return whole prompts: the boundary is not a cut point either way.
+func TestSplitParallelPrompts_LimitBoundaryAtDelimiterVsMidPrompt(t *testing.T) {
+	const delim = "\n---\n"
+	tail := strings.Repeat("t", 500)
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "delimiter starts exactly at the limit",
+			input: strings.Repeat("h", maxMessageLen) + delim + tail,
+			want:  []string{strings.Repeat("h", maxMessageLen), tail},
+		},
+		{
+			name:  "delimiter ends exactly at the limit",
+			input: strings.Repeat("h", maxMessageLen-len(delim)) + delim + tail,
+			want:  []string{strings.Repeat("h", maxMessageLen-len(delim)), tail},
+		},
+		{
+			name:  "limit falls inside the delimiter itself",
+			input: strings.Repeat("h", maxMessageLen-2) + delim + tail,
+			want:  []string{strings.Repeat("h", maxMessageLen-2), tail},
+		},
+		{
+			name:  "limit falls mid-way through the first prompt",
+			input: strings.Repeat("h", maxMessageLen*2) + delim + tail,
+			want:  []string{strings.Repeat("h", maxMessageLen*2), tail},
+		},
+		{
+			name:  "limit falls mid-way through the second prompt",
+			input: strings.Repeat("h", 4000) + delim + strings.Repeat("s", 4000),
+			want:  []string{strings.Repeat("h", 4000), strings.Repeat("s", 4000)},
+		},
+		{
+			name:  "limit falls on the last byte of the first prompt",
+			input: strings.Repeat("h", maxMessageLen) + delim + strings.Repeat("s", maxMessageLen),
+			want:  []string{strings.Repeat("h", maxMessageLen), strings.Repeat("s", maxMessageLen)},
+		},
+		{
+			name:  "limit falls mid-rune inside an oversized Unicode prompt",
+			input: strings.Repeat("日", 2000) + delim + tail,
+			want:  []string{strings.Repeat("日", 2000), tail},
+		},
+		{
+			name:  "literal --- at the limit is content, not a delimiter",
+			input: strings.Repeat("h", maxMessageLen) + "---" + tail,
+			want:  []string{strings.Repeat("h", maxMessageLen) + "---" + tail},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkNoTruncation(t, splitParallelPrompts(tt.input), tt.want)
+		})
+	}
+}
+
+// TestSplitParallelPrompts_ManyDelimitersInLongInput verifies that delimiter
+// count and placement do not interact with input size: every segment of a
+// far-over-limit input comes back intact, and delimiter-lookalikes buried deep
+// in long prompts still do not split.
+func TestSplitParallelPrompts_ManyDelimitersInLongInput(t *testing.T) {
+	// Ten 1000-byte segments: ~10KB total, each segment individually small.
+	tenSegments := make([]string, 10)
+	for i := range tenSegments {
+		tenSegments[i] = strings.Repeat(string(rune('A'+i)), 1000)
+	}
+
+	// Three segments, each itself over the limit.
+	threeHuge := []string{
+		strings.Repeat("p", maxMessageLen+1),
+		strings.Repeat("q", maxMessageLen+7),
+		strings.Repeat("r", maxMessageLen+13),
+	}
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "ten delimited segments in a 10KB input",
+			input: strings.Join(tenSegments, "\n---\n"),
+			want:  tenSegments,
+		},
+		{
+			name:  "three oversized segments",
+			input: strings.Join(threeHuge, "\n---\n"),
+			want:  threeHuge,
+		},
+		{
+			name:  "consecutive delimiters between long segments collapse",
+			input: threeHuge[0] + "\n---\n\n---\n\n---\n" + threeHuge[1],
+			want:  []string{threeHuge[0], threeHuge[1]},
+		},
+		{
+			name:  "leading and trailing delimiters on a long input",
+			input: "\n---\n" + threeHuge[0] + "\n---\n" + threeHuge[1] + "\n---\n",
+			want:  []string{threeHuge[0], threeHuge[1]},
+		},
+		{
+			name:  "indented delimiters deep inside a long prompt do not split",
+			input: strings.Repeat("z", maxMessageLen) + "\n  ---  \n" + strings.Repeat("z", maxMessageLen),
+			want:  []string{strings.Repeat("z", maxMessageLen) + "\n  ---  \n" + strings.Repeat("z", maxMessageLen)},
+		},
+		{
+			name:  "long horizontal rules inside a long prompt do not split",
+			input: strings.Repeat("z", maxMessageLen) + "\n-----\n" + strings.Repeat("z", 1000),
+			want:  []string{strings.Repeat("z", maxMessageLen) + "\n-----\n" + strings.Repeat("z", 1000)},
+		},
+		{
+			name:  "many delimiters yield many prompts regardless of total size",
+			input: strings.Repeat(strings.Repeat("m", 200)+"\n---\n", 49) + strings.Repeat("m", 200),
+			want: func() []string {
+				out := make([]string, 50)
+				for i := range out {
+					out[i] = strings.Repeat("m", 200)
+				}
+				return out
+			}(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkNoTruncation(t, splitParallelPrompts(tt.input), tt.want)
 		})
 	}
 }
