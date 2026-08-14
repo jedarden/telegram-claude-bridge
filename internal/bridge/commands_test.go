@@ -109,9 +109,9 @@ func newTestCommandHandler(t *testing.T, db *DB) *CommandHandler {
 		switch r.URL.Path {
 		case "/health":
 			json.NewEncoder(w).Encode(contract.HealthResponse{
-				Version:        "v1.0.0",
-				CommitSHA:      "abc123",
-				UptimeSeconds:  3600,
+				Version:       "v1.0.0",
+				CommitSHA:     "abc123",
+				UptimeSeconds: 3600,
 			})
 		case "/send", "/edit", "/create_topic", "/pin_message", "/close_topic", "/edit_topic":
 			json.NewEncoder(w).Encode(contract.OKResponse{OK: true})
@@ -139,6 +139,111 @@ func makeUpdate(chatID int64, threadID *int64, messageID int64, text string, use
 		Content: &contract.Content{
 			Text: &text,
 		},
+	}
+}
+
+func makeCommandUpdate(chatID int64, messageID int64, text string, userID int64) contract.Update {
+	command := strings.Fields(text)[0]
+	return contract.Update{
+		Type:      "message",
+		ChatID:    chatID,
+		MessageID: messageID,
+		FromUser:  contract.FromUser{ID: userID},
+		Content: &contract.Content{
+			Type:     contract.ContentTypeText,
+			Text:     &text,
+			Entities: []contract.Entity{{Type: "bot_command", Offset: 0, Length: len([]rune(command))}},
+		},
+	}
+}
+
+func TestCommandHandler_Handle_RoutesCommandsAndParsesArgs(t *testing.T) {
+	tests := []struct {
+		name           string
+		text           string
+		setup          func(t *testing.T, db *DB)
+		wantReply      string
+		wantMaxWorkers int
+	}{
+		{
+			name:      "help command",
+			text:      "/help",
+			wantReply: "Available commands:",
+		},
+		{
+			name:      "unknown command",
+			text:      "/does-not-exist extra words",
+			wantReply: "Unknown command: /does-not-exist",
+		},
+		{
+			name: "config command receives parsed setting and value",
+			text: "/config max_workers 3",
+			setup: func(t *testing.T, db *DB) {
+				t.Helper()
+				ctx := context.Background()
+				if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 42, Role: "admin", AddedAt: time.Now().UTC()}); err != nil {
+					t.Fatalf("upsert admin: %v", err)
+				}
+				if err := db.UpsertGroup(ctx, &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}); err != nil {
+					t.Fatalf("upsert group: %v", err)
+				}
+			},
+			wantReply:      "Max workers set to: 3",
+			wantMaxWorkers: 3,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			if tc.setup != nil {
+				tc.setup(t, db)
+			}
+
+			var sent []contract.SendRequest
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/send" {
+					http.NotFound(w, r)
+					return
+				}
+				var req contract.SendRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Errorf("decode send request: %v", err)
+					return
+				}
+				sent = append(sent, req)
+				_ = json.NewEncoder(w).Encode(contract.SendResponse{OK: true, MessageID: 900})
+			}))
+			defer srv.Close()
+
+			sender, err := NewSender(srv.URL, t.TempDir()+"/sender.db")
+			if err != nil {
+				t.Fatalf("NewSender: %v", err)
+			}
+			defer sender.Close()
+
+			h := NewCommandHandler(db, sender, srv.URL, nil, nil, "1.0.0", "abc123", "2024-01-01")
+			h.Handle(context.Background(), makeCommandUpdate(100, 12, tc.text, 42), func() *Group {
+				group, _ := db.GetGroup(context.Background(), 100)
+				return group
+			}())
+
+			if len(sent) != 1 {
+				t.Fatalf("send request count = %d, want 1", len(sent))
+			}
+			if !strings.Contains(sent[0].Text, tc.wantReply) {
+				t.Errorf("reply = %q, want substring %q", sent[0].Text, tc.wantReply)
+			}
+			if tc.wantMaxWorkers != 0 {
+				group, err := db.GetGroup(context.Background(), 100)
+				if err != nil {
+					t.Fatalf("get group: %v", err)
+				}
+				if group.MaxWorkers != tc.wantMaxWorkers {
+					t.Errorf("MaxWorkers = %d, want %d", group.MaxWorkers, tc.wantMaxWorkers)
+				}
+			}
+		})
 	}
 }
 
@@ -318,18 +423,18 @@ func TestCmdConfig_ShowAll(t *testing.T) {
 	ctx := context.Background()
 
 	group := &Group{
-		ChatID:           100,
-		CWD:              "/test/path",
-		DefaultModel:     "claude-sonnet-4-6",
-		MaxBudget:        10.0,
-		TimeoutSec:       300,
-		PermissionMode:   "acceptEdits",
-		AllowedTools:     `["Read","Grep"]`,
-		DisallowedTools:  `["Bash"]`,
-		MaxSubtasks:      5,
-		MaxWorkers:       3,
+		ChatID:              100,
+		CWD:                 "/test/path",
+		DefaultModel:        "claude-sonnet-4-6",
+		MaxBudget:           10.0,
+		TimeoutSec:          300,
+		PermissionMode:      "acceptEdits",
+		AllowedTools:        `["Read","Grep"]`,
+		DisallowedTools:     `["Bash"]`,
+		MaxSubtasks:         5,
+		MaxWorkers:          3,
 		ProgressIntervalSec: 60,
-		CreatedAt:        time.Now().UTC(),
+		CreatedAt:           time.Now().UTC(),
 	}
 	if err := db.UpsertGroup(ctx, group); err != nil {
 		t.Fatalf("upsert group: %v", err)
@@ -462,10 +567,10 @@ func TestCmdConfig_SetPermissionMode_Success(t *testing.T) {
 	}
 
 	group := &Group{
-		ChatID:          100,
-		CWD:             "/test",
-		PermissionMode:  "acceptEdits",
-		CreatedAt:       time.Now().UTC(),
+		ChatID:         100,
+		CWD:            "/test",
+		PermissionMode: "acceptEdits",
+		CreatedAt:      time.Now().UTC(),
 	}
 	if err := db.UpsertGroup(ctx, group); err != nil {
 		t.Fatalf("upsert group: %v", err)
@@ -589,10 +694,10 @@ func TestCmdConfig_SetAllowedTools_Clear(t *testing.T) {
 	}
 
 	group := &Group{
-		ChatID:        100,
-		CWD:           "/test",
-		AllowedTools:  `["Read"]`,
-		CreatedAt:     time.Now().UTC(),
+		ChatID:       100,
+		CWD:          "/test",
+		AllowedTools: `["Read"]`,
+		CreatedAt:    time.Now().UTC(),
 	}
 	if err := db.UpsertGroup(ctx, group); err != nil {
 		t.Fatalf("upsert group: %v", err)
@@ -696,7 +801,7 @@ func TestCmdConfig_SetMaxSubtasks_Invalid(t *testing.T) {
 	}{
 		{"negative", "-1"},
 		{"invalid", "abc"},
-		{"zero", "0"},  // 0 is actually valid
+		{"zero", "0"}, // 0 is actually valid
 	}
 
 	for _, tc := range tests {
@@ -733,10 +838,10 @@ func TestCmdConfig_SetMaxSubtasks_Success(t *testing.T) {
 	}
 
 	group := &Group{
-		ChatID:       100,
-		CWD:          "/test",
-		MaxSubtasks:  5,
-		CreatedAt:    time.Now().UTC(),
+		ChatID:      100,
+		CWD:         "/test",
+		MaxSubtasks: 5,
+		CreatedAt:   time.Now().UTC(),
 	}
 	if err := db.UpsertGroup(ctx, group); err != nil {
 		t.Fatalf("upsert group: %v", err)
@@ -779,10 +884,10 @@ func TestCmdConfig_SetMaxWorkers_Success(t *testing.T) {
 	}
 
 	group := &Group{
-		ChatID:      100,
-		CWD:         "/test",
-		MaxWorkers:  5,
-		CreatedAt:   time.Now().UTC(),
+		ChatID:     100,
+		CWD:        "/test",
+		MaxWorkers: 5,
+		CreatedAt:  time.Now().UTC(),
 	}
 	if err := db.UpsertGroup(ctx, group); err != nil {
 		t.Fatalf("upsert group: %v", err)
@@ -827,7 +932,7 @@ func TestCmdConfig_SetProgressInterval_Success(t *testing.T) {
 	group := &Group{
 		ChatID:              100,
 		CWD:                 "/test",
-		ProgressIntervalSec:  30,
+		ProgressIntervalSec: 30,
 		CreatedAt:           time.Now().UTC(),
 	}
 	if err := db.UpsertGroup(ctx, group); err != nil {
@@ -971,10 +1076,10 @@ func TestCmdPermission_ShowCurrent(t *testing.T) {
 	ctx := context.Background()
 
 	group := &Group{
-		ChatID:          100,
-		CWD:             "/test",
-		PermissionMode:  "acceptEdits",
-		CreatedAt:       time.Now().UTC(),
+		ChatID:         100,
+		CWD:            "/test",
+		PermissionMode: "acceptEdits",
+		CreatedAt:      time.Now().UTC(),
 	}
 	if err := db.UpsertGroup(ctx, group); err != nil {
 		t.Fatalf("upsert group: %v", err)
@@ -1231,16 +1336,16 @@ func TestCmdStatus_WithActiveSessions(t *testing.T) {
 
 	// Create an active session
 	session := &Session{
-		ChatID:        100,
-		ThreadID:      10,
-		SessionID:     "test-session",
-		CWD:           "/test",
-		Model:         "claude-sonnet-4-6",
-		Status:        "active",
-		MessageCount:  5,
-		LastActive:    time.Now().UTC(),
+		ChatID:         100,
+		ThreadID:       10,
+		SessionID:      "test-session",
+		CWD:            "/test",
+		Model:          "claude-sonnet-4-6",
+		Status:         "active",
+		MessageCount:   5,
+		LastActive:     time.Now().UTC(),
 		LastFromUserID: 12345,
-		CreatedAt:     time.Now().UTC(),
+		CreatedAt:      time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -1307,15 +1412,15 @@ func TestCmdSessions_WithSessions(t *testing.T) {
 	// Create sessions in different states
 	for i, status := range []string{"active", "closed", "active"} {
 		session := &Session{
-			ChatID:        100,
-			ThreadID:      int64(i + 10),
-			SessionID:     fmt.Sprintf("session-%d", i),
-			CWD:           "/test",
-			Status:        status,
-			MessageCount:  i + 1,
-			LastActive:    time.Now().UTC(),
+			ChatID:         100,
+			ThreadID:       int64(i + 10),
+			SessionID:      fmt.Sprintf("session-%d", i),
+			CWD:            "/test",
+			Status:         status,
+			MessageCount:   i + 1,
+			LastActive:     time.Now().UTC(),
 			LastFromUserID: 12345,
-			CreatedAt:     time.Now().UTC(),
+			CreatedAt:      time.Now().UTC(),
 		}
 		if err := db.CreateSession(ctx, session); err != nil {
 			t.Fatalf("create session: %v", err)
@@ -1351,13 +1456,13 @@ func TestCmdColor_ShowCurrent(t *testing.T) {
 
 	threadID := int64(10)
 	session := &Session{
-		ChatID:     100,
-		ThreadID:   10,
-		SessionID:  "test-session",
-		CWD:        "/test",
-		Status:     "active",
-		IconColor:  ColorComplete,
-		CreatedAt:  time.Now().UTC(),
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "test-session",
+		CWD:       "/test",
+		Status:    "active",
+		IconColor: ColorComplete,
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -1417,12 +1522,12 @@ func TestCmdColor_SetColor_Invalid(t *testing.T) {
 
 	threadID := int64(10)
 	session := &Session{
-		ChatID:     100,
-		ThreadID:   10,
-		SessionID:  "test-session",
-		CWD:        "/test",
-		Status:     "active",
-		CreatedAt:  time.Now().UTC(),
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "test-session",
+		CWD:       "/test",
+		Status:    "active",
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -1478,12 +1583,12 @@ func TestCmdColor_ColorAliases(t *testing.T) {
 		t.Run(tc.input, func(t *testing.T) {
 			threadID := int64(10)
 			session := &Session{
-				ChatID:     100,
-				ThreadID:   10,
-				SessionID:  fmt.Sprintf("test-session-%s", tc.input),
-				CWD:        "/test",
-				Status:     "active",
-				CreatedAt:  time.Now().UTC(),
+				ChatID:    100,
+				ThreadID:  10,
+				SessionID: fmt.Sprintf("test-session-%s", tc.input),
+				CWD:       "/test",
+				Status:    "active",
+				CreatedAt: time.Now().UTC(),
 			}
 			if err := db.CreateSession(ctx, session); err != nil {
 				t.Fatalf("create session: %v", err)
@@ -1602,12 +1707,12 @@ func TestCmdNotify_SetMode_Invalid(t *testing.T) {
 
 	threadID := int64(10)
 	session := &Session{
-		ChatID:     100,
-		ThreadID:   10,
-		SessionID:  "test-session",
-		CWD:        "/test",
-		Status:     "active",
-		CreatedAt:  time.Now().UTC(),
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "test-session",
+		CWD:       "/test",
+		Status:    "active",
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -1641,12 +1746,12 @@ func TestCmdNotify_SetMode_Success(t *testing.T) {
 
 	threadID := int64(10)
 	session := &Session{
-		ChatID:     100,
-		ThreadID:   10,
-		SessionID:  "test-session",
-		CWD:        "/test",
-		Status:     "active",
-		CreatedAt:  time.Now().UTC(),
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "test-session",
+		CWD:       "/test",
+		Status:    "active",
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -1689,12 +1794,12 @@ func TestCmdNotify_LiveAlias(t *testing.T) {
 
 	threadID := int64(10)
 	session := &Session{
-		ChatID:     100,
-		ThreadID:   10,
-		SessionID:  "test-session",
-		CWD:        "/test",
-		Status:     "active",
-		CreatedAt:  time.Now().UTC(),
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "test-session",
+		CWD:       "/test",
+		Status:    "active",
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -1755,10 +1860,10 @@ func TestCmdInfo_Success(t *testing.T) {
 	ctx := context.Background()
 
 	group := &Group{
-		ChatID:        100,
-		CWD:           "/test",
-		DefaultModel:  "claude-sonnet-4-6",
-		CreatedAt:     time.Now().UTC(),
+		ChatID:       100,
+		CWD:          "/test",
+		DefaultModel: "claude-sonnet-4-6",
+		CreatedAt:    time.Now().UTC(),
 	}
 	if err := db.UpsertGroup(ctx, group); err != nil {
 		t.Fatalf("upsert group: %v", err)
@@ -1814,10 +1919,10 @@ func TestCmdModel_ShowCurrent(t *testing.T) {
 	ctx := context.Background()
 
 	group := &Group{
-		ChatID:        100,
-		CWD:           "/test",
-		DefaultModel:  "claude-sonnet-4-6",
-		CreatedAt:     time.Now().UTC(),
+		ChatID:       100,
+		CWD:          "/test",
+		DefaultModel: "claude-sonnet-4-6",
+		CreatedAt:    time.Now().UTC(),
 	}
 	if err := db.UpsertGroup(ctx, group); err != nil {
 		t.Fatalf("upsert group: %v", err)
@@ -1825,13 +1930,13 @@ func TestCmdModel_ShowCurrent(t *testing.T) {
 
 	threadID := int64(10)
 	session := &Session{
-		ChatID:     100,
-		ThreadID:   10,
-		SessionID:  "test-session",
-		CWD:        "/test",
-		Model:      "claude-opus-4-7",
-		Status:     "active",
-		CreatedAt:  time.Now().UTC(),
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "test-session",
+		CWD:       "/test",
+		Model:     "claude-opus-4-7",
+		Status:    "active",
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -1876,12 +1981,12 @@ func TestCmdModel_SetModel_Shortcuts(t *testing.T) {
 		t.Run(tc.input, func(t *testing.T) {
 			threadID := int64(10)
 			session := &Session{
-				ChatID:     100,
-				ThreadID:   10,
-				SessionID:  fmt.Sprintf("test-session-%s", tc.input),
-				CWD:        "/test",
-				Status:     "active",
-				CreatedAt:  time.Now().UTC(),
+				ChatID:    100,
+				ThreadID:  10,
+				SessionID: fmt.Sprintf("test-session-%s", tc.input),
+				CWD:       "/test",
+				Status:    "active",
+				CreatedAt: time.Now().UTC(),
 			}
 			if err := db.CreateSession(ctx, session); err != nil {
 				t.Fatalf("create session: %v", err)
@@ -1932,12 +2037,12 @@ func TestCmdModel_SetModel_Custom(t *testing.T) {
 
 	threadID := int64(10)
 	session := &Session{
-		ChatID:     100,
-		ThreadID:   10,
-		SessionID:  "test-session",
-		CWD:        "/test",
-		Status:     "active",
-		CreatedAt:  time.Now().UTC(),
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "test-session",
+		CWD:       "/test",
+		Status:    "active",
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -2173,12 +2278,12 @@ func TestCmdClose_AlreadyClosed(t *testing.T) {
 	}
 
 	session := &Session{
-		ChatID:     100,
-		ThreadID:   10,
-		SessionID:  "test-session",
-		CWD:        "/test",
-		Status:     "closed",
-		CreatedAt:  time.Now().UTC(),
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "test-session",
+		CWD:       "/test",
+		Status:    "closed",
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -2204,10 +2309,10 @@ func TestCmdTimeout_ShowCurrent_NoOverride(t *testing.T) {
 	ctx := context.Background()
 
 	group := &Group{
-		ChatID:      100,
-		CWD:         "/test",
-		TimeoutSec:  300,
-		CreatedAt:   time.Now().UTC(),
+		ChatID:     100,
+		CWD:        "/test",
+		TimeoutSec: 300,
+		CreatedAt:  time.Now().UTC(),
 	}
 	if err := db.UpsertGroup(ctx, group); err != nil {
 		t.Fatalf("upsert group: %v", err)
@@ -2245,10 +2350,10 @@ func TestCmdTimeout_ShowCurrent_WithOverride(t *testing.T) {
 	ctx := context.Background()
 
 	group := &Group{
-		ChatID:      100,
-		CWD:         "/test",
-		TimeoutSec:  300,
-		CreatedAt:   time.Now().UTC(),
+		ChatID:     100,
+		CWD:        "/test",
+		TimeoutSec: 300,
+		CreatedAt:  time.Now().UTC(),
 	}
 	if err := db.UpsertGroup(ctx, group); err != nil {
 		t.Fatalf("upsert group: %v", err)
@@ -2296,12 +2401,12 @@ func TestCmdTimeout_Set_Invalid(t *testing.T) {
 
 	threadID := int64(10)
 	session := &Session{
-		ChatID:     100,
-		ThreadID:   10,
-		SessionID:  "test-session",
-		CWD:        "/test",
-		Status:     "active",
-		CreatedAt:  time.Now().UTC(),
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "test-session",
+		CWD:       "/test",
+		Status:    "active",
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -2335,12 +2440,12 @@ func TestCmdTimeout_Set_Negative(t *testing.T) {
 
 	threadID := int64(10)
 	session := &Session{
-		ChatID:     100,
-		ThreadID:   10,
-		SessionID:  "test-session",
-		CWD:        "/test",
-		Status:     "active",
-		CreatedAt:  time.Now().UTC(),
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "test-session",
+		CWD:       "/test",
+		Status:    "active",
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -2374,12 +2479,12 @@ func TestCmdTimeout_Set_Success(t *testing.T) {
 
 	threadID := int64(10)
 	session := &Session{
-		ChatID:     100,
-		ThreadID:   10,
-		SessionID:  "test-session",
-		CWD:        "/test",
-		Status:     "active",
-		CreatedAt:  time.Now().UTC(),
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "test-session",
+		CWD:       "/test",
+		Status:    "active",
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -2628,12 +2733,12 @@ func TestCmdContext_TopicNotFound(t *testing.T) {
 
 	threadID := int64(10)
 	session := &Session{
-		ChatID:     100,
-		ThreadID:   10,
-		SessionID:  "test-session",
-		CWD:        "/test",
-		Status:     "active",
-		CreatedAt:  time.Now().UTC(),
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "test-session",
+		CWD:       "/test",
+		Status:    "active",
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -3018,11 +3123,11 @@ func TestCmdBudget_ShowCurrent(t *testing.T) {
 	// Add some cost events
 	for i := 0; i < 5; i++ {
 		event := &CostEvent{
-			ChatID:     100,
-			ThreadID:   int64(i + 10),
-			CostUSD:    0.5,
-			Model:      "claude-sonnet-4-6",
-			CreatedAt:  time.Now().UTC(),
+			ChatID:    100,
+			ThreadID:  int64(i + 10),
+			CostUSD:   0.5,
+			Model:     "claude-sonnet-4-6",
+			CreatedAt: time.Now().UTC(),
 		}
 		if err := db.RecordCostEvent(ctx, event); err != nil {
 			t.Fatalf("create cost event: %v", err)
@@ -3295,7 +3400,7 @@ func TestCmdDispatch_ShowCurrent_UsingGroupDefault(t *testing.T) {
 		CWD:            "/test",
 		Status:         "active",
 		DispatcherMode: -1, // Using group default
-		CreatedAt:       time.Now().UTC(),
+		CreatedAt:      time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)
@@ -3335,7 +3440,7 @@ func TestCmdDispatch_ShowCurrent_OverrideEnabled(t *testing.T) {
 		CWD:            "/test",
 		Status:         "active",
 		DispatcherMode: 1, // Enabled
-		CreatedAt:       time.Now().UTC(),
+		CreatedAt:      time.Now().UTC(),
 	}
 	if err := db.CreateSession(ctx, session); err != nil {
 		t.Fatalf("create session: %v", err)

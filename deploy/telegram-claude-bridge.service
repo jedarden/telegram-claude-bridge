@@ -19,7 +19,7 @@ Environment=HOME=/home/coding
 Environment=REPO_PATH=/home/coding/telegram-claude-bridge
 Environment=BINARY_PATH=bin/bridge
 Environment=PROXY_URL=http://telegram-proxy:8080
-Environment=UPDATE_INTERVAL_MINUTES=5
+Environment=UPDATE_INTERVAL_MINUTES=0
 Environment=ADMIN_CHAT_ID=0
 
 [Install]

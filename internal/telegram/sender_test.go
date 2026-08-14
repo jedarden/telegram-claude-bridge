@@ -32,39 +32,39 @@ func newTestServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *S
 
 func TestSender_RateLimitDetection(t *testing.T) {
 	tests := []struct {
-		name           string
-		responseCode   int
-		retryAfter     int
-		expectRetry    bool
-		expectRateLimit bool
+		name            string
+		responseCode    int
+		retryAfter      int
+		expectErrorCode int
+		expectCalls     int
 	}{
 		{
-			name:           "too many requests with retry-after",
-			responseCode:   429,
-			retryAfter:     30,
-			expectRetry:    true,
-			expectRateLimit: true,
+			name:            "too many requests with retry-after",
+			responseCode:    429,
+			retryAfter:      30,
+			expectErrorCode: contract.ErrCodeRateLimit,
+			expectCalls:     1,
 		},
 		{
-			name:           "too many requests without retry-after",
-			responseCode:   429,
-			retryAfter:     0,
-			expectRetry:    true,
-			expectRateLimit: true,
+			name:            "too many requests without retry-after",
+			responseCode:    429,
+			retryAfter:      0,
+			expectErrorCode: contract.ErrCodeRateLimit,
+			expectCalls:     1,
 		},
 		{
-			name:           "server error",
-			responseCode:   500,
-			retryAfter:     0,
-			expectRetry:    true,
-			expectRateLimit: false,
+			name:            "server error",
+			responseCode:    500,
+			retryAfter:      0,
+			expectErrorCode: 500,
+			expectCalls:     1,
 		},
 		{
-			name:           "success",
-			responseCode:   200,
-			retryAfter:     0,
-			expectRetry:    false,
-			expectRateLimit: false,
+			name:            "success",
+			responseCode:    200,
+			retryAfter:      0,
+			expectErrorCode: 0,
+			expectCalls:     1,
 		},
 	}
 
@@ -73,12 +73,15 @@ func TestSender_RateLimitDetection(t *testing.T) {
 			callCount := 0
 			srv, sender := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 				callCount++
-				if callCount == 1 && tc.responseCode != 200 {
+				if tc.responseCode != 200 {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(tc.responseCode)
 					resp := contract.ErrorResponse{
-						ErrorCode:   contract.ErrCodeRateLimit,
-						Description: "Too Many Requests",
+						ErrorCode:   tc.responseCode,
+						Description: "request failed",
+					}
+					if tc.responseCode == contract.ErrCodeRateLimit {
+						resp.Description = "Too Many Requests"
 					}
 					if tc.retryAfter > 0 {
 						resp.RetryAfter = &tc.retryAfter
@@ -86,11 +89,12 @@ func TestSender_RateLimitDetection(t *testing.T) {
 					json.NewEncoder(w).Encode(resp)
 					return
 				}
-				// Second call (or first if no error) succeeds
+				// The raw Telegram client returns API errors to its caller. Retry
+				// policy belongs to the bridge-side proxy client.
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(map[string]any{
-					"ok":          true,
-					"result":      map[string]any{"message_id": 123},
+					"ok":     true,
+					"result": map[string]any{"message_id": 123},
 				})
 			})
 			defer srv.Close()
@@ -98,21 +102,24 @@ func TestSender_RateLimitDetection(t *testing.T) {
 			ctx := context.Background()
 			resp, err := sender.SendMessage(ctx, contract.SendRequest{
 				ChatID: 100,
-				Text:    "test message",
+				Text:   "test message",
 			})
 
-			if tc.expectRetry && callCount != 2 {
-				t.Errorf("expected 2 calls with retry, got %d", callCount)
-			}
-			if !tc.expectRetry && callCount != 1 {
-				t.Errorf("expected 1 call without retry, got %d", callCount)
+			if callCount != tc.expectCalls {
+				t.Errorf("expected %d call(s), got %d", tc.expectCalls, callCount)
 			}
 
-			if tc.expectRateLimit && err == nil {
-				t.Error("expected error for rate limit, got nil")
-			}
-			if !tc.expectRateLimit && err != nil && tc.responseCode == 200 {
-				t.Errorf("expected success for 200, got error: %v", err)
+			if tc.expectErrorCode == 0 {
+				if err != nil {
+					t.Fatalf("expected success, got error: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("expected API error, got nil")
+				}
+				if err.ErrorCode != tc.expectErrorCode {
+					t.Errorf("error code = %d, want %d", err.ErrorCode, tc.expectErrorCode)
+				}
 			}
 			if resp != nil && tc.responseCode == 200 && resp.MessageID != 123 {
 				t.Errorf("expected message_id 123, got %d", resp.MessageID)
@@ -125,69 +132,69 @@ func TestSender_RateLimitDetection(t *testing.T) {
 
 func TestSender_ErrorResponseConversion(t *testing.T) {
 	tests := []struct {
-		name              string
-		httpCode          int
+		name             string
+		httpCode         int
 		tgErrorCode      int
 		tgDescription    string
 		tgRetryAfter     int
 		expectErrorCode  int
-		expectDesc        string
-		expectRetryAfter  *int
+		expectDesc       string
+		expectRetryAfter *int
 	}{
 		{
 			name:             "rate limit with retry-after",
 			httpCode:         429,
-			tgErrorCode:     contract.ErrCodeRateLimit,
-			tgDescription:   "Too Many Requests",
-			tgRetryAfter:    60,
-			expectErrorCode: contract.ErrCodeRateLimit,
-			expectDesc:      "Too Many Requests",
+			tgErrorCode:      contract.ErrCodeRateLimit,
+			tgDescription:    "Too Many Requests",
+			tgRetryAfter:     60,
+			expectErrorCode:  contract.ErrCodeRateLimit,
+			expectDesc:       "Too Many Requests",
 			expectRetryAfter: func() *int { i := 60; return &i }(),
 		},
 		{
-			name:            "forbidden",
-			httpCode:        403,
-			tgErrorCode:    contract.ErrCodeForbidden,
-			tgDescription:  "Bot was blocked by the user",
-			expectErrorCode: contract.ErrCodeForbidden,
-			expectDesc:      "Bot was blocked by the user",
+			name:             "forbidden",
+			httpCode:         403,
+			tgErrorCode:      contract.ErrCodeForbidden,
+			tgDescription:    "Bot was blocked by the user",
+			expectErrorCode:  contract.ErrCodeForbidden,
+			expectDesc:       "Bot was blocked by the user",
 			expectRetryAfter: nil,
 		},
 		{
-			name:            "bad request",
-			httpCode:        400,
-			tgErrorCode:    contract.ErrCodeBadRequest,
-			tgDescription:  "Bad Request: chat not found",
-			expectErrorCode: contract.ErrCodeBadRequest,
-			expectDesc:      "Bad Request: chat not found",
+			name:             "bad request",
+			httpCode:         400,
+			tgErrorCode:      contract.ErrCodeBadRequest,
+			tgDescription:    "Bad Request: chat not found",
+			expectErrorCode:  contract.ErrCodeBadRequest,
+			expectDesc:       "Bad Request: chat not found",
 			expectRetryAfter: nil,
 		},
 		{
-			name:            "unauthorized",
-			httpCode:        401,
-			tgErrorCode:    contract.ErrCodeUnauthorized,
-			tgDescription:  "Unauthorized",
-			expectErrorCode: contract.ErrCodeUnauthorized,
-			expectDesc:      "Unauthorized",
+			name:             "unauthorized",
+			httpCode:         401,
+			tgErrorCode:      contract.ErrCodeUnauthorized,
+			tgDescription:    "Unauthorized",
+			expectErrorCode:  contract.ErrCodeUnauthorized,
+			expectDesc:       "Unauthorized",
 			expectRetryAfter: nil,
 		},
 		{
-			name:            "conflict",
-			httpCode:        409,
-			tgErrorCode:    contract.ErrCodeConflict,
-			tgDescription:  "Conflict: message is not modified",
-			expectErrorCode: contract.ErrCodeConflict,
-			expectDesc:      "Conflict: message is not modified",
+			name:             "conflict",
+			httpCode:         409,
+			tgErrorCode:      contract.ErrCodeConflict,
+			tgDescription:    "Conflict: message is not modified",
+			expectErrorCode:  contract.ErrCodeConflict,
+			expectDesc:       "Conflict: message is not modified",
 			expectRetryAfter: nil,
 		},
 		{
-			name:            "too many requests without retry-after",
-			httpCode:        429,
-			tgErrorCode:    contract.ErrCodeRateLimit,
-			tgDescription:  "Too Many Requests",
-			tgRetryAfter:   0,
-			expectErrorCode: contract.ErrCodeRateLimit,
-			expectDesc:      "Too Many Requests",
+			name:             "too many requests without retry-after",
+			httpCode:         429,
+			tgErrorCode:      contract.ErrCodeRateLimit,
+			tgDescription:    "Too Many Requests",
+			tgRetryAfter:     0,
+			expectErrorCode:  contract.ErrCodeRateLimit,
+			expectDesc:       "Too Many Requests",
 			expectRetryAfter: nil,
 		},
 	}
@@ -214,7 +221,7 @@ func TestSender_ErrorResponseConversion(t *testing.T) {
 			ctx := context.Background()
 			_, apiErr := sender.SendMessage(ctx, contract.SendRequest{
 				ChatID: 100,
-				Text:    "test message",
+				Text:   "test message",
 			})
 
 			if apiErr == nil {
@@ -286,9 +293,9 @@ func TestSender_SendMessage_WithThreadID(t *testing.T) {
 	ctx := context.Background()
 	threadID := int64(123)
 	resp, err := sender.SendMessage(ctx, contract.SendRequest{
-		ChatID:    100,
-		ThreadID:  &threadID,
-		Text:      "test message",
+		ChatID:   100,
+		ThreadID: &threadID,
+		Text:     "test message",
 	})
 
 	if err != nil {
@@ -420,8 +427,8 @@ func TestSender_SendChatAction_Success(t *testing.T) {
 
 	ctx := context.Background()
 	err := sender.SendChatAction(ctx, contract.ChatActionRequest{
-		ChatID:  100,
-		Action:  "typing",
+		ChatID: 100,
+		Action: "typing",
 	})
 
 	if err != nil {
@@ -571,8 +578,8 @@ func TestSender_CreateForumTopic_Success(t *testing.T) {
 			"ok": true,
 			"result": map[string]any{
 				"message_thread_id": 12345,
-				"name":             "Test Topic",
-				"icon_color":       9371288,
+				"name":              "Test Topic",
+				"icon_color":        9371288,
 			},
 		})
 	})
@@ -610,7 +617,7 @@ func TestSender_CreateForumTopic_WithoutIconColor(t *testing.T) {
 			"ok": true,
 			"result": map[string]any{
 				"message_thread_id": 67890,
-				"name":             "Default Color",
+				"name":              "Default Color",
 			},
 		})
 	})
@@ -651,9 +658,9 @@ func TestSender_EditForumTopic_Name(t *testing.T) {
 	ctx := context.Background()
 	newName := "Updated Topic Name"
 	err := sender.EditForumTopic(ctx, contract.EditTopicRequest{
-		ChatID:    100,
-		ThreadID:  123,
-		Name:      &newName,
+		ChatID:   100,
+		ThreadID: 123,
+		Name:     &newName,
 	})
 
 	if err != nil {
@@ -876,10 +883,14 @@ func TestSender_DownloadFile_NotFound(t *testing.T) {
 	defer srv.Close()
 
 	ctx := context.Background()
-	_, err := sender.DownloadFile(ctx, "/photos/notfound.jpg")
+	resp, err := sender.DownloadFile(ctx, "/photos/notfound.jpg")
 
-	if err == nil {
-		t.Fatal("DownloadFile should return error for 404")
+	if err != nil {
+		t.Fatalf("DownloadFile should return the HTTP response for 404: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status code = %d, want %d", resp.StatusCode, http.StatusNotFound)
 	}
 }
 
@@ -913,7 +924,7 @@ func TestSender_ContextCancellation(t *testing.T) {
 
 	_, err := sender.SendMessage(ctx, contract.SendRequest{
 		ChatID: 100,
-		Text:    "test",
+		Text:   "test",
 	})
 
 	if err == nil {
@@ -1075,9 +1086,9 @@ func TestSender_SendVideo_WithDimensions(t *testing.T) {
 	width := 1920
 	height := 1080
 	resp, err := sender.SendVideo(ctx, contract.SendVideoRequest{
-		ChatID:  100,
-		Width:   &width,
-		Height:  &height,
+		ChatID: 100,
+		Width:  &width,
+		Height: &height,
 	}, fileData, "video.mp4")
 
 	if err != nil {
@@ -1109,7 +1120,7 @@ func TestSender_TokenRedaction(t *testing.T) {
 	ctx := context.Background()
 	_, err := sender.SendMessage(ctx, contract.SendRequest{
 		ChatID: 100,
-		Text:    "test",
+		Text:   "test",
 	})
 
 	if err == nil {
