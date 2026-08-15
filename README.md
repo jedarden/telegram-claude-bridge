@@ -78,6 +78,8 @@ When enabled (`/dispatch on`), Claude receives two synthetic tools:
 
 The bridge checks a configurable remote for new versions on a background interval and applies updates with `/update do`. Update checking can be disabled by setting `UPDATE_INTERVAL_MINUTES=0`.
 
+**Systemd unit updates:** The self-updater automatically copies `deploy/telegram-claude-bridge.service` to `~/.config/systemd/user/telegram-claude-bridge.service` and runs `systemctl --user daemon-reload` before each update. This ensures service configuration changes (like StartLimit settings, watchdog timeout, environment variables) are applied without manual intervention. The live unit file is always kept in sync with the template in the repo.
+
 ### Session lifecycle
 
 - One session per `(chat_id, thread_id)` pair

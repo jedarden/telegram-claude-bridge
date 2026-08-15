@@ -409,6 +409,50 @@ func (u *Updater) notifyRestarting(ctx context.Context) {
 	}
 }
 
+// updateSystemdUnit copies the systemd unit file from deploy/ to the user's systemd directory.
+// This ensures that changes to the service unit (like StartLimit settings) are applied.
+func (u *Updater) updateSystemdUnit(ctx context.Context) error {
+	// Source: deploy/telegram-claude-bridge.service
+	srcPath := filepath.Join(u.repoPath, "deploy", "telegram-claude-bridge.service")
+
+	// Destination: ~/.config/systemd/user/telegram-claude-bridge.service
+	homeDir := os.Getenv("HOME")
+	if homeDir == "" {
+		return fmt.Errorf("HOME environment variable not set")
+	}
+	dstDir := filepath.Join(homeDir, ".config", "systemd", "user")
+	dstPath := filepath.Join(dstDir, "telegram-claude-bridge.service")
+
+	// Ensure destination directory exists
+	if err := os.MkdirAll(dstDir, 0755); err != nil {
+		return fmt.Errorf("create systemd directory: %w", err)
+	}
+
+	// Read source file
+	content, err := os.ReadFile(srcPath)
+	if err != nil {
+		return fmt.Errorf("read source unit file: %w", err)
+	}
+
+	// Write to destination
+	if err := os.WriteFile(dstPath, content, 0644); err != nil {
+		return fmt.Errorf("write unit file: %w", err)
+	}
+
+	log.Printf("[updater] updated systemd unit file: %s", dstPath)
+
+	// Reload systemd daemon to apply changes
+	reloadCmd := exec.CommandContext(ctx, "systemctl", "--user", "daemon-reload")
+	if output, err := reloadCmd.CombinedOutput(); err != nil {
+		log.Printf("[updater] systemctl daemon-reload failed: %v: %s", err, string(output))
+		// Don't fail the update for this, but log it
+		return fmt.Errorf("daemon-reload: %w", err)
+	}
+
+	log.Printf("[updater] systemd daemon reloaded")
+	return nil
+}
+
 // replaceAndRestart atomically replaces the binary and restarts the process.
 func (u *Updater) replaceAndRestart(newCommit string) {
 	oldPath := filepath.Join(u.repoPath, u.binaryPath)
@@ -424,6 +468,14 @@ func (u *Updater) replaceAndRestart(newCommit string) {
 		log.Printf("[updater] backed up current binary to %s", backupPath)
 		// Make backup executable
 		os.Chmod(backupPath, 0755)
+	}
+
+	// Update systemd unit file before replacing binary
+	// This ensures any service configuration changes are applied
+	ctx := context.Background()
+	if err := u.updateSystemdUnit(ctx); err != nil {
+		log.Printf("[updater] failed to update systemd unit: %v", err)
+		// Continue with the update anyway - the binary is more critical
 	}
 
 	// Atomic rename (must be on same filesystem)
