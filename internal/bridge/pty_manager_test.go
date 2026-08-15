@@ -3,10 +3,210 @@ package bridge
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+// ── tmux Mock Fixtures ─────────────────────────────────────────────────────────────
+
+const tmuxMockFixtureDirEnv = "TELEGRAM_BRIDGE_TMUX_FIXTURE_DIR"
+
+// tmuxMockResponse describes the result returned by the fixture-backed tmux
+// executable for one subcommand.
+type tmuxMockResponse struct {
+	stdout   string
+	stderr   string
+	exitCode int
+}
+
+const (
+	tmuxNewSessionOutput  = ""
+	tmuxNewPaneOutput     = "%1\n"
+	tmuxListPanesOutput   = "%1\ttelegram-bridge\tt100-10\t0\t12345\t/dev/pts/42\n"
+	tmuxListWindowsOutput = "t100-10\nw-worker_1-1234567890\n"
+	tmuxPaneTTYOutput     = "/dev/pts/42\n"
+	tmuxCapturePaneOutput = "● Mock response\nMock response body\n❯\n"
+)
+
+// tmuxCommandFixtures returns independent fixtures for the tmux commands used
+// by PTYManager and cleanup code. A function is used instead of a package-level
+// mutable map so tests can safely override one command without affecting other
+// tests.
+func tmuxCommandFixtures() map[string]tmuxMockResponse {
+	return map[string]tmuxMockResponse{
+		"has-session":     {exitCode: 0},
+		"new-session":     {stdout: tmuxNewSessionOutput},
+		"new-window":      {stdout: tmuxNewSessionOutput},
+		"new-pane":        {stdout: tmuxNewPaneOutput},
+		"list-panes":      {stdout: tmuxListPanesOutput},
+		"list-windows":    {stdout: tmuxListWindowsOutput},
+		"display-message": {stdout: tmuxPaneTTYOutput},
+		"capture-pane":    {stdout: tmuxCapturePaneOutput},
+		"kill-window":     {stdout: tmuxNewSessionOutput},
+		"send-keys":       {stdout: tmuxNewSessionOutput},
+		"set-buffer":      {stdout: tmuxNewSessionOutput},
+		"paste-buffer":    {stdout: tmuxNewSessionOutput},
+	}
+}
+
+// tmuxTestState owns the temporary fixture directory and fake tmux executable
+// installed by setupTmuxTest.
+type tmuxTestState struct {
+	fixtureDir         string
+	previousPath       string
+	previousPathSet    bool
+	previousFixtureDir string
+	previousFixtureSet bool
+	tornDown           bool
+}
+
+// setupTmuxTest installs a fixture-backed tmux command and loads the common
+// command responses. The returned state can be used to inspect recorded calls
+// or to explicitly invoke teardownTmuxTest; t.Cleanup also tears it down.
+func setupTmuxTest(t *testing.T) *tmuxTestState {
+	t.Helper()
+
+	fixtureDir := t.TempDir()
+	tmuxPath := filepath.Join(fixtureDir, "tmux")
+	const tmuxMockScript = `#!/bin/sh
+set -eu
+
+fixture_dir=${TELEGRAM_BRIDGE_TMUX_FIXTURE_DIR:?missing fixture directory}
+if [ "$#" -eq 0 ]; then
+    echo "tmux mock: missing subcommand" >&2
+    exit 127
+fi
+
+command=$1
+printf '%s\n' "$*" >> "$fixture_dir/calls"
+
+stdout_file="$fixture_dir/$command.stdout"
+stderr_file="$fixture_dir/$command.stderr"
+exit_file="$fixture_dir/$command.exit"
+if [ ! -f "$stdout_file" ] || [ ! -f "$stderr_file" ] || [ ! -f "$exit_file" ]; then
+    echo "tmux mock: no fixture for $command" >&2
+    exit 127
+fi
+
+cat "$stdout_file"
+cat "$stderr_file" >&2
+exit "$(cat "$exit_file")"
+`
+	if err := os.WriteFile(tmuxPath, []byte(tmuxMockScript), 0o755); err != nil {
+		t.Fatalf("write tmux mock: %v", err)
+	}
+
+	previousFixtureDir, previousFixtureSet := os.LookupEnv(tmuxMockFixtureDirEnv)
+	previousPath, previousPathSet := os.LookupEnv("PATH")
+	t.Setenv(tmuxMockFixtureDirEnv, fixtureDir)
+	t.Setenv("PATH", fixtureDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	state := &tmuxTestState{
+		fixtureDir:         fixtureDir,
+		previousPath:       previousPath,
+		previousPathSet:    previousPathSet,
+		previousFixtureDir: previousFixtureDir,
+		previousFixtureSet: previousFixtureSet,
+	}
+	for command, response := range tmuxCommandFixtures() {
+		writeTmuxMockResponse(t, fixtureDir, command, response)
+	}
+	t.Cleanup(func() { teardownTmuxTest(t, state) })
+	return state
+}
+
+// teardownTmuxTest removes the temporary fixture state. It is idempotent so a
+// test may clean up early while the registered t.Cleanup remains in place.
+func teardownTmuxTest(t *testing.T, state *tmuxTestState) {
+	t.Helper()
+	if state == nil || state.tornDown {
+		return
+	}
+	state.tornDown = true
+	var err error
+	if state.previousPathSet {
+		err = os.Setenv("PATH", state.previousPath)
+	} else {
+		err = os.Unsetenv("PATH")
+	}
+	if err != nil {
+		t.Errorf("restore PATH after tmux test: %v", err)
+	}
+	if state.previousFixtureSet {
+		err = os.Setenv(tmuxMockFixtureDirEnv, state.previousFixtureDir)
+	} else {
+		err = os.Unsetenv(tmuxMockFixtureDirEnv)
+	}
+	if err != nil {
+		t.Errorf("restore %s after tmux test: %v", tmuxMockFixtureDirEnv, err)
+	}
+	if err := os.RemoveAll(state.fixtureDir); err != nil {
+		t.Errorf("remove tmux fixture directory: %v", err)
+	}
+}
+
+// mockTmuxCommand writes a complete response fixture for one tmux subcommand.
+func mockTmuxCommand(t *testing.T, command, output string) {
+	t.Helper()
+	mockTmuxResponse(t, command, tmuxMockResponse{stdout: output})
+}
+
+// mockTmuxCommandResult writes a response fixture with an explicit exit code.
+func mockTmuxCommandResult(t *testing.T, command, output string, exitCode int) {
+	t.Helper()
+	mockTmuxResponse(t, command, tmuxMockResponse{stdout: output, exitCode: exitCode})
+}
+
+// mockTmuxCommandFailure writes a failed tmux response with stderr output.
+func mockTmuxCommandFailure(t *testing.T, command, stderr string, exitCode int) {
+	t.Helper()
+	mockTmuxResponse(t, command, tmuxMockResponse{stderr: stderr, exitCode: exitCode})
+}
+
+func mockTmuxResponse(t *testing.T, command string, response tmuxMockResponse) {
+	t.Helper()
+	if command == "" || strings.ContainsAny(command, "/\n") {
+		t.Fatalf("invalid tmux mock command %q", command)
+	}
+	fixtureDir := os.Getenv(tmuxMockFixtureDirEnv)
+	if fixtureDir == "" {
+		t.Fatal("setupTmuxTest must be called before mocking a tmux command")
+	}
+	writeTmuxMockResponse(t, fixtureDir, command, response)
+}
+
+func writeTmuxMockResponse(t *testing.T, fixtureDir, command string, response tmuxMockResponse) {
+	t.Helper()
+	files := map[string][]byte{
+		filepath.Join(fixtureDir, command+".stdout"): []byte(response.stdout),
+		filepath.Join(fixtureDir, command+".stderr"): []byte(response.stderr),
+		filepath.Join(fixtureDir, command+".exit"):   []byte(strconv.Itoa(response.exitCode)),
+	}
+	for path, contents := range files {
+		if err := os.WriteFile(path, contents, 0o600); err != nil {
+			t.Fatalf("write tmux fixture %q: %v", path, err)
+		}
+	}
+}
+
+// tmuxCalls returns the command lines sent to the fixture-backed tmux binary.
+func (s *tmuxTestState) tmuxCalls(t *testing.T) []string {
+	t.Helper()
+	contents, err := os.ReadFile(filepath.Join(s.fixtureDir, "calls"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read tmux calls: %v", err)
+	}
+	contents = []byte(strings.TrimSpace(string(contents)))
+	if len(contents) == 0 {
+		return nil
+	}
+	return strings.Split(string(contents), "\n")
+}
 
 // ── Helper Function Tests ─────────────────────────────────────────────────────────
 
@@ -35,7 +235,7 @@ func TestShellQuote(t *testing.T) {
 
 func TestBridgeRespFile(t *testing.T) {
 	tests := []struct {
-		paneName  string
+		paneName string
 		expected string
 	}{
 		{"t100-10", "/tmp/telegram-bridge-resp/t100-10.resp"},
@@ -416,6 +616,54 @@ func TestReadStopHookResponse(t *testing.T) {
 }
 
 // ── PTYManager Tests ───────────────────────────────────────────────────────────────
+
+func TestTmuxMockFixtures(t *testing.T) {
+	state := setupTmuxTest(t)
+	manager := NewPTYManager()
+	target := "telegram-bridge:t100-10"
+
+	mockTmuxCommand(t, "capture-pane", tmuxCapturePaneOutput)
+	screen, err := manager.CaptureScreen(target)
+	if err != nil {
+		t.Fatalf("CaptureScreen with fixture: %v", err)
+	}
+	if screen != tmuxCapturePaneOutput {
+		t.Errorf("CaptureScreen = %q, want %q", screen, tmuxCapturePaneOutput)
+	}
+
+	tty, err := manager.PaneTTY(target)
+	if err != nil {
+		t.Fatalf("PaneTTY with fixture: %v", err)
+	}
+	if tty != strings.TrimSpace(tmuxPaneTTYOutput) {
+		t.Errorf("PaneTTY = %q, want %q", tty, strings.TrimSpace(tmuxPaneTTYOutput))
+	}
+	if !manager.PaneAlive(target) {
+		t.Error("PaneAlive = false, want true")
+	}
+
+	// A failed has-session response exercises the new-session fixture path.
+	mockTmuxCommandResult(t, "has-session", "", 1)
+	if err := manager.EnsureSession(); err != nil {
+		t.Fatalf("EnsureSession with new-session fixture: %v", err)
+	}
+
+	// A failed command should be surfaced by the production method.
+	mockTmuxCommandFailure(t, "capture-pane", "capture failed", 1)
+	if _, err := manager.CaptureScreen(target); err == nil {
+		t.Fatal("CaptureScreen succeeded for failed tmux fixture")
+	}
+
+	calls := state.tmuxCalls(t)
+	if len(calls) < 5 {
+		t.Fatalf("recorded %d tmux calls, want at least 5: %v", len(calls), calls)
+	}
+	if calls[0] != "capture-pane -t "+target+" -p -S -" {
+		t.Errorf("first tmux call = %q, want capture-pane invocation", calls[0])
+	}
+
+	teardownTmuxTest(t, state)
+}
 
 func TestNewPTYManager(t *testing.T) {
 	pm := NewPTYManager()
