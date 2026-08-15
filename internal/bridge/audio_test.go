@@ -392,6 +392,16 @@ func TestProcessAudio_Args(t *testing.T) {
 			transcription: "Special characters in path transcription test.",
 			wantCmdName:   "whisper",
 		},
+		{
+			name:          "whisper with minimal IDs resulting in /tmp/telegram-bridge/0/1.ogg",
+			chatID:        0,
+			messageID:     1,
+			contentType:   contract.ContentTypeVoice,
+			mimeType:      "audio/ogg",
+			fileID:        "voice_minimal_ids",
+			transcription: "Minimal IDs test - closest to /tmp/test.ogg pattern.",
+			wantCmdName:   "whisper",
+		},
 	}
 
 	for _, tt := range tests {
