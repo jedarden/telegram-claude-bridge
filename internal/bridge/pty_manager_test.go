@@ -287,18 +287,18 @@ func TestShellQuote(t *testing.T) {
 func TestBridgeRespFile(t *testing.T) {
 	tests := []struct {
 		paneName string
-		expected string
 	}{
-		{"t100-10", "/tmp/telegram-bridge-resp/t100-10.resp"},
-		{"simple", "/tmp/telegram-bridge-resp/simple.resp"},
-		{"pane-with-dashes", "/tmp/telegram-bridge-resp/pane-with-dashes.resp"},
+		{"t100-10"},
+		{"simple"},
+		{"pane-with-dashes"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.paneName, func(t *testing.T) {
 			got := bridgeRespFile(tc.paneName)
-			if !strings.HasSuffix(got, tc.expected) {
-				t.Errorf("bridgeRespFile(%q) = %q, want ending with %q", tc.paneName, got, tc.expected)
+			want := filepath.Join(os.TempDir(), "telegram-bridge-resp", tc.paneName+".resp")
+			if got != want {
+				t.Errorf("bridgeRespFile(%q) = %q, want %q", tc.paneName, got, want)
 			}
 		})
 	}
