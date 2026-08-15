@@ -96,7 +96,7 @@ The following must be available on the host running the bridge:
 
 - **tmux** — session multiplexer that hosts Claude Code panes
 - **claude** — [Claude Code CLI](https://github.com/anthropics/claude-code), logged in with an active Anthropic subscription
-- **whisper** — [whisper.cpp](https://github.com/ggerganov/whisper.cpp) or compatible CLI (required only for voice/audio transcription)
+- **whisper** — [OpenAI Whisper CLI](https://github.com/openai/whisper) (`pip install openai-whisper`), or a CLI that accepts the same flags (`--model turbo --output_format txt --output_dir`) — whisper.cpp's CLI does not (required only for voice/audio transcription)
 - **git** — required only if self-update is enabled
 
 The proxy runs as a Docker container and has no host-level dependencies beyond a container runtime.
