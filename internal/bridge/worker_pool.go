@@ -14,10 +14,11 @@ import (
 // via the spawn_worker synthetic tool. Results are posted to Telegram and
 // injected back into the orchestrator's context on the next invocation.
 type WorkerPool struct {
-	db              *DB
-	sender          *Sender
-	sessionMgr      *SessionManager // For PTYManager access and injecting worker results
-	globalMaxWorkers int             // Maximum concurrent workers across all topics (0 = no limit)
+	db                 *DB
+	sender             *Sender
+	sessionMgr         *SessionManager // For PTYManager access and injecting worker results
+	globalMaxWorkers   int             // Maximum concurrent workers across all topics (0 = no limit)
+	globalWorkerTokens chan struct{}   // Process-wide semaphore shared by all topics
 
 	mu        sync.Mutex
 	nextIndex map[topicKey]int // monotonically increasing worker index per topic
@@ -26,11 +27,42 @@ type WorkerPool struct {
 // NewWorkerPool creates a new WorkerPool.
 func NewWorkerPool(db *DB, sender *Sender, sessionMgr *SessionManager, globalMaxWorkers int) *WorkerPool {
 	return &WorkerPool{
-		db:              db,
-		sender:          sender,
-		sessionMgr:      sessionMgr,
-		globalMaxWorkers: globalMaxWorkers,
-		nextIndex:       make(map[topicKey]int),
+		db:                 db,
+		sender:             sender,
+		sessionMgr:         sessionMgr,
+		globalMaxWorkers:   globalMaxWorkers,
+		globalWorkerTokens: newWorkerSemaphore(globalMaxWorkers),
+		nextIndex:          make(map[topicKey]int),
+	}
+}
+
+// newWorkerSemaphore returns a process-wide worker semaphore. A non-positive
+// limit preserves the explicit no-limit configuration.
+func newWorkerSemaphore(limit int) chan struct{} {
+	if limit <= 0 {
+		return nil
+	}
+	return make(chan struct{}, limit)
+}
+
+// tryAcquireGlobalWorker reserves a process-wide worker slot without waiting.
+// SpawnWorker must release the slot if creating the worker record fails, and
+// runWorker releases it when the worker finishes.
+func (wp *WorkerPool) tryAcquireGlobalWorker() bool {
+	if wp.globalWorkerTokens == nil {
+		return true
+	}
+	select {
+	case wp.globalWorkerTokens <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (wp *WorkerPool) releaseGlobalWorker() {
+	if wp.globalWorkerTokens != nil {
+		<-wp.globalWorkerTokens
 	}
 }
 
@@ -73,15 +105,10 @@ func (wp *WorkerPool) SpawnWorker(
 		return "", 0, fmt.Errorf("max workers (%d) already running for this topic", maxWorkers)
 	}
 
-	// Check global ceiling
-	if wp.globalMaxWorkers > 0 {
-		globalRunning, err := wp.db.CountRunningWorkersGlobal(ctx)
-		if err != nil {
-			return "", 0, fmt.Errorf("count global running workers: %w", err)
-		}
-		if globalRunning >= wp.globalMaxWorkers {
-			return "", 0, fmt.Errorf("global worker ceiling (%d) reached - %d workers running across all topics. Wait for existing workers to complete or increase GLOBAL_MAX_WORKERS", wp.globalMaxWorkers, globalRunning)
-		}
+	// Acquire a process-wide slot after the per-topic check. The channel send is
+	// atomic, so concurrent topics cannot race past the global limit.
+	if !wp.tryAcquireGlobalWorker() {
+		return "", 0, fmt.Errorf("global worker ceiling (%d) reached - all worker slots are busy. Wait for existing workers to complete or increase MAX_GLOBAL_WORKERS", wp.globalMaxWorkers)
 	}
 
 	// Get next worker index for this topic
@@ -113,6 +140,7 @@ func (wp *WorkerPool) SpawnWorker(
 		Status:    "running",
 	}
 	if err := wp.db.CreateWorker(ctx, worker); err != nil {
+		wp.releaseGlobalWorker()
 		return "", 0, fmt.Errorf("create worker record: %w", err)
 	}
 
@@ -129,6 +157,8 @@ func (wp *WorkerPool) runWorker(
 	group *Group,
 	index int,
 ) {
+	defer wp.releaseGlobalWorker()
+
 	ctx := context.Background()
 	ptyMgr := wp.sessionMgr.PTYManager()
 

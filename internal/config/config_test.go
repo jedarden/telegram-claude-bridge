@@ -391,7 +391,7 @@ func TestLoadBridgeConfig(t *testing.T) {
 			"BINARY_PATH", "SESSION_CLEANUP_INTERVAL_MINUTES",
 			"SESSION_TTL_HOURS", "CLOSE_INACTIVE_TOPICS",
 			"ADMIN_USER_ID", "EVENT_PUBLISHING_ENABLED",
-			"EVENT_SOCKET_PATH",
+			"EVENT_SOCKET_PATH", "MAX_GLOBAL_WORKERS", "GLOBAL_MAX_WORKERS",
 		}
 		saved := make(map[string]string)
 		for _, e := range envs {
@@ -429,6 +429,8 @@ func TestLoadBridgeConfig(t *testing.T) {
 
 		os.Setenv("PROXY_URL", "http://localhost:8080")
 		os.Unsetenv("POLL_TIMEOUT")
+		os.Unsetenv("MAX_GLOBAL_WORKERS")
+		os.Unsetenv("GLOBAL_MAX_WORKERS")
 
 		cfg, err := LoadBridgeConfig()
 		if err != nil {
@@ -454,6 +456,9 @@ func TestLoadBridgeConfig(t *testing.T) {
 		}
 		if cfg.EventSocketPath != "/tmp/telegram-bridge-events.sock" {
 			t.Errorf("EventSocketPath = %v, want %v", cfg.EventSocketPath, "/tmp/telegram-bridge-events.sock")
+		}
+		if cfg.GlobalMaxWorkers != 10 {
+			t.Errorf("GlobalMaxWorkers = %v, want %v", cfg.GlobalMaxWorkers, 10)
 		}
 	})
 
@@ -760,6 +765,36 @@ func TestLoadBridgeConfig(t *testing.T) {
 		_, err := LoadBridgeConfig()
 		if err == nil {
 			t.Error("LoadBridgeConfig() expected error for invalid EVENT_PUBLISHING_ENABLED")
+		}
+	})
+
+	t.Run("MAX_GLOBAL_WORKERS", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		os.Setenv("PROXY_URL", "http://localhost:8080")
+		os.Setenv("MAX_GLOBAL_WORKERS", "3")
+		os.Unsetenv("GLOBAL_MAX_WORKERS")
+
+		cfg, err := LoadBridgeConfig()
+		if err != nil {
+			t.Fatalf("LoadBridgeConfig() error = %v", err)
+		}
+		if cfg.GlobalMaxWorkers != 3 {
+			t.Errorf("GlobalMaxWorkers = %v, want 3", cfg.GlobalMaxWorkers)
+		}
+	})
+
+	t.Run("invalid MAX_GLOBAL_WORKERS", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		os.Setenv("PROXY_URL", "http://localhost:8080")
+		os.Setenv("MAX_GLOBAL_WORKERS", "not-a-number")
+		os.Unsetenv("GLOBAL_MAX_WORKERS")
+
+		if _, err := LoadBridgeConfig(); err == nil {
+			t.Error("LoadBridgeConfig() expected error for invalid MAX_GLOBAL_WORKERS")
 		}
 	})
 }

@@ -129,6 +129,7 @@ The proxy runs as a Docker container and has no host-level dependencies beyond a
 | `ADMIN_CHAT_ID` | `0` | Chat ID for crash-loop alerts (via ExecStopPost) |
 | `EVENT_PUBLISHING_ENABLED` | `false` | Enable dashboard Unix socket events |
 | `EVENT_SOCKET_PATH` | `/tmp/telegram-bridge-events.sock` | Dashboard socket path |
+| `MAX_GLOBAL_WORKERS` | `10` | Maximum concurrent `spawn_worker` Claude processes across all topics (`0` = disabled) |
 | `UPDATE_INTERVAL_MINUTES` | `5` | Self-update check interval (`0` = disabled) |
 
 ---
