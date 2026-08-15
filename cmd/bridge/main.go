@@ -141,6 +141,36 @@ func main() {
 	watchdog := health.NewWatchdog(checker, "http://"+healthAddr)
 	watchdog.Start(ctx)
 
+	// Run canary test if enabled (default: true)
+	// This verifies PTY screen-scraping and stop-hook extraction work before
+	// we start accepting user messages. Failure sends an alert to ADMIN_CHAT_ID.
+	if cfg.CanaryEnabled {
+		checker.LogInfo("canary_test_starting")
+		canaryCtx, canaryCancel := context.WithTimeout(ctx, 90*time.Second)
+		canaryResult := sessionMgr.RunCanaryTest(canaryCtx, cfg.AdminChatID)
+		canaryCancel()
+
+		if canaryResult.Success {
+			checker.LogInfo("canary_test_passed",
+				"duration_sec", canaryResult.DurationSec,
+				"stop_hook_ok", canaryResult.StopHookOK,
+				"pty_ok", canaryResult.PTYOK)
+		} else {
+			checker.LogError("canary_test_failed",
+				"error", canaryResult.Error,
+				"duration_sec", canaryResult.DurationSec,
+				"stop_hook_ok", canaryResult.StopHookOK,
+				"pty_ok", canaryResult.PTYOK)
+			// Log the failure but continue - the alert has already been sent
+		}
+
+		// Start periodic canary if interval is configured
+		if cfg.CanaryIntervalMinutes > 0 {
+			interval := time.Duration(cfg.CanaryIntervalMinutes) * time.Minute
+			go runPeriodicCanary(ctx, sessionMgr, cfg.AdminChatID, interval, checker)
+		}
+	}
+
 	// Notify systemd that we're ready
 	if err := health.NotifyReady(); err != nil {
 		checker.LogWarn("notify_ready_failed", "error", err)
@@ -196,6 +226,39 @@ func handleReconnectNotifications(ctx context.Context, checker *health.Checker, 
 
 			if len(groupInfos) > 0 {
 				healthServer.SendReconnectNotification(ctx, sender, groupInfos)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// runPeriodicCanary runs the PTY screen-scraping canary test at the configured interval.
+// Each test spawns a fresh Claude session, sends a trivial prompt, and verifies
+// both extraction methods succeed. Failure sends an alert to ADMIN_CHAT_ID.
+func runPeriodicCanary(ctx context.Context, sessionMgr *bridge.SessionManager, adminChatID int64, interval time.Duration, checker *health.Checker) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			checker.LogInfo("periodic_canary_starting", "interval_min", interval.Minutes())
+			canaryCtx, canaryCancel := context.WithTimeout(ctx, 90*time.Second)
+			result := sessionMgr.RunCanaryTest(canaryCtx, adminChatID)
+			canaryCancel()
+
+			if result.Success {
+				checker.LogInfo("periodic_canary_passed",
+					"duration_sec", result.DurationSec,
+					"stop_hook_ok", result.StopHookOK,
+					"pty_ok", result.PTYOK)
+			} else {
+				checker.LogError("periodic_canary_failed",
+					"error", result.Error,
+					"duration_sec", result.DurationSec,
+					"stop_hook_ok", result.StopHookOK,
+					"pty_ok", result.PTYOK)
 			}
 		case <-ctx.Done():
 			return

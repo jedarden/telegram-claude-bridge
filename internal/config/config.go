@@ -98,8 +98,21 @@ type BridgeConfig struct {
 	EventSocketPath string
 
 	// GlobalMaxWorkers is the maximum number of concurrent workers across all topics.
-	// Set to 0 for no limit. Default: 50.
+	// Set to 0 for no limit. Default: 10.
 	GlobalMaxWorkers int
+
+	// AdminChatID is the Telegram chat ID to send administrative alerts to.
+	// Used for canary test failures, crash alerts, and other critical notifications.
+	AdminChatID int64
+
+	// CanaryEnabled controls whether the PTY screen-scraping canary test runs.
+	// The test verifies that Claude CLI response extraction (both stop-hook and PTY)
+	// continues to work after Claude updates. Default: true.
+	CanaryEnabled bool
+
+	// CanaryIntervalMinutes is how often to run the canary test.
+	// Default: 0 (run once at startup only).
+	CanaryIntervalMinutes int
 }
 
 // fetchOpenBaoSecret retrieves a secret from OpenBao's KV v2 store.
@@ -323,16 +336,57 @@ func LoadBridgeConfig() (*BridgeConfig, error) {
 
 	cfg.EventSocketPath = envOrDefault("EVENT_SOCKET_PATH", "/tmp/telegram-bridge-events.sock")
 
-	// Global max workers configuration
-	defaultGlobalMaxWorkers := 50
-	if v := os.Getenv("GLOBAL_MAX_WORKERS"); v != "" {
+	// Global max workers configuration. MAX_GLOBAL_WORKERS is the canonical
+	// name; accept the former GLOBAL_MAX_WORKERS name for compatibility with
+	// existing deployments.
+	defaultGlobalMaxWorkers := 10
+	globalMaxWorkersEnv := "MAX_GLOBAL_WORKERS"
+	v := os.Getenv(globalMaxWorkersEnv)
+	if v == "" {
+		globalMaxWorkersEnv = "GLOBAL_MAX_WORKERS"
+		v = os.Getenv(globalMaxWorkersEnv)
+	}
+	if v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
-			return nil, fmt.Errorf("GLOBAL_MAX_WORKERS must be a non-negative integer, got %q", v)
+			return nil, fmt.Errorf("%s must be a non-negative integer, got %q", globalMaxWorkersEnv, v)
 		}
 		cfg.GlobalMaxWorkers = n
 	} else {
 		cfg.GlobalMaxWorkers = defaultGlobalMaxWorkers
+	}
+
+	// Admin chat ID for alerts
+	if v := os.Getenv("ADMIN_CHAT_ID"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("ADMIN_CHAT_ID must be an integer, got %q", v)
+		}
+		cfg.AdminChatID = n
+	}
+
+	// Canary test configuration
+	if v := os.Getenv("CANARY_ENABLED"); v != "" {
+		switch v {
+		case "1", "true", "yes", "on":
+			cfg.CanaryEnabled = true
+		case "0", "false", "no", "off":
+			cfg.CanaryEnabled = false
+		default:
+			return nil, fmt.Errorf("CANARY_ENABLED must be a boolean value (0/1, true/false, yes/no, on/off), got %q", v)
+		}
+	} else {
+		cfg.CanaryEnabled = true // default: enabled
+	}
+
+	if v := os.Getenv("CANARY_INTERVAL_MINUTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("CANARY_INTERVAL_MINUTES must be a non-negative integer, got %q", v)
+		}
+		cfg.CanaryIntervalMinutes = n
+	} else {
+		cfg.CanaryIntervalMinutes = 0 // default: startup only
 	}
 
 	return cfg, nil
