@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -56,6 +57,7 @@ func tmuxCommandFixtures() map[string]tmuxMockResponse {
 // installed by setupTmuxTest.
 type tmuxTestState struct {
 	fixtureDir         string
+	shellExec          func(args ...string) ([]byte, error)
 	previousPath       string
 	previousPathSet    bool
 	previousFixtureDir string
@@ -110,6 +112,9 @@ exit "$(cat "$exit_file")"
 		previousPathSet:    previousPathSet,
 		previousFixtureDir: previousFixtureDir,
 		previousFixtureSet: previousFixtureSet,
+	}
+	state.shellExec = func(args ...string) ([]byte, error) {
+		return mockShellExec(state.fixtureDir, args...)
 	}
 	for command, response := range tmuxCommandFixtures() {
 		writeTmuxMockResponse(t, fixtureDir, command, response)
@@ -190,6 +195,46 @@ func writeTmuxMockResponse(t *testing.T, fixtureDir, command string, response tm
 			t.Fatalf("write tmux fixture %q: %v", path, err)
 		}
 	}
+}
+
+// mockShellExec returns the predefined response for a tmux command. It reads
+// the same fixture files as the fake tmux executable installed by
+// setupTmuxTest, so tests can exercise the mock directly and production code
+// can exercise it through exec.Command without maintaining two response
+// implementations.
+func mockShellExec(fixtureDir string, args ...string) ([]byte, error) {
+	if fixtureDir == "" {
+		return nil, fmt.Errorf("tmux shell mock: missing fixture directory")
+	}
+	if len(args) == 0 || args[0] == "" {
+		return nil, fmt.Errorf("tmux shell mock: missing subcommand")
+	}
+
+	command := args[0]
+	stdout, err := os.ReadFile(filepath.Join(fixtureDir, command+".stdout"))
+	if err != nil {
+		return nil, fmt.Errorf("tmux shell mock: read %s stdout: %w", command, err)
+	}
+	stderr, err := os.ReadFile(filepath.Join(fixtureDir, command+".stderr"))
+	if err != nil {
+		return nil, fmt.Errorf("tmux shell mock: read %s stderr: %w", command, err)
+	}
+	exitBytes, err := os.ReadFile(filepath.Join(fixtureDir, command+".exit"))
+	if err != nil {
+		return nil, fmt.Errorf("tmux shell mock: read %s exit code: %w", command, err)
+	}
+	exitCode, err := strconv.Atoi(strings.TrimSpace(string(exitBytes)))
+	if err != nil {
+		return nil, fmt.Errorf("tmux shell mock: parse %s exit code: %w", command, err)
+	}
+
+	output := make([]byte, 0, len(stdout)+len(stderr))
+	output = append(output, stdout...)
+	output = append(output, stderr...)
+	if exitCode != 0 {
+		return output, fmt.Errorf("tmux shell mock: %s exited with status %d", command, exitCode)
+	}
+	return output, nil
 }
 
 // tmuxCalls returns the command lines sent to the fixture-backed tmux binary.
@@ -817,6 +862,52 @@ func TestTmuxMockFixtures(t *testing.T) {
 	}
 
 	teardownTmuxTest(t, state)
+}
+
+func TestShellMock(t *testing.T) {
+	state := setupTmuxTest(t)
+
+	for command, response := range tmuxCommandFixtures() {
+		command, response := command, response
+		t.Run(command, func(t *testing.T) {
+			got, err := state.shellExec(command, "-t", tmuxSessionName)
+			if err != nil {
+				t.Fatalf("mockShellExec(%q) returned error: %v", command, err)
+			}
+			want := append([]byte(response.stdout), response.stderr...)
+			if string(got) != string(want) {
+				t.Errorf("mockShellExec(%q) = %q, want %q", command, got, want)
+			}
+		})
+	}
+
+	t.Run("invalid session", func(t *testing.T) {
+		mockTmuxCommandFailure(t, "has-session", "invalid session\n", 1)
+
+		got, err := state.shellExec("has-session", "-t", "invalid-session")
+		if err == nil {
+			t.Fatal("mockShellExec for invalid session returned nil error")
+		}
+		if string(got) != "invalid session\n" {
+			t.Errorf("invalid session output = %q, want %q", got, "invalid session\n")
+		}
+	})
+
+	t.Run("pane not found", func(t *testing.T) {
+		mockTmuxCommandFailure(t, "capture-pane", "pane not found\n", 1)
+
+		got, err := state.shellExec("capture-pane", "-t", "telegram-bridge:missing-pane")
+		if err == nil {
+			t.Fatal("mockShellExec for missing pane returned nil error")
+		}
+		if string(got) != "pane not found\n" {
+			t.Errorf("missing pane output = %q, want %q", got, "pane not found\n")
+		}
+
+		if _, err := NewPTYManager().CaptureScreen("telegram-bridge:missing-pane"); err == nil {
+			t.Fatal("CaptureScreen succeeded for missing pane fixture")
+		}
+	})
 }
 
 func TestNewPTYManager(t *testing.T) {
