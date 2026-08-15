@@ -1,12 +1,12 @@
 {
   "active_root": {
-    "path": "objects/gen-288e4ce43aeaf9329d1fef9e7cb83ef3.jsonl",
-    "sha256": "5610ca976d68960bd1fc9329dca10c4c6810f8fb8fb1854155a9cc46b28df608"
+    "path": "objects/gen-a7b7189d032ce616e6176a02a187c70a.jsonl",
+    "sha256": "079dfbb1d96cab0e57b86dde9cba327e12d2767ad3472542b6838ce4dff99ce1"
   },
   "added_paths": [
-    "objects/gen-288e4ce43aeaf9329d1fef9e7cb83ef3.jsonl"
+    "objects/gen-a7b7189d032ce616e6176a02a187c70a.jsonl"
   ],
-  "created_at": "2026-08-15T14:03:37.324609254Z",
+  "created_at": "2026-08-15T15:32:56.092602751Z",
   "deleted_paths": [
     "current.json",
     "objects/gen-017c66c2059a9b01c66d8641197a3cea.jsonl",
@@ -15,6 +15,7 @@
     "objects/gen-1bfaab15798f0b1dac990279655b925c.jsonl",
     "objects/gen-203c6e47223b8d2ba6a4bd6528beb225.jsonl",
     "objects/gen-274c1fb95382164d70dbdfcef22b9153.jsonl",
+    "objects/gen-288e4ce43aeaf9329d1fef9e7cb83ef3.jsonl",
     "objects/gen-2d1b26d122605cd99bd39405f6943f8b.jsonl",
     "objects/gen-3c0d66fd7ca0c96b7ea21220a9b8a32b.jsonl",
     "objects/gen-3ea1d8d3504cd480523672b36c42ac8e.jsonl",
@@ -44,13 +45,14 @@
     "objects/gen-c3a6b7051c9fc00963bc2ba3a0db4daa.jsonl",
     "objects/gen-d89148d3735443b377cb1e77a378d99a.jsonl",
     "objects/gen-e20cafb86009ed4d58c1a101634f1066.jsonl",
+    "objects/gen-eb66bab8af73a49a13845740c7cfbd66.jsonl",
     "objects/gen-fbe1063fab67b8edcbe9e95ba3f12219.jsonl",
     "objects/gen-fd74293040ce84d14d187aeb39ffe938.jsonl",
     "objects/gen-fec5e4743646693e81cdd4299d57cc6d.jsonl"
   ],
-  "event_count": 286,
-  "generation_id": "gen-288e4ce43aeaf9329d1fef9e7cb83ef3",
-  "issue_count": 228,
+  "event_count": 287,
+  "generation_id": "gen-a7b7189d032ce616e6176a02a187c70a",
+  "issue_count": 234,
   "mode": "monolithic",
   "receipt_count": 0,
   "replaced_paths": [
@@ -58,7 +60,7 @@
     "previous.json"
   ],
   "schema_version": 1,
-  "snapshot_sequence": 286,
+  "snapshot_sequence": 287,
   "store_uuid": "9ed1a1b7-5b9e-b1e4-be2e-c26c0bdc4ba7",
-  "total_record_count": 514
+  "total_record_count": 521
 }
