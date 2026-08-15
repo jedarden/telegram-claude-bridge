@@ -20,7 +20,7 @@ func newTestHandler(proxyURL string) *CallbackHandler {
 	sender, _ := NewSender(proxyURL, ":memory:")
 
 	// Create a minimal session manager
-	sm := NewSessionManager(db, sender, proxyURL, nil)
+	sm := NewSessionManager(db, sender, proxyURL, nil, 5)
 
 	return &CallbackHandler{
 		db:         db,

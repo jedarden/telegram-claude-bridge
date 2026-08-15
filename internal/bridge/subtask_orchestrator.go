@@ -161,7 +161,11 @@ func (o *SubtaskOrchestrator) executeSubtask(ctx context.Context, req SubtaskReq
 	if err != nil {
 		return &subtaskResult{SubtaskID: subtaskID, Error: fmt.Errorf("spawn pane: %w", err)}
 	}
-	defer ptyMgr.KillPane(paneTarget)
+	defer func() {
+		if err := ptyMgr.KillPane(paneTarget); err != nil {
+			log.Printf("[subtask] failed to kill pane after completion: %v (pane may already be dead)", err)
+		}
+	}()
 
 	if err := ptyMgr.WaitForStartup(paneTarget); err != nil {
 		return &subtaskResult{SubtaskID: subtaskID, Error: fmt.Errorf("startup: %w", err)}

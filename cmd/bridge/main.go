@@ -85,7 +85,7 @@ func main() {
 	defer events.StopPublisher(eventPublisher)
 
 	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL, upd, eventPublisher, Version, CommitSHA, BuildDate)
-	sessionMgr := bridge.NewSessionManager(db, sender, cfg.ProxyURL, eventPublisher)
+	sessionMgr := bridge.NewSessionManager(db, sender, cfg.ProxyURL, eventPublisher, cfg.GlobalMaxWorkers)
 	defer sessionMgr.Shutdown()
 	cmdHandler.SetSessionManager(sessionMgr)
 
@@ -125,6 +125,17 @@ func main() {
 	healthAddr := "127.0.0.1:9091"
 	healthServer := health.NewServer(healthAddr, checker)
 	healthServer.Start()
+
+	// Perform startup health check if this is a post-update startup
+	// This verifies the new binary is healthy before we mark it as ready
+	// If health checks fail, it will roll back to the previous binary and exit
+	if err := updater.CheckStartupHealth(cfg.RepoPath, cfg.BinaryPath); err != nil {
+		// Health check failed and rollback was initiated
+		// This function will not return if rollback succeeds (it execs the old binary)
+		// If we reach here, rollback itself failed - log and exit
+		checker.LogError("startup_health_check_failed", "error", err)
+		os.Exit(1)
+	}
 
 	// Start systemd watchdog
 	watchdog := health.NewWatchdog(checker, "http://"+healthAddr)

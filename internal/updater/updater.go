@@ -3,8 +3,10 @@ package updater
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +27,21 @@ const (
 
 	// Suffix for the new binary during update (added to the binary path)
 	newBinarySuffix = ".new"
+
+	// Suffix for the previous binary backup during update
+	backupBinarySuffix = ".prev"
+
+	// Health check URL for the bridge's HTTP health endpoint
+	healthCheckURL = "http://localhost:9091/health"
+
+	// Maximum time to wait for health check after restart
+	healthCheckTimeout = 30 * time.Second
+
+	// Interval between health check polls
+	healthCheckInterval = 500 * time.Millisecond
+
+	// Environment variable set when running in rollback mode
+	envRollbackMode = "BRIDGE_ROLLBACK_MODE"
 )
 
 // Updater handles periodic self-update checks and binary replacement.
@@ -396,6 +413,18 @@ func (u *Updater) notifyRestarting(ctx context.Context) {
 func (u *Updater) replaceAndRestart(newCommit string) {
 	oldPath := filepath.Join(u.repoPath, u.binaryPath)
 	newPath := oldPath + newBinarySuffix
+	backupPath := oldPath + backupBinarySuffix
+
+	// First, save the current binary as a backup before replacing it
+	// We need to copy it because we'll need it if the new binary fails
+	if err := u.copyFile(oldPath, backupPath); err != nil {
+		log.Printf("[updater] failed to create backup: %v", err)
+		// Continue anyway - we'll just have no rollback capability
+	} else {
+		log.Printf("[updater] backed up current binary to %s", backupPath)
+		// Make backup executable
+		os.Chmod(backupPath, 0755)
+	}
 
 	// Atomic rename (must be on same filesystem)
 	if err := os.Rename(newPath, oldPath); err != nil {
@@ -405,15 +434,28 @@ func (u *Updater) replaceAndRestart(newCommit string) {
 
 	log.Printf("[updater] binary replaced, restarting (commit: %s)", newCommit)
 
+	// Set environment variable to signal the new binary to perform startup health check
+	env := os.Environ()
+	env = append(env, "BRIDGE_UPDATED_FROM_COMMIT="+u.runningCommit)
+
 	// Use exec to replace the current process with the new binary
 	// This keeps the same PID and is cleaner than exiting and letting systemd restart
-	err := syscall.Exec(oldPath, []string{"bridge"}, os.Environ())
+	err := syscall.Exec(oldPath, []string{"bridge"}, env)
 	if err != nil {
 		log.Printf("[updater] exec failed: %v", err)
 		// If exec fails, exit cleanly and let systemd restart
 		os.Exit(0)
 	}
 	// exec never returns
+}
+
+// copyFile copies a file from src to dst
+func (u *Updater) copyFile(src, dst string) error {
+	input, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, input, 0755)
 }
 
 // ManualUpdate checks for updates immediately and returns a status message.
@@ -533,5 +575,168 @@ func (u *Updater) CheckForUpdates(ctx context.Context) *bridge.UpdateResult {
 		HasUpdate: hasUpdate,
 		NewCommit: newCommit,
 	}
+}
+
+// CheckStartupHealth performs a health check after a binary update.
+// This should be called at startup if BRIDGE_UPDATED_FROM_COMMIT is set.
+// If health checks fail, it rolls back to the previous binary and exits.
+// Returns nil if healthy, or an error if rollback was performed.
+func CheckStartupHealth(repoPath, binaryPath string) error {
+	// Only check if we just updated
+	prevCommit := os.Getenv("BRIDGE_UPDATED_FROM_COMMIT")
+	if prevCommit == "" {
+		return nil // Not an update startup
+	}
+
+	oldPath := filepath.Join(repoPath, binaryPath)
+	backupPath := oldPath + backupBinarySuffix
+
+	// Check if backup exists
+	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+		log.Printf("[updater] no backup found, skipping health check")
+		return nil
+	}
+
+	log.Printf("[updater] performing post-update health check (prev commit: %s)", prevCommit)
+
+	// Wait a moment for the health server to start
+	time.Sleep(2 * time.Second)
+
+	// Poll health endpoint with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
+	defer cancel()
+
+	healthy := false
+	ticker := time.NewTicker(healthCheckInterval)
+	defer ticker.Stop()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[updater] health check timeout after %s", healthCheckTimeout)
+			// Timeout - roll back
+			return performRollback(oldPath, backupPath, prevCommit)
+		case <-ticker.C:
+			if checkIsHealthy(ctx, client) {
+				healthy = true
+				log.Printf("[updater] health check passed, update successful")
+				// Clean up backup
+				os.Remove(backupPath)
+				break
+			}
+		}
+
+		if healthy {
+			break
+		}
+	}
+
+	return nil
+}
+
+// checkIsHealthy performs a single health check against the local health endpoint.
+func checkIsHealthy(ctx context.Context, client *http.Client) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthCheckURL, nil)
+	if err != nil {
+		return false
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+
+	// Parse response to check the healthy field
+	var result struct {
+		Healthy bool `json:"healthy"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false
+	}
+
+	return result.Healthy
+}
+
+// performRollback restores the previous binary and triggers a rollback restart.
+func performRollback(currentPath, backupPath, prevCommit string) error {
+	log.Printf("[updater] ROLLING BACK to previous binary (commit %s)", prevCommit)
+
+	// Restore backup
+	if err := os.Rename(backupPath, currentPath); err != nil {
+		log.Printf("[updater] failed to restore backup: %v", err)
+		return fmt.Errorf("restore backup failed: %w", err)
+	}
+
+	// Make sure it's executable
+	os.Chmod(currentPath, 0755)
+
+	// Send rollback notification if possible
+	sendRollbackNotification(prevCommit)
+
+	log.Printf("[updater] rollback complete, restarting with previous binary")
+
+	// Exec the previous binary
+	err := syscall.Exec(currentPath, []string{"bridge"}, os.Environ())
+	if err != nil {
+		log.Printf("[updater] rollback exec failed: %v", err)
+		os.Exit(1)
+	}
+	// exec never returns
+	return nil
+}
+
+// sendRollbackNotification sends a notification about the rollback.
+// This uses the proxy directly since the bridge sender may not be available.
+func sendRollbackNotification(prevCommit string) {
+	proxyURL := os.Getenv("PROXY_URL")
+	adminChatID := os.Getenv("ADMIN_CHAT_ID")
+
+	if proxyURL == "" || adminChatID == "" || adminChatID == "0" {
+		log.Printf("[updater] cannot send rollback notification: PROXY_URL or ADMIN_CHAT_ID not set")
+		return
+	}
+
+	message := fmt.Sprintf("⚠️ Bridge update FAILED - rolling back to previous version\n\nPrevious commit: %s\n\nThe new binary failed health checks after restart. Please check logs:\n`journalctl -u telegram-claude-bridge -n 100`", prevCommit)
+
+	// Build JSON payload
+	payload := map[string]interface{}{
+		"chat_id": mustParseInt(adminChatID),
+		"text":    message,
+	}
+
+	// Send via proxy
+	resp, err := http.Post(proxyURL+"/send", "application/json", jsonReader(payload))
+	if err != nil {
+		log.Printf("[updater] failed to send rollback notification: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[updater] rollback notification returned status %d", resp.StatusCode)
+	}
+}
+
+// mustParseInt parses a string to int64, panics on failure.
+func mustParseInt(s string) int64 {
+	var i int64
+	_, err := fmt.Sscanf(s, "%d", &i)
+	if err != nil {
+		panic(fmt.Sprintf("invalid int: %s", s))
+	}
+	return i
+}
+
+// jsonReader creates an io.Reader from a JSON-encoded value.
+func jsonReader(v interface{}) *strings.Reader {
+	b, _ := json.Marshal(v)
+	return strings.NewReader(string(b))
 }
 

@@ -4,6 +4,7 @@ package updater
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1277,5 +1278,149 @@ func TestCheckAndUpdate(t *testing.T) {
 
 		// Should not panic when fetch fails (no remote configured)
 		u.checkAndUpdate()
+	})
+}
+
+func TestCheckStartupHealth(t *testing.T) {
+	t.Run("returns nil when not updating", func(t *testing.T) {
+		tempDir := t.TempDir()
+		initTestRepo(t, tempDir)
+
+		// Make sure BRIDGE_UPDATED_FROM_COMMIT is not set
+		os.Unsetenv("BRIDGE_UPDATED_FROM_COMMIT")
+
+		err := CheckStartupHealth(tempDir, "bridge")
+		if err != nil {
+			t.Errorf("CheckStartupHealth() should return nil when not updating, got: %v", err)
+		}
+	})
+
+	t.Run("returns nil when no backup exists", func(t *testing.T) {
+		tempDir := t.TempDir()
+		initTestRepo(t, tempDir)
+
+		// Set the environment variable to simulate an update
+		os.Setenv("BRIDGE_UPDATED_FROM_COMMIT", "abc123")
+		defer os.Unsetenv("BRIDGE_UPDATED_FROM_COMMIT")
+
+		err := CheckStartupHealth(tempDir, "bridge")
+		if err != nil {
+			t.Errorf("CheckStartupHealth() should return nil when no backup exists, got: %v", err)
+		}
+	})
+
+	t.Run("waits for health check when backup exists", func(t *testing.T) {
+		tempDir := t.TempDir()
+		initTestRepo(t, tempDir)
+
+		// Create a mock backup file
+		binaryPath := "bridge"
+		backupPath := filepath.Join(tempDir, binaryPath+backupBinarySuffix)
+		if err := os.WriteFile(backupPath, []byte("backup"), 0755); err != nil {
+			t.Fatalf("failed to create backup: %v", err)
+		}
+
+		// Set the environment variable to simulate an update
+		os.Setenv("BRIDGE_UPDATED_FROM_COMMIT", "abc123")
+		defer os.Unsetenv("BRIDGE_UPDATED_FROM_COMMIT")
+
+		// The function will timeout waiting for health check
+		// This is expected behavior when no health server is running
+		err := CheckStartupHealth(tempDir, binaryPath)
+		// Should error due to timeout/failed health check
+		if err == nil {
+			t.Error("CheckStartupHealth() should error when health check fails")
+		}
+	})
+}
+
+func TestCopyFile(t *testing.T) {
+	t.Run("copies file successfully", func(t *testing.T) {
+		tempDir := t.TempDir()
+
+		// Create source file
+		src := filepath.Join(tempDir, "source.txt")
+		content := []byte("test content")
+		if err := os.WriteFile(src, content, 0644); err != nil {
+			t.Fatalf("failed to create source file: %v", err)
+		}
+
+		// Copy file
+		dst := filepath.Join(tempDir, "dest.txt")
+		cfg := &Config{
+			RepoPath:   tempDir,
+			BinaryPath: "bridge",
+		}
+		u := New(cfg)
+
+		if err := u.copyFile(src, dst); err != nil {
+			t.Errorf("copyFile() failed: %v", err)
+		}
+
+		// Verify content
+		copiedContent, err := os.ReadFile(dst)
+		if err != nil {
+			t.Fatalf("failed to read destination file: %v", err)
+		}
+
+		if string(copiedContent) != string(content) {
+			t.Errorf("copyFile() content mismatch, got %v, want %v", string(copiedContent), string(content))
+		}
+	})
+
+	t.Run("returns error when source doesn't exist", func(t *testing.T) {
+		tempDir := t.TempDir()
+
+		src := filepath.Join(tempDir, "nonexistent.txt")
+		dst := filepath.Join(tempDir, "dest.txt")
+
+		cfg := &Config{
+			RepoPath:   tempDir,
+			BinaryPath: "bridge",
+		}
+		u := New(cfg)
+
+		if err := u.copyFile(src, dst); err == nil {
+			t.Error("copyFile() should error when source doesn't exist")
+		}
+	})
+}
+
+func TestCheckIsHealthy(t *testing.T) {
+	t.Run("returns false on connection error", func(t *testing.T) {
+		ctx := context.Background()
+		client := &http.Client{Timeout: 100 * time.Millisecond}
+
+		// No server running, should return false
+		healthy := checkIsHealthy(ctx, client)
+		if healthy {
+			t.Error("checkIsHealthy() should return false when no server running")
+		}
+	})
+}
+
+func TestBackupBinarySuffix(t *testing.T) {
+	if backupBinarySuffix != ".prev" {
+		t.Errorf("backupBinarySuffix = %v, want .prev", backupBinarySuffix)
+	}
+}
+
+func TestHealthCheckConstants(t *testing.T) {
+	t.Run("health check URL is localhost:9091/health", func(t *testing.T) {
+		if healthCheckURL != "http://localhost:9091/health" {
+			t.Errorf("healthCheckURL = %v, want http://localhost:9091/health", healthCheckURL)
+		}
+	})
+
+	t.Run("health check timeout is 30 seconds", func(t *testing.T) {
+		if healthCheckTimeout != 30*time.Second {
+			t.Errorf("healthCheckTimeout = %v, want 30s", healthCheckTimeout)
+		}
+	})
+
+	t.Run("health check interval is 500ms", func(t *testing.T) {
+		if healthCheckInterval != 500*time.Millisecond {
+			t.Errorf("healthCheckInterval = %v, want 500ms", healthCheckInterval)
+		}
 	})
 }

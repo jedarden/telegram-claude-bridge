@@ -617,7 +617,8 @@ type toolResultDelta struct {
 // NewSessionManager creates a SessionManager backed by db, sender, and proxyURL.
 // proxyURL is the base URL of the proxy, used to download photo attachments.
 // eventPublisher may be nil if event publishing is disabled.
-func NewSessionManager(db *DB, sender *Sender, proxyURL string, eventPublisher events.Publishable) *SessionManager {
+// globalMaxWorkers is the maximum concurrent workers across all topics (0 = no limit).
+func NewSessionManager(db *DB, sender *Sender, proxyURL string, eventPublisher events.Publishable, globalMaxWorkers int) *SessionManager {
 	m := &SessionManager{
 		db:                   db,
 		sender:               sender,
@@ -634,7 +635,7 @@ func NewSessionManager(db *DB, sender *Sender, proxyURL string, eventPublisher e
 		approvalChans:        make(map[topicKey]chan toolApproval),
 		paneNames:            make(map[topicKey]string),
 	}
-	m.workerPool = NewWorkerPool(db, sender, m)
+	m.workerPool = NewWorkerPool(db, sender, m, globalMaxWorkers)
 	return m
 }
 
@@ -1601,7 +1602,10 @@ func (m *SessionManager) invokeClaudeAPI(
 			return nil, fmt.Errorf("spawn pane: %w", spawnErr)
 		}
 		if err := m.ptyMgr.WaitForStartup(paneTarget); err != nil {
-			m.ptyMgr.KillPane(paneTarget) // don't leave a broken pane alive for the warm path
+			// don't leave a broken pane alive for the warm path
+			if killErr := m.ptyMgr.KillPane(paneTarget); killErr != nil {
+				log.Printf("[session_mgr] failed to kill pane after startup failure: %v (pane may already be dead)", killErr)
+			}
 			return nil, fmt.Errorf("wait for startup: %w", err)
 		}
 
@@ -1657,6 +1661,31 @@ func (m *SessionManager) invokeClaudeAPI(
 	// Poll for response with live streaming updates.
 	lastChunk := ""
 	lastEdit := time.Now()
+	lastTelegramOutput := time.Now() // Tracks last user-visible output for progress ticker
+
+	// Progress ticker: sends "Still working…" messages if no output for progress_interval_sec
+	progressInterval := time.Duration(group.ProgressIntervalSec) * time.Second
+	progressTicker := createProgressTicker(progressInterval, func() bool {
+		// Check if we should send a progress update
+		if progressInterval == 0 {
+			return false // Disabled
+		}
+		if time.Since(lastTelegramOutput) < progressInterval {
+			return false // Output sent recently, no need
+		}
+		elapsed := time.Since(startTime)
+		elapsedMin := int(elapsed.Minutes())
+		elapsedSec := int(elapsed.Seconds()) % 60
+		msgText := fmt.Sprintf("⏳ Still working… (%dm %ds elapsed)", elapsedMin, elapsedSec)
+		if streamMsgID != 0 {
+			_ = m.sender.EditMessage(sendCtx, chatID, streamMsgID, msgText)
+		}
+		// Don't reset lastTelegramOutput here - let it continue firing at interval
+		return true
+	})
+	if progressTicker != nil {
+		defer progressTicker.Stop()
+	}
 
 	onChunk := func(text string) {
 		if !enableStreaming || text == "" || text == lastChunk {
@@ -1667,6 +1696,7 @@ func (m *SessionManager) invokeClaudeAPI(
 		}
 		lastChunk = text
 		lastEdit = time.Now()
+		lastTelegramOutput = time.Now() // Reset progress ticker on output
 		if streamMsgID != 0 {
 			_ = m.sender.EditMessage(sendCtx, chatID, streamMsgID, text)
 			if m.eventPublisher != nil && threadID != nil {
@@ -1678,7 +1708,10 @@ func (m *SessionManager) invokeClaudeAPI(
 
 	result, waitErr := m.ptyMgr.WaitForResponse(subprocCtx, paneTarget, preInjectScreen, onChunk)
 	if waitErr != nil {
-		m.ptyMgr.KillPane(paneTarget)
+		// Clean up the pane on error
+		if killErr := m.ptyMgr.KillPane(paneTarget); killErr != nil {
+			log.Printf("[session_mgr] failed to kill pane after wait error: %v (pane may already be dead)", killErr)
+		}
 		m.mu.Lock()
 		delete(m.paneNames, key)
 		m.mu.Unlock()

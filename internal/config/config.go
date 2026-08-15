@@ -96,6 +96,10 @@ type BridgeConfig struct {
 
 	// EventSocketPath is the path to the Unix socket for event publishing.
 	EventSocketPath string
+
+	// GlobalMaxWorkers is the maximum number of concurrent workers across all topics.
+	// Set to 0 for no limit. Default: 50.
+	GlobalMaxWorkers int
 }
 
 // fetchOpenBaoSecret retrieves a secret from OpenBao's KV v2 store.
@@ -318,6 +322,18 @@ func LoadBridgeConfig() (*BridgeConfig, error) {
 	}
 
 	cfg.EventSocketPath = envOrDefault("EVENT_SOCKET_PATH", "/tmp/telegram-bridge-events.sock")
+
+	// Global max workers configuration
+	defaultGlobalMaxWorkers := 50
+	if v := os.Getenv("GLOBAL_MAX_WORKERS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("GLOBAL_MAX_WORKERS must be a non-negative integer, got %q", v)
+		}
+		cfg.GlobalMaxWorkers = n
+	} else {
+		cfg.GlobalMaxWorkers = defaultGlobalMaxWorkers
+	}
 
 	return cfg, nil
 }

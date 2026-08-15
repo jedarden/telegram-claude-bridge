@@ -130,8 +130,11 @@ func (sc *SessionCleanup) sweepStaleWorkers(ctx context.Context) {
 		// Kill the pane if we found one
 		if matchedPane != "" {
 			paneTarget := fmt.Sprintf("%s:%s", tmuxSessionName, matchedPane)
-			sc.ptyMgr.KillPane(paneTarget)
-			log.Printf("[cleanup] killed pane for stale worker %s: %s", worker.ID, paneTarget)
+			if err := sc.ptyMgr.KillPane(paneTarget); err != nil {
+				log.Printf("[cleanup] failed to kill pane for stale worker %s: %v (pane may already be dead)", worker.ID, err)
+			} else {
+				log.Printf("[cleanup] killed pane for stale worker %s: %s", worker.ID, paneTarget)
+			}
 			delete(paneSet, matchedPane)
 		} else {
 			log.Printf("[cleanup] no pane found for stale worker %s (may have been killed earlier)", worker.ID)
@@ -172,9 +175,14 @@ func (sc *SessionCleanup) MarkInactive(ctx context.Context, sess *Session) error
 	// Kill the corresponding tmux pane
 	paneName := fmt.Sprintf("t%d-%d", absChatID, sess.ThreadID)
 	paneTarget := fmt.Sprintf("%s:%s", tmuxSessionName, paneName)
-	sc.ptyMgr.KillPane(paneTarget)
-	log.Printf("[cleanup] killed pane for inactive session (%d,%d): %s",
-		sess.ChatID, sess.ThreadID, paneTarget)
+	if err := sc.ptyMgr.KillPane(paneTarget); err != nil {
+		// Log but don't fail the transaction - the pane may already be dead
+		log.Printf("[cleanup] non-fatal: failed to kill pane for session (%d,%d): %v (pane may already be dead)",
+			sess.ChatID, sess.ThreadID, err)
+	} else {
+		log.Printf("[cleanup] killed pane for inactive session (%d,%d): %s",
+			sess.ChatID, sess.ThreadID, paneTarget)
+	}
 
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
@@ -252,9 +260,14 @@ func (sc *SessionCleanup) runCleanup(ctx context.Context) {
 		}
 		paneName := fmt.Sprintf("t%d-%d", absChatID, sess.ThreadID)
 		paneTarget := fmt.Sprintf("%s:%s", tmuxSessionName, paneName)
-		sc.ptyMgr.KillPane(paneTarget)
-		log.Printf("[cleanup] killed pane for inactive session (%d,%d): %s",
-			sess.ChatID, sess.ThreadID, paneTarget)
+		if err := sc.ptyMgr.KillPane(paneTarget); err != nil {
+			// Log but don't fail the transaction - the pane may already be dead
+			log.Printf("[cleanup] non-fatal: failed to kill pane for session (%d,%d): %v (pane may already be dead)",
+				sess.ChatID, sess.ThreadID, err)
+		} else {
+			log.Printf("[cleanup] killed pane for inactive session (%d,%d): %s",
+				sess.ChatID, sess.ThreadID, paneTarget)
+		}
 
 		// Update topic color to green (complete)
 		if err := sc.sender.EditTopicIconColor(ctx, sess.ChatID, sess.ThreadID, ColorComplete); err != nil {

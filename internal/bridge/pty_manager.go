@@ -153,8 +153,12 @@ func (p *PTYManager) PaneAlive(paneTarget string) bool {
 }
 
 // KillPane kills the tmux window for a pane.
-func (p *PTYManager) KillPane(paneTarget string) {
-	exec.Command("tmux", "kill-window", "-t", paneTarget).Run()
+func (p *PTYManager) KillPane(paneTarget string) error {
+	out, err := exec.Command("tmux", "kill-window", "-t", paneTarget).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("kill pane %s: %w: %s", paneTarget, err, out)
+	}
+	return nil
 }
 
 // WaitForStartup polls the pane until claude is ready for input.
@@ -543,8 +547,11 @@ func (p *PTYManager) ScheduleIdleKill(paneTarget string, ttl time.Duration, onKi
 		delete(p.idleTimers, paneTarget)
 		p.mu.Unlock()
 
-		p.KillPane(paneTarget)
-		log.Printf("[pty_mgr] idle-culled pane %s", paneTarget)
+		if err := p.KillPane(paneTarget); err != nil {
+			log.Printf("[pty_mgr] failed to kill idle-culled pane %s: %v (pane may already be dead)", paneTarget, err)
+		} else {
+			log.Printf("[pty_mgr] idle-culled pane %s", paneTarget)
+		}
 		if onKill != nil {
 			onKill()
 		}

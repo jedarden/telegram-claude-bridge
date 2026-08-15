@@ -14,21 +14,23 @@ import (
 // via the spawn_worker synthetic tool. Results are posted to Telegram and
 // injected back into the orchestrator's context on the next invocation.
 type WorkerPool struct {
-	db         *DB
-	sender     *Sender
-	sessionMgr *SessionManager // For PTYManager access and injecting worker results
+	db              *DB
+	sender          *Sender
+	sessionMgr      *SessionManager // For PTYManager access and injecting worker results
+	globalMaxWorkers int             // Maximum concurrent workers across all topics (0 = no limit)
 
 	mu        sync.Mutex
 	nextIndex map[topicKey]int // monotonically increasing worker index per topic
 }
 
 // NewWorkerPool creates a new WorkerPool.
-func NewWorkerPool(db *DB, sender *Sender, sessionMgr *SessionManager) *WorkerPool {
+func NewWorkerPool(db *DB, sender *Sender, sessionMgr *SessionManager, globalMaxWorkers int) *WorkerPool {
 	return &WorkerPool{
-		db:         db,
-		sender:     sender,
-		sessionMgr: sessionMgr,
-		nextIndex:  make(map[topicKey]int),
+		db:              db,
+		sender:          sender,
+		sessionMgr:      sessionMgr,
+		globalMaxWorkers: globalMaxWorkers,
+		nextIndex:       make(map[topicKey]int),
 	}
 }
 
@@ -69,6 +71,17 @@ func (wp *WorkerPool) SpawnWorker(
 	}
 	if running >= maxWorkers {
 		return "", 0, fmt.Errorf("max workers (%d) already running for this topic", maxWorkers)
+	}
+
+	// Check global ceiling
+	if wp.globalMaxWorkers > 0 {
+		globalRunning, err := wp.db.CountRunningWorkersGlobal(ctx)
+		if err != nil {
+			return "", 0, fmt.Errorf("count global running workers: %w", err)
+		}
+		if globalRunning >= wp.globalMaxWorkers {
+			return "", 0, fmt.Errorf("global worker ceiling (%d) reached - %d workers running across all topics. Wait for existing workers to complete or increase GLOBAL_MAX_WORKERS", wp.globalMaxWorkers, globalRunning)
+		}
 	}
 
 	// Get next worker index for this topic

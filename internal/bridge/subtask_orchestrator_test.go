@@ -2200,3 +2200,647 @@ func TestSplitParallelPrompts_ManyDelimitersInLongInput(t *testing.T) {
 		})
 	}
 }
+
+// TestSplitParallelPrompts_LengthLimitBoundaries tests exact length limit boundary
+// conditions including empty prompts, single characters, very short Unicode/emoji
+// prompts, and prompts at exact byte boundaries. These tests verify that the
+// function handles edge cases at the extremes of input length without truncation
+// or corruption.
+func TestSplitParallelPrompts_LengthLimitBoundaries(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+		verify      func([]string) bool
+	}{
+		// ── Empty and zero-length inputs ─────────────────────────────────────────
+		{
+			name:        "empty string length 0",
+			input:       "",
+			wantLen:     1,
+			wantPrompts: []string{""},
+		},
+		{
+			name:        "single newline",
+			input:       "\n",
+			wantLen:     1,
+			wantPrompts: []string{""},
+		},
+		{
+			name:        "multiple newlines only",
+			input:       "\n\n\n",
+			wantLen:     1,
+			wantPrompts: []string{""},
+		},
+		// ── Single character prompts ───────────────────────────────────────────────
+		{
+			name:        "single ASCII character",
+			input:       "a",
+			wantLen:     1,
+			wantPrompts: []string{"a"},
+		},
+		{
+			name:        "single digit",
+			input:       "5",
+			wantLen:     1,
+			wantPrompts: []string{"5"},
+		},
+		{
+			name:        "single punctuation",
+			input:       "?",
+			wantLen:     1,
+			wantPrompts: []string{"?"},
+		},
+		{
+			name:        "single space",
+			input:       " ",
+			wantLen:     1,
+			wantPrompts: []string{""},
+		},
+		{
+			name:        "single tab",
+			input:       "\t",
+			wantLen:     1,
+			wantPrompts: []string{""},
+		},
+		{
+			name:        "two single-char prompts with delimiter",
+			input:       "a\n---\nb",
+			wantLen:     2,
+			wantPrompts: []string{"a", "b"},
+		},
+		{
+			name:        "five single-char prompts",
+			input:       "a\n---\nb\n---\nc\n---\nd\n---\ne",
+			wantLen:     5,
+			wantPrompts: []string{"a", "b", "c", "d", "e"},
+		},
+		// ── Very short prompts (2-5 bytes) ─────────────────────────────────────────
+		{
+			name:        "two ASCII characters",
+			input:       "ab",
+			wantLen:     1,
+			wantPrompts: []string{"ab"},
+		},
+		{
+			name:        "three ASCII characters",
+			input:       "abc",
+			wantLen:     1,
+			wantPrompts: []string{"abc"},
+		},
+		{
+			name:        "five ASCII characters",
+			input:       "abcde",
+			wantLen:     1,
+			wantPrompts: []string{"abcde"},
+		},
+		{
+			name:        "short word",
+			input:       "test",
+			wantLen:     1,
+			wantPrompts: []string{"test"},
+		},
+		// ── Very short Unicode prompts ─────────────────────────────────────────────
+		{
+			name:        "single CJK character (3 bytes)",
+			input:       "日",
+			wantLen:     1,
+			wantPrompts: []string{"日"},
+			verify: func(p []string) bool {
+				return utf8.RuneCountInString(p[0]) == 1 && len(p[0]) == 3
+			},
+		},
+		{
+			name:        "single emoji (4 bytes)",
+			input:       "🚀",
+			wantLen:     1,
+			wantPrompts: []string{"🚀"},
+			verify: func(p []string) bool {
+				return utf8.RuneCountInString(p[0]) == 1 && len(p[0]) == 4
+			},
+		},
+		{
+			name:        "single accented Latin (2 bytes)",
+			input:       "é",
+			wantLen:     1,
+			wantPrompts: []string{"é"},
+			verify: func(p []string) bool {
+				return utf8.RuneCountInString(p[0]) == 1 && len(p[0]) == 2
+			},
+		},
+		{
+			name:        "two CJK characters",
+			input:       "日本",
+			wantLen:     1,
+			wantPrompts: []string{"日本"},
+			verify: func(p []string) bool {
+				return utf8.RuneCountInString(p[0]) == 2 && len(p[0]) == 6
+			},
+		},
+		{
+			name:        "two emoji",
+			input:       "🚀🔥",
+			wantLen:     1,
+			wantPrompts: []string{"🚀🔥"},
+			verify: func(p []string) bool {
+				return utf8.RuneCountInString(p[0]) == 2 && len(p[0]) == 8
+			},
+		},
+		{
+			name:        "three CJK characters",
+			input:       "日本語",
+			wantLen:     1,
+			wantPrompts: []string{"日本語"},
+			verify: func(p []string) bool {
+				return utf8.RuneCountInString(p[0]) == 3 && len(p[0]) == 9
+			},
+		},
+		// ── Very short prompts with delimiter ────────────────────────────────────
+		{
+			name:        "single CJK per prompt",
+			input:       "日\n---\n本\n---\n語",
+			wantLen:     3,
+			wantPrompts: []string{"日", "本", "語"},
+			verify: func(p []string) bool {
+				for _, s := range p {
+					if utf8.RuneCountInString(s) != 1 || len(s) != 3 {
+						return false
+					}
+				}
+				return true
+			},
+		},
+		{
+			name:        "single emoji per prompt",
+			input:       "🚀\n---\n🔥\n---\n🎯",
+			wantLen:     3,
+			wantPrompts: []string{"🚀", "🔥", "🎯"},
+			verify: func(p []string) bool {
+				for _, s := range p {
+					if utf8.RuneCountInString(s) != 1 || len(s) != 4 {
+						return false
+					}
+				}
+				return true
+			},
+		},
+		{
+			name:        "mixed single-char Unicode prompts",
+			input:       "日\n---\n🚀\n---\né",
+			wantLen:     3,
+			wantPrompts: []string{"日", "🚀", "é"},
+		},
+		{
+			name:        "two-byte char per prompt",
+			input:       "é\n---\nñ\n---\nü",
+			wantLen:     3,
+			wantPrompts: []string{"é", "ñ", "ü"},
+		},
+		// ── Prompts at exact byte boundaries ────────────────────────────────────────
+		{
+			name:        "exactly 1 byte prompt",
+			input:       "a",
+			wantLen:     1,
+			wantPrompts: []string{"a"},
+		},
+		{
+			name:        "exactly 2 bytes (two ASCII)",
+			input:       "ab",
+			wantLen:     1,
+			wantPrompts: []string{"ab"},
+		},
+		{
+			name:        "exactly 3 bytes (one CJK)",
+			input:       "日",
+			wantLen:     1,
+			wantPrompts: []string{"日"},
+		},
+		{
+			name:        "exactly 4 bytes (one emoji)",
+			input:       "🚀",
+			wantLen:     1,
+			wantPrompts: []string{"🚀"},
+		},
+		{
+			name:        "exactly 5 bytes (mixed)",
+			input:       "a日",
+			wantLen:     1,
+			wantPrompts: []string{"a日"},
+			verify: func(p []string) bool {
+				return len(p[0]) == 4 // 'a'=1 + '日'=3
+			},
+		},
+		{
+			name:        "exactly 6 bytes (two CJK)",
+			input:       "日本",
+			wantLen:     1,
+			wantPrompts: []string{"日本"},
+		},
+		{
+			name:        "exactly 7 bytes (ASCII + emoji)",
+			input:       "ab🚀",
+			wantLen:     1,
+			wantPrompts: []string{"ab🚀"},
+			verify: func(p []string) bool {
+				return len(p[0]) == 6 // 'a'=1 + 'b'=1 + '🚀'=4
+			},
+		},
+		{
+			name:        "exactly 8 bytes (two emoji)",
+			input:       "🚀🔥",
+			wantLen:     1,
+			wantPrompts: []string{"🚀🔥"},
+		},
+		{
+			name:        "exactly 10 bytes (mixed)",
+			input:       "abc日🚀",
+			wantLen:     1,
+			wantPrompts: []string{"abc日🚀"},
+			verify: func(p []string) bool {
+				return len(p[0]) == 10 // 'a'=1+'b'=1+'c'=1+'日'=3+'🚀'=4
+			},
+		},
+		// ── Short prompts at delimiter boundaries ───────────────────────────────────
+		{
+			name:        "1-byte prompts with delimiter",
+			input:       "a\n---\nb\n---\nc",
+			wantLen:     3,
+			wantPrompts: []string{"a", "b", "c"},
+		},
+		{
+			name:        "3-byte CJK prompts with delimiter",
+			input:       "日\n---\n本\n---\n語",
+			wantLen:     3,
+			wantPrompts: []string{"日", "本", "語"},
+		},
+		{
+			name:        "4-byte emoji prompts with delimiter",
+			input:       "🚀\n---\n🔥\n---\n🎯",
+			wantLen:     3,
+			wantPrompts: []string{"🚀", "🔥", "🎯"},
+		},
+		{
+			name:        "mixed-byte prompts with delimiter",
+			input:       "a\n---\n日\n---\n🚀\n---\né",
+			wantLen:     4,
+			wantPrompts: []string{"a", "日", "🚀", "é"},
+		},
+		// ── Very short prompts with Unicode zero-width joiner ────────────────────────
+		{
+			name:        "single ZWJ sequence (family emoji)",
+			input:       "👨‍👩‍👧‍👦",
+			wantLen:     1,
+			wantPrompts: []string{"👨‍👩‍👧‍👦"},
+			verify: func(p []string) bool {
+				// Family emoji is 7 code points: 👨(1) + ‍(1) + 👩(1) + ‍(1) + 👧(1) + ‍(1) + 👦(1)
+				// Each emoji is 4 bytes, each ZWJ is 3 bytes = 4+3+4+3+4+3+4 = 25 bytes
+				return utf8.RuneCountInString(p[0]) == 7 && len(p[0]) == 25
+			},
+		},
+		{
+			name:        "single ZWJ sequence at delimiter boundary",
+			input:       "👨‍👩‍👧‍👦\n---\nnext",
+			wantLen:     2,
+			wantPrompts: []string{"👨‍👩‍👧‍👦", "next"},
+		},
+		// ── Short prompts with skin tone modifiers ────────────────────────────────────
+		{
+			name:        "emoji with skin tone modifier",
+			input:       "👍🏽",
+			wantLen:     1,
+			wantPrompts: []string{"👍🏽"},
+			verify: func(p []string) bool {
+				// 👍🏽 is a multi-byte sequence (base emoji + skin tone modifier)
+				return utf8.RuneCountInString(p[0]) == 2 && len(p[0]) > 4
+			},
+		},
+		{
+			name:        "skin tone emoji at delimiter boundary",
+			input:       "👍🏽\n---\n👍🏿",
+			wantLen:     2,
+			wantPrompts: []string{"👍🏽", "👍🏿"},
+		},
+		// ── Regional indicator flags (2 regional indicators = 1 flag) ─────────────────
+		{
+			name:        "single flag emoji (8 bytes)",
+			input:       "🇯🇵",
+			wantLen:     1,
+			wantPrompts: []string{"🇯🇵"},
+			verify: func(p []string) bool {
+				// Two regional indicators = 8 bytes (4 bytes each)
+				return utf8.RuneCountInString(p[0]) == 2 && len(p[0]) == 8
+			},
+		},
+		{
+			name:        "flag emoji at delimiter boundary",
+			input:       "🇯🇵\n---\n🇨🇳\n---\n🇫🇷",
+			wantLen:     3,
+			wantPrompts: []string{"🇯🇵", "🇨🇳", "🇫🇷"},
+		},
+		// ── Keycap emoji sequences ────────────────────────────────────────────────────
+		{
+			name:        "single keycap (7 bytes)",
+			input:       "1️⃣",
+			wantLen:     1,
+			wantPrompts: []string{"1️⃣"},
+			verify: func(p []string) bool {
+				// '1' (1) + variation selector (4) + combining keycap (3) = 8 bytes
+				return len(p[0]) >= 7
+			},
+		},
+		{
+			name:        "keycap at delimiter boundary",
+			input:       "1️⃣\n---\n2️⃣\n---\n3️⃣",
+			wantLen:     3,
+			wantPrompts: []string{"1️⃣", "2️⃣", "3️⃣"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			if len(prompts) != tt.wantLen {
+				t.Errorf("got %d prompts, want %d", len(prompts), tt.wantLen)
+			}
+			if tt.wantPrompts != nil && len(prompts) > 0 {
+				for i, want := range tt.wantPrompts {
+					if i >= len(prompts) {
+						t.Errorf("expected prompt[%d] but got only %d prompts", i, len(prompts))
+						break
+					}
+					if prompts[i] != want {
+						t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
+					}
+				}
+			}
+			if tt.verify != nil && !tt.verify(prompts) {
+				t.Errorf("verification failed for prompts: %v", prompts)
+			}
+			// Verify UTF-8 validity for all prompts
+			for i, p := range prompts {
+				if !utf8.ValidString(p) {
+					t.Errorf("prompt[%d] = %q is not valid UTF-8", i, p)
+				}
+				if strings.ContainsRune(p, utf8.RuneError) && !strings.Contains(tt.input, string(utf8.RuneError)) {
+					t.Errorf("prompt[%d] = %q contains the replacement character U+FFFD", i, p)
+				}
+			}
+		})
+	}
+}
+
+// TestSplitParallelPrompts_MixedUnicodeASCII tests combinations of ASCII and
+// Unicode content within prompts and across delimiter boundaries. Verifies that
+// mixed scripts, emoji embedded in ASCII text, and alternating patterns are
+// handled correctly through splitting.
+func TestSplitParallelPrompts_MixedUnicodeASCII(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+		verify      func([]string) bool
+	}{
+		// ── ASCII with embedded Unicode characters ─────────────────────────────
+		{
+			name:        "ASCII text with embedded accented characters",
+			input:       "Check the café and résumé\n---\nNext task about naïve",
+			wantLen:     2,
+			wantPrompts: []string{"Check the café and résumé", "Next task about naïve"},
+		},
+		{
+			name:        "ASCII with currency symbols",
+			input:       "Price: $100 or €90\n---\nTotal: £50 + ¥1000",
+			wantLen:     2,
+			wantPrompts: []string{"Price: $100 or €90", "Total: £50 + ¥1000"},
+		},
+		{
+			name:        "ASCII with mathematical symbols",
+			input:       "Use ∑ for sum, √ for root\n---\nCalculate ∞ + ∆",
+			wantLen:     2,
+			wantPrompts: []string{"Use ∑ for sum, √ for root", "Calculate ∞ + ∆"},
+		},
+		{
+			name:        "ASCII with punctuation symbols",
+			input:       "Question: What is this?\n---\nAnswer: §©®™ elements",
+			wantLen:     2,
+			wantPrompts: []string{"Question: What is this?", "Answer: §©®™ elements"},
+		},
+		// ── ASCII with embedded emoji ────────────────────────────────────────────
+		{
+			name:        "ASCII sentence with emoji at end",
+			input:       "This is great! 🎉\n---\nThat works well 👍",
+			wantLen:     2,
+			wantPrompts: []string{"This is great! 🎉", "That works well 👍"},
+		},
+		{
+			name:        "ASCII with emoji in the middle",
+			input:       "The 🚀 ship has sailed\n---\nA 🐛 bug was found",
+			wantLen:     2,
+			wantPrompts: []string{"The 🚀 ship has sailed", "A 🐛 bug was found"},
+		},
+		{
+			name:        "ASCII with multiple emoji",
+			input:       "Test ✅ the code 🧪 now 🏃‍♂️\n---\nShip 📦 the build 🛠️ fast",
+			wantLen:     2,
+			wantPrompts: []string{"Test ✅ the code 🧪 now 🏃‍♂️", "Ship 📦 the build 🛠️ fast"},
+		},
+		{
+			name:        "ASCII technical terms with emoji",
+			input:       "Run npm install 📦 then npm test 🧪\n---\nDeploy 🚀 to production 🌍",
+			wantLen:     2,
+			wantPrompts: []string{"Run npm install 📦 then npm test 🧪", "Deploy 🚀 to production 🌍"},
+		},
+		{
+			name:        "ASCII with emoji-only word replacements",
+			input:       "I ❤️ programming\n---\nShe 👩‍💻 codes",
+			wantLen:     2,
+			wantPrompts: []string{"I ❤️ programming", "She 👩‍💻 codes"},
+		},
+		// ── Multiple scripts in single prompt ────────────────────────────────────
+		{
+			name:        "ASCII, Japanese, and emoji in one prompt",
+			input:       "Check 日本語 🗾 the data\n---\nNext task",
+			wantLen:     2,
+			wantPrompts: []string{"Check 日本語 🗾 the data", "Next task"},
+		},
+		{
+			name:        "ASCII, Chinese, and Cyrillic mixed",
+			input:       "Test 测试 the code\n---\nNext функцию task",
+			wantLen:     2,
+			wantPrompts: []string{"Test 测试 the code", "Next функцию task"},
+		},
+		{
+			name:        "ASCII, Arabic, and Greek in one line",
+			input:       "Hello مرحبا world\n---\nNext Γεια σου task",
+			wantLen:     2,
+			wantPrompts: []string{"Hello مرحبا world", "Next Γεια σου task"},
+		},
+		{
+			name:        "Four scripts alternating in one prompt",
+			input:       "A 日本 test 测试\n---\nNext مرحبا Γεια",
+			wantLen:     2,
+			wantPrompts: []string{"A 日本 test 测试", "Next مرحبا Γεια"},
+		},
+		{
+			name:        "ASCII with emoji and multiple scripts",
+			input:       "Start 🚀 with 日本 🗾\n---\nAdd 测试 and 🇨🇳",
+			wantLen:     2,
+			wantPrompts: []string{"Start 🚀 with 日本 🗾", "Add 测试 and 🇨🇳"},
+		},
+		{
+			name:        "technical ASCII with CJK and emoji",
+			input:       "Run `git commit` and check 日本 🗾\n---\nDeploy to 测试 🇨🇳 server",
+			wantLen:     2,
+			wantPrompts: []string{"Run `git commit` and check 日本 🗾", "Deploy to 测试 🇨🇳 server"},
+		},
+		// ── Mixed content across delimiter boundaries ────────────────────────────
+		{
+			name:        "Unicode ends first prompt, ASCII starts second",
+			input:       "テスト ends\n---\nASCII starts",
+			wantLen:     2,
+			wantPrompts: []string{"テスト ends", "ASCII starts"},
+		},
+		{
+			name:        "ASCII ends first prompt, Unicode starts second",
+			input:       "ASCII ends\n---\n日本語 starts",
+			wantLen:     2,
+			wantPrompts: []string{"ASCII ends", "日本語 starts"},
+		},
+		{
+			name:        "Emoji at delimiter boundary",
+			input:       "End 🚀\n---\n🔥 Start",
+			wantLen:     2,
+			wantPrompts: []string{"End 🚀", "🔥 Start"},
+		},
+		{
+			name:        "Mixed scripts at delimiter boundaries",
+			input:       "A 日本 B\n---\nC 测试 D",
+			wantLen:     2,
+			wantPrompts: []string{"A 日本 B", "C 测试 D"},
+		},
+		{
+			name:        "ASCII-emoji-ASCII pattern across delimiter",
+			input:       "Test 🚀 code\n---\nShip 📦 now",
+			wantLen:     2,
+			wantPrompts: []string{"Test 🚀 code", "Ship 📦 now"},
+		},
+		{
+			name:        "ZWJ sequence at delimiter boundary",
+			input:       "Family 👨‍👩‍👧‍👦\n---\nNext 👩‍💻 task",
+			wantLen:     2,
+			wantPrompts: []string{"Family 👨‍👩‍👧‍👦", "Next 👩‍💻 task"},
+		},
+		{
+			name:        "Multiple alternating patterns across boundaries",
+			input:       "ASCII 日本 🚀 test\n---\nNext 测试 🔥 code",
+			wantLen:     2,
+			wantPrompts: []string{"ASCII 日本 🚀 test", "Next 测试 🔥 code"},
+		},
+		{
+			name:        "Unicode-ASCII-Unicode sandwich pattern",
+			input:       "日本 ASCII テスト\n---\nNext word 文字",
+			wantLen:     2,
+			wantPrompts: []string{"日本 ASCII テスト", "Next word 文字"},
+		},
+		// ── Complex real-world mixed scenarios ───────────────────────────────────
+		{
+			name:        "international greeting message",
+			input:       "Hello! 🌍 Bonjour! 🇫🇷\n---\nKonnichiwa! 🇯🇵 Nihao! 🇨🇳",
+			wantLen:     2,
+			wantPrompts: []string{"Hello! 🌍 Bonjour! 🇫🇷", "Konnichiwa! 🇯🇵 Nihao! 🇨🇳"},
+		},
+		{
+			name:        "technical documentation with code examples",
+			input:       "Use `npm install` for dependencies 📦\n---\nCheck the 日本 README for setup 🇯🇵",
+			wantLen:     2,
+			wantPrompts: []string{"Use `npm install` for dependencies 📦", "Check the 日本 README for setup 🇯🇵"},
+		},
+		{
+			name:        "multiline prompt with mixed content",
+			input:       "Line 1: ASCII\nLine 2: 日本語 🇯🇵\n---\nNext task starts here",
+			wantLen:     2,
+			wantPrompts: []string{"Line 1: ASCII\nLine 2: 日本語 🇯🇵", "Next task starts here"},
+		},
+		{
+			name:        "code comments in multiple languages",
+			input:       "// This is a test comment 日本語\n---\n// Next line 测试 emoji 🚀",
+			wantLen:     2,
+			wantPrompts: []string{"// This is a test comment 日本語", "// Next line 测试 emoji 🚀"},
+		},
+		{
+			name:        "international deployment pipeline",
+			input:       "Deploy to us-east-1 🇺🇸 region\n---\nCheck 日本 🇯🇵 and 测试 🇨🇳 deployments",
+			wantLen:     2,
+			wantPrompts: []string{"Deploy to us-east-1 🇺🇸 region", "Check 日本 🇯🇵 and 测试 🇨🇳 deployments"},
+		},
+		// ── Edge cases with mixed content ────────────────────────────────────────
+		{
+			name:        "single ASCII character with emoji delimiter boundary",
+			input:       "A 🚀\n---\n🔥 B",
+			wantLen:     2,
+			wantPrompts: []string{"A 🚀", "🔥 B"},
+		},
+		{
+			name:        "mixed content with whitespace trimming",
+			input:       "  ASCII 日本 🚀  \n---\n  测试 emoji 🔥  ",
+			wantLen:     2,
+			wantPrompts: []string{"ASCII 日本 🚀", "测试 emoji 🔥"},
+		},
+		{
+			name:        "mixed RTL and LTR scripts",
+			input:       "Hello مرحبا World\n---\nNext שלום test",
+			wantLen:     2,
+			wantPrompts: []string{"Hello مرحبا World", "Next שלום test"},
+			verify: func(prompts []string) bool {
+				// Verify RTL content is preserved
+				return strings.Contains(prompts[0], "مرحبا") && strings.Contains(prompts[1], "שלום")
+			},
+		},
+		{
+			name:        "emoji skin tone with ASCII",
+			input:        "Team 👨🏽‍💻 reviews code\n---\nManager 👩🏿‍💻 approves",
+			wantLen:     2,
+			wantPrompts: []string{"Team 👨🏽‍💻 reviews code", "Manager 👩🏿‍💻 approves"},
+		},
+		{
+			name:        "flag emoji with country names",
+			input:       "Visit Japan 🇯🇵 and China 🇨🇳\n---\nThen France 🇫🇷 and Germany 🇩🇪",
+			wantLen:     2,
+			wantPrompts: []string{"Visit Japan 🇯🇵 and China 🇨🇳", "Then France 🇫🇷 and Germany 🇩🇪"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			if len(prompts) != tt.wantLen {
+				t.Errorf("got %d prompts, want %d", len(prompts), tt.wantLen)
+			}
+			if tt.wantPrompts != nil && len(prompts) > 0 {
+				for i, want := range tt.wantPrompts {
+					if i >= len(prompts) {
+						t.Errorf("expected prompt[%d] but got only %d prompts", i, len(prompts))
+						break
+					}
+					if prompts[i] != want {
+						t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
+					}
+				}
+			}
+			if tt.verify != nil && !tt.verify(prompts) {
+				t.Errorf("verification failed for prompts: %v", prompts)
+			}
+			// Verify UTF-8 validity for all mixed content
+			for i, p := range prompts {
+				if !utf8.ValidString(p) {
+					t.Errorf("prompt[%d] = %q is not valid UTF-8", i, p)
+				}
+				if strings.ContainsRune(p, utf8.RuneError) {
+					t.Errorf("prompt[%d] = %q contains the replacement character U+FFFD", i, p)
+				}
+			}
+		})
+	}
+}

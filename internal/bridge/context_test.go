@@ -20,7 +20,7 @@ func newTestSessionManagerForContext(t *testing.T, db *DB, sender *Sender) *Sess
 		w.Write([]byte(`{"ok":true}`))
 	}))
 
-	sm := NewSessionManager(db, sender, srv.URL, nil)
+	sm := NewSessionManager(db, sender, srv.URL, nil, 5)
 	t.Cleanup(srv.Close)
 	return sm
 }

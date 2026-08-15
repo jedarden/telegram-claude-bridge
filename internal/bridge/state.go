@@ -616,8 +616,8 @@ func (d *DB) CreateSession(ctx context.Context, s *Session) error {
 	}
 	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO sessions
-		   (chat_id, thread_id, session_id, cwd, model, status, icon_color, created_at, last_active, message_count, pinned_message_id, total_cost_usd, summary, notification_mode, timeout_sec, topic_name, last_from_user_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		   (chat_id, thread_id, session_id, cwd, model, status, icon_color, created_at, last_active, message_count, pinned_message_id, total_cost_usd, summary, notification_mode, timeout_sec, dispatcher_mode, topic_name, last_from_user_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.ChatID, s.ThreadID, s.SessionID, s.CWD, nullableString(s.Model), s.Status,
 		s.IconColor,
 		s.CreatedAt.UTC().Format(time.RFC3339),
@@ -629,6 +629,7 @@ func (d *DB) CreateSession(ctx context.Context, s *Session) error {
 		s.NotificationMode,
 		s.TimeoutSec,
 		nullableString(s.TopicName),
+			s.DispatcherMode,
 
 			s.LastFromUserID,
 	)
@@ -1658,6 +1659,15 @@ func (d *DB) CountRunningWorkers(ctx context.Context, chatID, threadID int64) (i
 	err := d.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM workers WHERE chat_id = ? AND thread_id = ? AND status = 'running'`,
 		chatID, threadID,
+	).Scan(&count)
+	return count, err
+}
+
+// CountRunningWorkersGlobal returns the count of all running workers across all topics.
+func (d *DB) CountRunningWorkersGlobal(ctx context.Context) (int, error) {
+	var count int
+	err := d.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM workers WHERE status = 'running'`,
 	).Scan(&count)
 	return count, err
 }

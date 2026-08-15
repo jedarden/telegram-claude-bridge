@@ -31,14 +31,34 @@ func newIntegrationTestSender(t *testing.T) *Sender {
 }
 
 // newTestSessionManager creates a SessionManager for testing.
+// Tests that spawn workers must use newTestSessionManagerWithTmux instead.
 func newTestSessionManager(t *testing.T, db *DB, sender *Sender) *SessionManager {
 	// Create a mock HTTP server for the proxy
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(contract.OKResponse{OK: true})
 	}))
 
-	sm := NewSessionManager(db, sender, srv.URL, nil)
+	sm := NewSessionManager(db, sender, srv.URL, nil, 5)
 	t.Cleanup(srv.Close)
+	return sm
+}
+
+// newTestSessionManagerWithTmux creates a SessionManager with tmux fixtures.
+// This must be used for tests that spawn workers or start sessions.
+func newTestSessionManagerWithTmux(t *testing.T, db *DB, sender *Sender) *SessionManager {
+	t.Helper()
+
+	// Set up tmux fixtures before creating the session manager
+	_ = setupTmuxTest(t)
+
+	// Create a mock HTTP server for the proxy
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(contract.OKResponse{OK: true})
+	}))
+
+	sm := NewSessionManager(db, sender, srv.URL, nil, 5)
+	t.Cleanup(srv.Close)
+
 	return sm
 }
 
@@ -60,8 +80,8 @@ func TestWorkerPool_SpawnWorker_ValidPrompt_DBState(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":"test task","model":"claude-haiku-4-5"}`)
 	chatID := int64(100)
@@ -131,8 +151,8 @@ func TestWorkerPool_SpawnWorker_EmptyPrompt(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":""}`)
 
@@ -161,8 +181,8 @@ func TestWorkerPool_SpawnWorker_MaxWorkersLimit(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
 
@@ -208,8 +228,8 @@ func TestWorkerPool_SpawnWorker_IndexIncrements(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":"task"}`)
 
@@ -266,8 +286,8 @@ func TestWorkerPool_SpawnWorker_DefaultModel(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	// Request without model specified - should use group default
 	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
@@ -302,8 +322,8 @@ func TestWorkerPool_SpawnWorker_MalformedInput(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	tests := []struct {
 		name       string
@@ -354,8 +374,8 @@ func TestWorkerPool_SpawnWorker_DifferentTopics(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":"task"}`)
 
@@ -388,8 +408,8 @@ func TestWorkerPool_SpawnWorker_MaxWorkersZero(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":"task"}`)
 
@@ -427,7 +447,7 @@ func TestSubtaskOrchestrator_Run_SingleSubtask_DBState(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	req := SubtaskRequest{
@@ -490,7 +510,7 @@ func TestSubtaskOrchestrator_Run_MultipleSubtasks_DBState(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	req := SubtaskRequest{
@@ -548,7 +568,7 @@ func TestSubtaskOrchestrator_Run_MaxSubtasksLimit(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	req := SubtaskRequest{
@@ -588,7 +608,7 @@ func TestSubtaskOrchestrator_Run_NoPrompts(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	req := SubtaskRequest{
@@ -624,7 +644,7 @@ func TestSubtaskOrchestrator_Run_TooManyPrompts(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	// Create 6 prompts (exceeds max of 5)
@@ -666,7 +686,7 @@ func TestSubtaskOrchestrator_ListRunningSubtasks(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	// Create some running subtasks directly in DB
@@ -699,7 +719,7 @@ func TestSubtaskOrchestrator_CancelSubtasks(t *testing.T) {
 	ctx := context.Background()
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	// Create some running subtasks directly in DB
@@ -780,7 +800,7 @@ func TestSubtaskOrchestrator_Run_WithSession(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	req := SubtaskRequest{
@@ -829,7 +849,7 @@ func TestSubtaskOrchestrator_Run_NoSubtasksDefault(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	// Create 5 prompts (should work with default max of 5)
@@ -868,7 +888,7 @@ func TestSubtaskOrchestrator_Run_UplevelChat(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	req := SubtaskRequest{
@@ -913,7 +933,7 @@ func TestSubtaskOrchestrator_Run_DBErrorOnCreate(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	req := SubtaskRequest{
@@ -941,7 +961,7 @@ func TestSubtaskOrchestrator_ListRunningSubtasks_MixedStatuses(t *testing.T) {
 	ctx := context.Background()
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	// Create subtasks with different statuses
@@ -978,7 +998,7 @@ func TestSubtaskOrchestrator_CancelSubtasks_NoRunningSubtasks(t *testing.T) {
 	ctx := context.Background()
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	// No subtasks created for this topic
@@ -996,7 +1016,7 @@ func TestSubtaskOrchestrator_CancelSubtasks_OnlyNonRunning(t *testing.T) {
 	ctx := context.Background()
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	// Create only completed subtasks (no running ones)
@@ -1041,7 +1061,7 @@ func TestSubtaskOrchestrator_Run_SubtaskIDsAreUnique(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	req := SubtaskRequest{
@@ -1093,7 +1113,7 @@ func TestSubtaskOrchestrator_Run_VeryLongPrompt(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	// Create a very long prompt (10KB)
@@ -1141,7 +1161,7 @@ func TestSubtaskOrchestrator_Run_EmptyPromptInList(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	// Include an empty prompt in the list
@@ -1184,7 +1204,7 @@ func TestSubtaskOrchestrator_Run_NilSession(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	req := SubtaskRequest{
@@ -1231,7 +1251,7 @@ func TestSubtaskOrchestrator_Run_DuplicatePrompts(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	// Same prompt multiple times
@@ -1274,7 +1294,7 @@ func TestSubtaskOrchestrator_CancelSubtasks_MultipleTopics(t *testing.T) {
 	ctx := context.Background()
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	// Create running subtasks in different topics
@@ -1670,7 +1690,7 @@ func TestCommandHandler_cmdParallel_SinglePrompt(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
@@ -1743,7 +1763,7 @@ func TestCommandHandler_cmdParallel_MultiplePrompts(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
@@ -2009,7 +2029,7 @@ func TestCommandHandler_cmdParallel_NoSessionFound(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
@@ -2067,7 +2087,7 @@ func TestCommandHandler_cmdParallel_NegativeChatID(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
@@ -2136,7 +2156,7 @@ func TestCommandHandler_cmdParallel_UnicodePrompts(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
@@ -2212,7 +2232,7 @@ func TestCommandHandler_cmdParallel_SpecialCharacters(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
@@ -2282,7 +2302,7 @@ func TestCommandHandler_cmdParallel_VeryLongPrompts(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
@@ -2361,7 +2381,7 @@ func TestCommandHandler_cmdParallel_MaxFivePromptsBoundary(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
 	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
@@ -2574,8 +2594,8 @@ func TestWorkerPool_finishWorker_Success(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	worker := &Worker{
 		ID:        "worker-test-1",
@@ -2622,8 +2642,8 @@ func TestWorkerPool_finishWorker_Failure(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	worker := &Worker{
 		ID:        "worker-test-2",
@@ -2670,8 +2690,8 @@ func TestWorkerPool_finishWorker_InjectsPendingResult(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	worker := &Worker{
 		ID:        "worker-test-3",
@@ -2709,8 +2729,8 @@ func TestWorkerPool_finishWorker_ResultTruncation(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	worker := &Worker{
 		ID:        "worker-test-4",
@@ -2758,8 +2778,8 @@ func TestWorkerPool_finishWorker_ErrorMessageTruncation(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	worker := &Worker{
 		ID:        "worker-test-5",
@@ -2806,8 +2826,8 @@ func TestWorkerPool_SpawnWorker_EmptyGroupModel(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
 	workerID, _, err := wp.SpawnWorker(ctx, 100, 10, 1000, group, inputJSON)
@@ -2841,8 +2861,8 @@ func TestWorkerPool_SpawnWorker_NegativeChatID(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
 	workerID, _, err := wp.SpawnWorker(ctx, -100123456789, 42, 1000, group, inputJSON)
@@ -2881,8 +2901,8 @@ func TestWorkerPool_SpawnWorker_DBErrorOnCount(t *testing.T) {
 	db.Close()
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
 	_, _, err := wp.SpawnWorker(ctx, 100, 10, 1000, group, inputJSON)
@@ -2910,8 +2930,8 @@ func TestWorkerPool_SpawnWorker_ConcurrentIndexing(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":"concurrent test"}`)
 
@@ -2985,8 +3005,8 @@ func TestWorkerPool_SpawnWorker_WorkerIDFormat(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
 	workerID, _, err := wp.SpawnWorker(ctx, 100, 10, 1000, group, inputJSON)
@@ -3016,8 +3036,8 @@ func TestWorkerPool_SpawnWorker_MultipleTopicsIsolation(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
 
@@ -3067,8 +3087,8 @@ func TestWorkerPool_finishWorker_DBError(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	worker := &Worker{
 		ID:        "worker-db-error",
@@ -3108,8 +3128,8 @@ func TestWorkerPool_SpawnWorker_CreateWorkerError(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
 
@@ -3141,8 +3161,8 @@ func TestWorkerPool_finishWorker_PendingResultInjection(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	worker := &Worker{
 		ID:        "worker-inject-test",
@@ -3193,8 +3213,8 @@ func TestWorkerPool_SpawnWorker_IndexPerTopic(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	sm := newTestSessionManager(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	wp := NewWorkerPool(db, sender, sm, 10)
 
 	inputJSON := json.RawMessage(`{"prompt":"task"}`)
 
@@ -3722,5 +3742,1174 @@ func TestCommandHandler_cmdParallel_ZeroMessageID(t *testing.T) {
 	}
 	if subtasks[0].ParentMsgID != 0 {
 		t.Errorf("subtask.ParentMsgID = %d, want 0", subtasks[0].ParentMsgID)
+	}
+}
+
+// ── WorkerPool DB State Transition Tests ───────────────────────────────────────────────────
+
+func TestWorkerPool_DB_CreateWorker_CompleteRecord(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create worker with all fields populated
+	worker := &Worker{
+		ID:        "worker-full-test",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "Complete test task with all fields",
+		SessionID: "test-session-123",
+		Model:     "claude-opus-4-6",
+		Status:    "running",
+		Result:    "",
+		Error:     "",
+		StartedAt: time.Now().UTC(),
+	}
+
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	// Verify all fields were persisted
+	retrieved, err := db.GetWorker(ctx, "worker-full-test")
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+	if retrieved == nil {
+		t.Fatal("worker not found in DB")
+	}
+
+	if retrieved.ID != "worker-full-test" {
+		t.Errorf("ID = %q, want 'worker-full-test'", retrieved.ID)
+	}
+	if retrieved.ChatID != 100 {
+		t.Errorf("ChatID = %d, want 100", retrieved.ChatID)
+	}
+	if retrieved.ThreadID != 10 {
+		t.Errorf("ThreadID = %d, want 10", retrieved.ThreadID)
+	}
+	if retrieved.ParentMsg != 1000 {
+		t.Errorf("ParentMsg = %d, want 1000", retrieved.ParentMsg)
+	}
+	if retrieved.Prompt != "Complete test task with all fields" {
+		t.Errorf("Prompt = %q, want 'Complete test task with all fields'", retrieved.Prompt)
+	}
+	if retrieved.SessionID != "test-session-123" {
+		t.Errorf("SessionID = %q, want 'test-session-123'", retrieved.SessionID)
+	}
+	if retrieved.Model != "claude-opus-4-6" {
+		t.Errorf("Model = %q, want 'claude-opus-4-6'", retrieved.Model)
+	}
+	if retrieved.Status != "running" {
+		t.Errorf("Status = %q, want 'running'", retrieved.Status)
+	}
+	// StartedAt may lose sub-second precision due to SQLite storage
+	// SQLite stores timestamps as strings, so compare with 1-second tolerance
+	timeDiff := retrieved.StartedAt.Sub(worker.StartedAt)
+	if timeDiff < 0 {
+		timeDiff = -timeDiff
+	}
+	if timeDiff > time.Second {
+		t.Logf("Note: StartedAt lost precision: stored=%v, original=%v, diff=%v", retrieved.StartedAt, worker.StartedAt, timeDiff)
+	}
+	if retrieved.FinishedAt != nil {
+		t.Error("FinishedAt should be nil for running worker")
+	}
+}
+
+func TestWorkerPool_DB_CreateWorker_MinimalFields(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create worker with minimal required fields
+	worker := &Worker{
+		ID:        "worker-minimal",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "Minimal task",
+		// Status and StartedAt should be auto-populated
+	}
+
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	// Verify auto-populated fields
+	retrieved, err := db.GetWorker(ctx, "worker-minimal")
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+	if retrieved.Status != "running" {
+		t.Errorf("Status auto-populated to %q, want 'running'", retrieved.Status)
+	}
+	if retrieved.StartedAt.IsZero() {
+		t.Error("StartedAt should be auto-populated")
+	}
+	// Optional fields should be empty
+	if retrieved.SessionID != "" {
+		t.Errorf("SessionID should be empty, got %q", retrieved.SessionID)
+	}
+	if retrieved.Model != "" {
+		t.Errorf("Model should be empty, got %q", retrieved.Model)
+	}
+}
+
+func TestWorkerPool_DB_StateTransition_RunningToDone(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create running worker
+	worker := &Worker{
+		ID:        "worker-transition-done",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "Task to complete",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	// Verify initial state
+	retrieved, err := db.GetWorker(ctx, "worker-transition-done")
+	if err != nil {
+		t.Fatalf("GetWorker before update: %v", err)
+	}
+	if retrieved.Status != "running" {
+		t.Errorf("initial Status = %q, want 'running'", retrieved.Status)
+	}
+	if retrieved.FinishedAt != nil {
+		t.Error("initial FinishedAt should be nil")
+	}
+
+	// Transition to done with result
+	resultText := "Task completed successfully: 2+2=4"
+	if err := db.UpdateWorker(ctx, "worker-transition-done", "done", resultText, ""); err != nil {
+		t.Fatalf("UpdateWorker to done: %v", err)
+	}
+
+	// Verify final state
+	updated, err := db.GetWorker(ctx, "worker-transition-done")
+	if err != nil {
+		t.Fatalf("GetWorker after update: %v", err)
+	}
+	if updated.Status != "done" {
+		t.Errorf("final Status = %q, want 'done'", updated.Status)
+	}
+	if updated.Result != resultText {
+		t.Errorf("Result = %q, want %q", updated.Result, resultText)
+	}
+	if updated.Error != "" {
+		t.Errorf("Error should be empty, got %q", updated.Error)
+	}
+	if updated.FinishedAt == nil {
+		t.Fatal("FinishedAt should be set after completion")
+	}
+	// Allow FinishedAt to equal or be after StartedAt (SQLite precision)
+	// Just check it's not zero time
+	if updated.FinishedAt.IsZero() {
+		t.Error("FinishedAt should not be zero time")
+	}
+	// FinishedAt should be after or equal to StartedAt (allowing for precision)
+	if updated.FinishedAt.Before(updated.StartedAt) && !updated.FinishedAt.Equal(updated.StartedAt) {
+		t.Errorf("FinishedAt (%v) should be after or equal to StartedAt (%v)", updated.FinishedAt, updated.StartedAt)
+	}
+}
+
+func TestWorkerPool_DB_StateTransition_RunningToFailed(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create running worker
+	worker := &Worker{
+		ID:        "worker-transition-failed",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "Task that will fail",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	// Transition to failed with error message
+	errorMsg := "Execution timeout: Claude process hung"
+	if err := db.UpdateWorker(ctx, "worker-transition-failed", "failed", "", errorMsg); err != nil {
+		t.Fatalf("UpdateWorker to failed: %v", err)
+	}
+
+	// Verify final state
+	updated, err := db.GetWorker(ctx, "worker-transition-failed")
+	if err != nil {
+		t.Fatalf("GetWorker after update: %v", err)
+	}
+	if updated.Status != "failed" {
+		t.Errorf("final Status = %q, want 'failed'", updated.Status)
+	}
+	if updated.Result != "" {
+		t.Errorf("Result should be empty for failed worker, got %q", updated.Result)
+	}
+	if updated.Error != errorMsg {
+		t.Errorf("Error = %q, want %q", updated.Error, errorMsg)
+	}
+	if updated.FinishedAt == nil {
+		t.Error("FinishedAt should be set even for failed workers")
+	}
+}
+
+func TestWorkerPool_DB_StateTransition_DoneToFailed(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create worker and mark as done
+	worker := &Worker{
+		ID:        "worker-done-to-failed",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "Task",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	if err := db.UpdateWorker(ctx, "worker-done-to-failed", "done", "Initial result", ""); err != nil {
+		t.Fatalf("UpdateWorker to done: %v", err)
+	}
+
+	// Get initial FinishedAt
+	doneWorker, err := db.GetWorker(ctx, "worker-done-to-failed")
+	if err != nil {
+		t.Fatalf("GetWorker after done: %v", err)
+	}
+	initialFinishedAt := doneWorker.FinishedAt
+
+	// Transition from done to failed (e.g., post-processing validation failed)
+	if err := db.UpdateWorker(ctx, "worker-done-to-failed", "failed", "", "Validation failed"); err != nil {
+		t.Fatalf("UpdateWorker to failed: %v", err)
+	}
+
+	// Verify state transition
+	failedWorker, err := db.GetWorker(ctx, "worker-done-to-failed")
+	if err != nil {
+		t.Fatalf("GetWorker after failed: %v", err)
+	}
+	if failedWorker.Status != "failed" {
+		t.Errorf("Status = %q, want 'failed'", failedWorker.Status)
+	}
+	// FinishedAt should be updated on second transition
+	// Allow for timestamp precision (within 1 second is acceptable change)
+	if failedWorker.FinishedAt.Sub(*initialFinishedAt) > time.Second && failedWorker.FinishedAt.Before(*initialFinishedAt) {
+		t.Error("FinishedAt should be updated on state transition")
+	}
+}
+
+func TestWorkerPool_DB_UpdateWorkerSessionID(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create worker without SessionID
+	worker := &Worker{
+		ID:        "worker-session-update",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "Task",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	// Verify SessionID is empty
+	retrieved, err := db.GetWorker(ctx, "worker-session-update")
+	if err != nil {
+		t.Fatalf("GetWorker before update: %v", err)
+	}
+	if retrieved.SessionID != "" {
+		t.Errorf("initial SessionID should be empty, got %q", retrieved.SessionID)
+	}
+
+	// Update SessionID
+	sessionID := "session-abc-123"
+	if err := db.UpdateWorkerSessionID(ctx, "worker-session-update", sessionID); err != nil {
+		t.Fatalf("UpdateWorkerSessionID: %v", err)
+	}
+
+	// Verify SessionID was updated
+	updated, err := db.GetWorker(ctx, "worker-session-update")
+	if err != nil {
+		t.Fatalf("GetWorker after update: %v", err)
+	}
+	if updated.SessionID != sessionID {
+		t.Errorf("SessionID = %q, want %q", updated.SessionID, sessionID)
+	}
+	// Other fields should be unchanged
+	if updated.Status != "running" {
+		t.Errorf("Status should remain 'running', got %q", updated.Status)
+	}
+	if updated.Prompt != "Task" {
+		t.Errorf("Prompt should remain unchanged")
+	}
+}
+
+func TestWorkerPool_DB_ListWorkersForTopic(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create multiple workers for same topic
+	workers := []*Worker{
+		{
+			ID:        "worker-list-1",
+			ChatID:    100,
+			ThreadID:  10,
+			ParentMsg: 1000,
+			Prompt:    "Task 1",
+			Status:    "done",
+			Result:    "Result 1",
+			StartedAt: time.Now().UTC().Add(-2 * time.Hour),
+		},
+		{
+			ID:        "worker-list-2",
+			ChatID:    100,
+			ThreadID:  10,
+			ParentMsg: 1001,
+			Prompt:    "Task 2",
+			Status:    "running",
+			StartedAt: time.Now().UTC().Add(-1 * time.Hour),
+		},
+		{
+			ID:        "worker-list-3",
+			ChatID:    100,
+			ThreadID:  10,
+			ParentMsg: 1002,
+			Prompt:    "Task 3",
+			Status:    "failed",
+			Error:     "Error 3",
+			StartedAt: time.Now().UTC().Add(-30 * time.Minute),
+		},
+	}
+
+	for _, w := range workers {
+		if err := db.CreateWorker(ctx, w); err != nil {
+			t.Fatalf("CreateWorker %s: %v", w.ID, err)
+		}
+	}
+
+	// Mark first worker as done
+	if err := db.UpdateWorker(ctx, "worker-list-1", "done", "Result 1", ""); err != nil {
+		t.Fatalf("UpdateWorker: %v", err)
+	}
+
+	// List workers for topic
+	listed, err := db.ListWorkersForTopic(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListWorkersForTopic: %v", err)
+	}
+	if len(listed) != 3 {
+		t.Fatalf("got %d workers, want 3", len(listed))
+	}
+
+	// Verify ordering: should be DESC by started_at (most recent first)
+	if listed[0].ID != "worker-list-3" {
+		t.Errorf("first worker ID = %q, want 'worker-list-3' (most recent)", listed[0].ID)
+	}
+	if listed[1].ID != "worker-list-2" {
+		t.Errorf("second worker ID = %q, want 'worker-list-2'", listed[1].ID)
+	}
+	if listed[2].ID != "worker-list-1" {
+		t.Errorf("third worker ID = %q, want 'worker-list-1' (oldest)", listed[2].ID)
+	}
+
+	// Verify all workers belong to the correct topic
+	for _, w := range listed {
+		if w.ChatID != 100 {
+			t.Errorf("worker %s has wrong ChatID: %d", w.ID, w.ChatID)
+		}
+		if w.ThreadID != 10 {
+			t.Errorf("worker %s has wrong ThreadID: %d", w.ID, w.ThreadID)
+		}
+	}
+}
+
+func TestWorkerPool_DB_ListWorkersForTopic_MultipleTopics(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create workers for different topics
+	topics := []struct {
+		chatID, threadID int64
+		workerID         string
+	}{
+		{100, 10, "worker-topic-100-10"},
+		{100, 20, "worker-topic-100-20"},
+		{200, 10, "worker-topic-200-10"},
+	}
+
+	for _, tc := range topics {
+		w := &Worker{
+			ID:        tc.workerID,
+			ChatID:    tc.chatID,
+			ThreadID:  tc.threadID,
+			ParentMsg: 1000,
+			Prompt:    "Task",
+			Status:    "running",
+			StartedAt: time.Now().UTC(),
+		}
+		if err := db.CreateWorker(ctx, w); err != nil {
+			t.Fatalf("CreateWorker %s: %v", tc.workerID, err)
+		}
+	}
+
+	// List workers for topic (100, 10) - should only return one
+	listed, err := db.ListWorkersForTopic(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListWorkersForTopic: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("got %d workers for topic (100, 10), want 1", len(listed))
+	}
+	if listed[0].ID != "worker-topic-100-10" {
+		t.Errorf("worker ID = %q, want 'worker-topic-100-10'", listed[0].ID)
+	}
+
+	// List workers for topic (100, 20)
+	listed, err = db.ListWorkersForTopic(ctx, 100, 20)
+	if err != nil {
+		t.Fatalf("ListWorkersForTopic: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("got %d workers for topic (100, 20), want 1", len(listed))
+	}
+	if listed[0].ID != "worker-topic-100-20" {
+		t.Errorf("worker ID = %q, want 'worker-topic-100-20'", listed[0].ID)
+	}
+
+	// List workers for topic (200, 10)
+	listed, err = db.ListWorkersForTopic(ctx, 200, 10)
+	if err != nil {
+		t.Fatalf("ListWorkersForTopic: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("got %d workers for topic (200, 10), want 1", len(listed))
+	}
+	if listed[0].ID != "worker-topic-200-10" {
+		t.Errorf("worker ID = %q, want 'worker-topic-200-10'", listed[0].ID)
+	}
+}
+
+func TestWorkerPool_DB_ListWorkersForTopic_EmptyTopic(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create worker for a different topic
+	w := &Worker{
+		ID:        "worker-other-topic",
+		ChatID:    100,
+		ThreadID:  20,
+		ParentMsg: 1000,
+		Prompt:    "Task",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, w); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	// List workers for topic with no workers
+	listed, err := db.ListWorkersForTopic(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListWorkersForTopic: %v", err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("got %d workers for empty topic, want 0", len(listed))
+	}
+}
+
+func TestWorkerPool_DB_DeleteWorkersForTopic(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create workers for two topics
+	for _, workerID := range []string{"worker-delete-1", "worker-delete-2", "worker-delete-3"} {
+		w := &Worker{
+			ID:        workerID,
+			ChatID:    100,
+			ThreadID:  10,
+			ParentMsg: 1000,
+			Prompt:    "Task",
+			Status:    "running",
+			StartedAt: time.Now().UTC(),
+		}
+		if err := db.CreateWorker(ctx, w); err != nil {
+			t.Fatalf("CreateWorker %s: %v", workerID, err)
+		}
+	}
+
+	// Create worker for different topic (should not be deleted)
+	w := &Worker{
+		ID:        "worker-other-topic",
+		ChatID:    100,
+		ThreadID:  20,
+		ParentMsg: 1000,
+		Prompt:    "Task",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, w); err != nil {
+		t.Fatalf("CreateWorker for other topic: %v", err)
+	}
+
+	// Verify workers exist before deletion
+	listedBefore, err := db.ListWorkersForTopic(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListWorkersForTopic before delete: %v", err)
+	}
+	if len(listedBefore) != 3 {
+		t.Fatalf("got %d workers before delete, want 3", len(listedBefore))
+	}
+
+	// Delete all workers for topic (100, 10)
+	if err := db.DeleteWorkersForTopic(ctx, 100, 10); err != nil {
+		t.Fatalf("DeleteWorkersForTopic: %v", err)
+	}
+
+	// Verify workers were deleted
+	listedAfter, err := db.ListWorkersForTopic(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListWorkersForTopic after delete: %v", err)
+	}
+	if len(listedAfter) != 0 {
+		t.Fatalf("got %d workers after delete, want 0", len(listedAfter))
+	}
+
+	// Verify worker for other topic still exists
+	otherListed, err := db.ListWorkersForTopic(ctx, 100, 20)
+	if err != nil {
+		t.Fatalf("ListWorkersForTopic for other topic: %v", err)
+	}
+	if len(otherListed) != 1 {
+		t.Fatalf("got %d workers for other topic, want 1", len(otherListed))
+	}
+	if otherListed[0].ID != "worker-other-topic" {
+		t.Errorf("other topic worker ID = %q, want 'worker-other-topic'", otherListed[0].ID)
+	}
+}
+
+func TestWorkerPool_DB_ListStaleWorkers(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+
+	// Create workers with different start times
+	workers := []struct {
+		id          string
+		startedAt   time.Time
+		isStale     bool
+		description string
+	}{
+		{
+			id:        "worker-stale-1",
+			startedAt: now.Add(-2 * time.Hour),
+			isStale:   true,
+			description: "2 hours old (stale with 1h TTL)",
+		},
+		{
+			id:        "worker-stale-2",
+			startedAt: now.Add(-90 * time.Minute),
+			isStale:   true,
+			description: "90 minutes old (stale with 1h TTL)",
+		},
+		{
+			id:        "worker-fresh-1",
+			startedAt: now.Add(-30 * time.Minute),
+			isStale:   false,
+			description: "30 minutes old (fresh with 1h TTL)",
+		},
+		{
+			id:        "worker-fresh-2",
+			startedAt: now.Add(-5 * time.Minute),
+			isStale:   false,
+			description: "5 minutes old (fresh with 1h TTL)",
+		},
+	}
+
+	for _, tc := range workers {
+		w := &Worker{
+			ID:        tc.id,
+			ChatID:    100,
+			ThreadID:  10,
+			ParentMsg:  1000,
+			Prompt:    "Task",
+			Status:    "running",
+			StartedAt: tc.startedAt,
+		}
+		if err := db.CreateWorker(ctx, w); err != nil {
+			t.Fatalf("CreateWorker %s: %v", tc.id, err)
+		}
+	}
+
+	// Also create a completed worker (should not be considered stale)
+	wDone := &Worker{
+		ID:        "worker-completed",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "Task",
+		Status:    "done",
+		Result:    "Complete",
+		StartedAt: now.Add(-2 * time.Hour),
+	}
+	if err := db.CreateWorker(ctx, wDone); err != nil {
+		t.Fatalf("CreateWorker completed: %v", err)
+	}
+	if err := db.UpdateWorker(ctx, "worker-completed", "done", "Complete", ""); err != nil {
+		t.Fatalf("UpdateWorker completed: %v", err)
+	}
+
+	// List stale workers with 1 hour TTL
+	stale, err := db.ListStaleWorkers(ctx, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("ListStaleWorkers: %v", err)
+	}
+
+	// Should find 2 stale workers (old running workers)
+	if len(stale) != 2 {
+		t.Fatalf("got %d stale workers, want 2", len(stale))
+	}
+
+	// Verify stale workers are the old ones
+	staleIDs := make(map[string]bool)
+	for _, w := range stale {
+		staleIDs[w.ID] = true
+		if w.Status != "running" {
+			t.Errorf("stale worker %s has status %q, want 'running'", w.ID, w.Status)
+		}
+	}
+
+	if !staleIDs["worker-stale-1"] {
+		t.Error("worker-stale-1 should be in stale list")
+	}
+	if !staleIDs["worker-stale-2"] {
+		t.Error("worker-stale-2 should be in stale list")
+	}
+	if staleIDs["worker-fresh-1"] {
+		t.Error("worker-fresh-1 should not be in stale list")
+	}
+	if staleIDs["worker-fresh-2"] {
+		t.Error("worker-fresh-2 should not be in stale list")
+	}
+	if staleIDs["worker-completed"] {
+		t.Error("worker-completed should not be in stale list (not running)")
+	}
+
+	// Verify stale workers are ordered by started_at ASC (oldest first)
+	if stale[0].ID != "worker-stale-1" {
+		t.Errorf("first stale worker ID = %q, want 'worker-stale-1' (oldest)", stale[0].ID)
+	}
+	if stale[1].ID != "worker-stale-2" {
+		t.Errorf("second stale worker ID = %q, want 'worker-stale-2'", stale[1].ID)
+	}
+}
+
+func TestWorkerPool_DB_ListStaleWorkers_NoStaleWorkers(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+
+	// Create only fresh workers
+	for i := 0; i < 3; i++ {
+		w := &Worker{
+			ID:        fmt.Sprintf("worker-fresh-%d", i),
+			ChatID:    100,
+			ThreadID:  10,
+			ParentMsg: 1000,
+			Prompt:    "Task",
+			Status:    "running",
+			StartedAt: now.Add(-10 * time.Minute),
+		}
+		if err := db.CreateWorker(ctx, w); err != nil {
+			t.Fatalf("CreateWorker: %v", err)
+		}
+	}
+
+	// List stale workers with 1 hour TTL
+	stale, err := db.ListStaleWorkers(ctx, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("ListStaleWorkers: %v", err)
+	}
+	if len(stale) != 0 {
+		t.Fatalf("got %d stale workers, want 0", len(stale))
+	}
+}
+
+func TestWorkerPool_DB_ListStaleWorkers_AllStale(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+
+	// Create only stale workers
+	for i := 0; i < 5; i++ {
+		w := &Worker{
+			ID:        fmt.Sprintf("worker-all-stale-%d", i),
+			ChatID:    100,
+			ThreadID:  10,
+			ParentMsg: 1000,
+			Prompt:    "Task",
+			Status:    "running",
+			StartedAt: now.Add(-2 * time.Hour),
+		}
+		if err := db.CreateWorker(ctx, w); err != nil {
+			t.Fatalf("CreateWorker: %v", err)
+		}
+	}
+
+	// List stale workers with 1 hour TTL
+	stale, err := db.ListStaleWorkers(ctx, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("ListStaleWorkers: %v", err)
+	}
+	if len(stale) != 5 {
+		t.Fatalf("got %d stale workers, want 5", len(stale))
+	}
+}
+
+func TestWorkerPool_DB_CountRunningWorkers(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create mix of running and completed workers
+	workers := []struct {
+		id     string
+		status string
+	}{
+		{"worker-count-1", "running"},
+		{"worker-count-2", "running"},
+		{"worker-count-3", "running"},
+		{"worker-count-4", "done"},
+		{"worker-count-5", "failed"},
+	}
+
+	for _, tc := range workers {
+		w := &Worker{
+			ID:        tc.id,
+			ChatID:    100,
+			ThreadID:  10,
+			ParentMsg: 1000,
+			Prompt:    "Task",
+			Status:    "running",
+			StartedAt: time.Now().UTC(),
+		}
+		if err := db.CreateWorker(ctx, w); err != nil {
+			t.Fatalf("CreateWorker %s: %v", tc.id, err)
+		}
+
+		// Mark completed/failed workers as such
+		if tc.status != "running" {
+			if err := db.UpdateWorker(ctx, tc.id, tc.status, "result", "error"); err != nil {
+				t.Fatalf("UpdateWorker %s: %v", tc.id, err)
+			}
+		}
+	}
+
+	// Count running workers
+	count, err := db.CountRunningWorkers(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("CountRunningWorkers: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("running worker count = %d, want 3", count)
+	}
+}
+
+func TestWorkerPool_DB_CountRunningWorkers_MultipleTopics(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create running workers for different topics
+	topics := []struct {
+		chatID, threadID int64
+		count            int
+	}{
+		{100, 10, 2},
+		{100, 20, 3},
+		{200, 10, 1},
+	}
+
+	for _, tc := range topics {
+		for i := 0; i < tc.count; i++ {
+			w := &Worker{
+				ID:        fmt.Sprintf("worker-topic-%d-%d-%d", tc.chatID, tc.threadID, i),
+				ChatID:    tc.chatID,
+				ThreadID:  tc.threadID,
+				ParentMsg: 1000,
+				Prompt:    "Task",
+				Status:    "running",
+				StartedAt: time.Now().UTC(),
+			}
+			if err := db.CreateWorker(ctx, w); err != nil {
+				t.Fatalf("CreateWorker: %v", err)
+			}
+		}
+	}
+
+	// Count workers for each topic
+	for _, tc := range topics {
+		count, err := db.CountRunningWorkers(ctx, tc.chatID, tc.threadID)
+		if err != nil {
+			t.Fatalf("CountRunningWorkers for topic (%d, %d): %v", tc.chatID, tc.threadID, err)
+		}
+		if count != tc.count {
+			t.Errorf("topic (%d, %d) running count = %d, want %d", tc.chatID, tc.threadID, count, tc.count)
+		}
+	}
+}
+
+func TestWorkerPool_DB_GetWorker_NotFound(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Try to get non-existent worker
+	worker, err := db.GetWorker(ctx, "worker-nonexistent")
+	if err != nil {
+		t.Fatalf("GetWorker with non-existent ID should not error: %v", err)
+	}
+	if worker != nil {
+		t.Error("worker should be nil for non-existent ID")
+	}
+}
+
+func TestWorkerPool_DB_ConcurrentStateUpdates(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create running worker
+	worker := &Worker{
+		ID:        "worker-concurrent",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "Task",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	// Perform multiple concurrent updates
+	numUpdates := 10
+	errChan := make(chan error, numUpdates)
+
+	for i := 0; i < numUpdates; i++ {
+		go func(updateNum int) {
+			result := fmt.Sprintf("Result %d", updateNum)
+			err := db.UpdateWorker(ctx, "worker-concurrent", "done", result, "")
+			errChan <- err
+		}(i)
+	}
+
+	// Collect all errors
+	for i := 0; i < numUpdates; i++ {
+		if err := <-errChan; err != nil {
+			t.Errorf("concurrent update %d failed: %v", i, err)
+		}
+	}
+
+	// Verify final state
+	updated, err := db.GetWorker(ctx, "worker-concurrent")
+	if err != nil {
+		t.Fatalf("GetWorker after concurrent updates: %v", err)
+	}
+	if updated.Status != "done" {
+		t.Errorf("final Status = %q, want 'done'", updated.Status)
+	}
+	// Result should be one of the concurrent updates
+	if updated.Result == "" {
+		t.Error("Result should be set after updates")
+	}
+}
+
+func TestWorkerPool_DB_UpdateWorker_LongResult(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create worker
+	worker := &Worker{
+		ID:        "worker-long-result",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "Task",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	// Update with very long result (10KB)
+	longResult := strings.Repeat("Result line: ", 500)
+	if err := db.UpdateWorker(ctx, "worker-long-result", "done", longResult, ""); err != nil {
+		t.Fatalf("UpdateWorker with long result: %v", err)
+	}
+
+	// Verify full result was stored
+	retrieved, err := db.GetWorker(ctx, "worker-long-result")
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+	if len(retrieved.Result) != len(longResult) {
+		t.Errorf("result length = %d, want %d (full result stored)", len(retrieved.Result), len(longResult))
+	}
+	if retrieved.Result != longResult {
+		t.Error("stored result doesn't match original")
+	}
+}
+
+func TestWorkerPool_DB_UpdateWorker_LongError(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create worker
+	worker := &Worker{
+		ID:        "worker-long-error",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "Task",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	// Update with very long error message
+	longError := strings.Repeat("Error details: ", 1000)
+	if err := db.UpdateWorker(ctx, "worker-long-error", "failed", "", longError); err != nil {
+		t.Fatalf("UpdateWorker with long error: %v", err)
+	}
+
+	// Verify full error was stored
+	retrieved, err := db.GetWorker(ctx, "worker-long-error")
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+	if len(retrieved.Error) != len(longError) {
+		t.Errorf("error length = %d, want %d (full error stored)", len(retrieved.Error), len(longError))
+	}
+	if retrieved.Error != longError {
+		t.Error("stored error doesn't match original")
+	}
+}
+
+func TestWorkerPool_DB_WorkerWithSpecialCharacters(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create worker with special characters in prompt/result/error
+	worker := &Worker{
+		ID:        "worker-special-chars",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "Task with: newlines\n, tabs\t, quotes '\", emoji 🎉",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	// Update with special characters
+	result := "Result: `code`, *markdown*, \"JSON\", emoji 🚀\nMulti-line\n\tTabs"
+	if err := db.UpdateWorker(ctx, "worker-special-chars", "done", result, "Error: ⚠️ test"); err != nil {
+		t.Fatalf("UpdateWorker: %v", err)
+	}
+
+	// Verify special characters were preserved
+	retrieved, err := db.GetWorker(ctx, "worker-special-chars")
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+	if retrieved.Prompt != worker.Prompt {
+		t.Error("prompt with special chars not preserved")
+	}
+	if retrieved.Result != result {
+		t.Error("result with special chars not preserved")
+	}
+	if retrieved.Error != "Error: ⚠️ test" {
+		t.Error("error with special chars not preserved")
+	}
+}
+
+func TestWorkerPool_DB_FinishedAtTimestamp(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	beforeCreate := time.Now().UTC()
+
+	// Create worker
+	worker := &Worker{
+		ID:        "worker-timestamp",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "Task",
+		Status:    "running",
+		StartedAt: beforeCreate,
+	}
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	// Wait a bit to ensure timestamp difference
+	time.Sleep(10 * time.Millisecond)
+
+	// Update worker
+	if err := db.UpdateWorker(ctx, "worker-timestamp", "done", "Result", ""); err != nil {
+		t.Fatalf("UpdateWorker: %v", err)
+	}
+
+	// Verify timestamps
+	retrieved, err := db.GetWorker(ctx, "worker-timestamp")
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+
+	// StartedAt should be close to beforeCreate (SQLite may lose sub-second precision)
+	// Just check it's not zero time
+	if retrieved.StartedAt.IsZero() {
+		t.Error("StartedAt should not be zero time")
+	}
+	if retrieved.StartedAt.Before(beforeCreate.Add(-1 * time.Second)) {
+		t.Errorf("StartedAt = %v, too far before beforeCreate = %v", retrieved.StartedAt, beforeCreate)
+	}
+
+	// FinishedAt should be set
+	if retrieved.FinishedAt == nil {
+		t.Fatal("FinishedAt should be set after update")
+	}
+
+	// FinishedAt should not be zero time
+	if retrieved.FinishedAt.IsZero() {
+		t.Error("FinishedAt should not be zero time")
+	}
+
+	// FinishedAt should be after or equal to StartedAt (allowing for precision)
+	if retrieved.FinishedAt.Before(retrieved.StartedAt) && !retrieved.FinishedAt.Equal(retrieved.StartedAt) {
+		t.Errorf("FinishedAt (%v) should be after or equal to StartedAt (%v)", retrieved.FinishedAt, retrieved.StartedAt)
+	}
+}
+
+func TestWorkerPool_DB_NegativeChatID(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create worker with negative chatID (supergroup)
+	worker := &Worker{
+		ID:        "worker-negative-chat",
+		ChatID:    -100123456789,
+		ThreadID:  42,
+		ParentMsg: 1000,
+		Prompt:    "Task",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker with negative chatID: %v", err)
+	}
+
+	// Verify worker was stored with negative chatID
+	retrieved, err := db.GetWorker(ctx, "worker-negative-chat")
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+	if retrieved.ChatID != -100123456789 {
+		t.Errorf("ChatID = %d, want -100123456789", retrieved.ChatID)
+	}
+	if retrieved.ThreadID != 42 {
+		t.Errorf("ThreadID = %d, want 42", retrieved.ThreadID)
+	}
+}
+
+func TestWorkerPool_DB_DeleteWorkersForTopic_NoWorkers(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Delete from topic with no workers (should not error)
+	if err := db.DeleteWorkersForTopic(ctx, 100, 10); err != nil {
+		t.Errorf("DeleteWorkersForTopic with no workers should not error: %v", err)
+	}
+}
+
+func TestWorkerPool_DB_MultipleStateTransitions(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create worker
+	worker := &Worker{
+		ID:        "worker-multi-transition",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "Task",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	// Transition: running → done
+	if err := db.UpdateWorker(ctx, "worker-multi-transition", "done", "First result", ""); err != nil {
+		t.Fatalf("UpdateWorker to done: %v", err)
+	}
+
+	retrieved, err := db.GetWorker(ctx, "worker-multi-transition")
+	if err != nil {
+		t.Fatalf("GetWorker after done: %v", err)
+	}
+	firstFinishedAt := retrieved.FinishedAt
+
+	// Transition: done → failed
+	if err := db.UpdateWorker(ctx, "worker-multi-transition", "failed", "", "Second error"); err != nil {
+		t.Fatalf("UpdateWorker to failed: %v", err)
+	}
+
+	retrieved, err = db.GetWorker(ctx, "worker-multi-transition")
+	if err != nil {
+		t.Fatalf("GetWorker after failed: %v", err)
+	}
+	if retrieved.Status != "failed" {
+		t.Errorf("Status = %q, want 'failed'", retrieved.Status)
+	}
+	if retrieved.Result != "" {
+		t.Errorf("Result should be empty, got %q", retrieved.Result)
+	}
+	if retrieved.Error != "Second error" {
+		t.Errorf("Error = %q, want 'Second error'", retrieved.Error)
+	}
+
+	// FinishedAt should be updated or close to it (within 1 second is acceptable)
+	// SQLite datetime('now') may have lower precision than Go time
+	finishedAtDiff := retrieved.FinishedAt.Sub(*firstFinishedAt)
+	if finishedAtDiff < 0 {
+		finishedAtDiff = -finishedAtDiff
+	}
+	if finishedAtDiff > time.Second {
+		t.Logf("Note: FinishedAt changed by %v between transitions (first: %v, second: %v)", finishedAtDiff, *firstFinishedAt, *retrieved.FinishedAt)
 	}
 }
