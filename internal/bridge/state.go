@@ -628,10 +628,9 @@ func (d *DB) CreateSession(ctx context.Context, s *Session) error {
 		nullableString(s.Summary),
 		s.NotificationMode,
 		s.TimeoutSec,
+		s.DispatcherMode,
 		nullableString(s.TopicName),
-			s.DispatcherMode,
-
-			s.LastFromUserID,
+		s.LastFromUserID,
 	)
 	return err
 }
