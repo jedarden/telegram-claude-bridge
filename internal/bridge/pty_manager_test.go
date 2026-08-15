@@ -24,12 +24,13 @@ type tmuxMockResponse struct {
 }
 
 const (
-	tmuxNewSessionOutput  = ""
-	tmuxNewPaneOutput     = "%1\n"
-	tmuxListPanesOutput   = "%1\ttelegram-bridge\tt100-10\t0\t12345\t/dev/pts/42\n"
-	tmuxListWindowsOutput = "t100-10\nw-worker_1-1234567890\n"
-	tmuxPaneTTYOutput     = "/dev/pts/42\n"
-	tmuxCapturePaneOutput = "● Mock response\nMock response body\n❯\n"
+	tmuxNewSessionOutput   = ""
+	tmuxNewPaneOutput      = "%1\n"
+	tmuxListPanesOutput    = "%1\ttelegram-bridge\tt100-10\t0\t12345\t/dev/pts/42\n"
+	tmuxListWindowsOutput  = "t100-10\nw-worker_1-1234567890\n"
+	tmuxPaneTTYOutput      = "/dev/pts/42\n"
+	tmuxCapturePaneOutput  = "● Mock response\nMock response body\n❯\n"
+	tmuxCaptureShellOutput = "shell command output\n"
 )
 
 // tmuxCommandFixtures returns independent fixtures for the tmux commands used
@@ -46,10 +47,14 @@ func tmuxCommandFixtures() map[string]tmuxMockResponse {
 		"list-windows":    {stdout: tmuxListWindowsOutput},
 		"display-message": {stdout: tmuxPaneTTYOutput},
 		"capture-pane":    {stdout: tmuxCapturePaneOutput},
-		"kill-window":     {stdout: tmuxNewSessionOutput},
-		"send-keys":       {stdout: tmuxNewSessionOutput},
-		"set-buffer":      {stdout: tmuxNewSessionOutput},
-		"paste-buffer":    {stdout: tmuxNewSessionOutput},
+		// capture-shell is kept as a separate fixture because callers that
+		// execute tmux through a shell use this response name, while the
+		// PTYManager's screen capture path uses capture-pane.
+		"capture-shell": {stdout: tmuxCaptureShellOutput},
+		"kill-window":   {stdout: tmuxNewSessionOutput},
+		"send-keys":     {stdout: tmuxNewSessionOutput},
+		"set-buffer":    {stdout: tmuxNewSessionOutput},
+		"paste-buffer":  {stdout: tmuxNewSessionOutput},
 	}
 }
 
