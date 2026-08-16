@@ -323,3 +323,70 @@ func TestSessionCleanupMarkInactiveKillPaneErrorIsNonFatal(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionCleanupMarkInactiveKillsPaneAndCommits(t *testing.T) {
+	const (
+		chatID         int64 = -987654321
+		threadID       int64 = 12345
+		wantPaneTarget       = "telegram-bridge:t987654321-12345"
+	)
+
+	tests := []struct {
+		name          string
+		killPaneError bool
+	}{
+		{
+			name: "KillPane succeeds",
+		},
+		{
+			name:          "KillPane fails",
+			killPaneError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tmux := setupTmuxTest(t)
+			if tc.killPaneError {
+				mockTmuxCommandFailure(t, "kill-window", "pane is already gone", 1)
+			}
+
+			db := openTestDB(t)
+			ctx := context.Background()
+			sess := &Session{
+				ChatID:    chatID,
+				ThreadID:  threadID,
+				SessionID: "cleanup-session-" + tc.name,
+				CWD:       "/tmp",
+			}
+			if err := db.UpsertGroup(ctx, &Group{ChatID: chatID, CWD: "/tmp"}); err != nil {
+				t.Fatalf("UpsertGroup: %v", err)
+			}
+			if err := db.CreateSession(ctx, sess); err != nil {
+				t.Fatalf("CreateSession: %v", err)
+			}
+
+			sc := NewSessionCleanup(db, &Sender{}, NewPTYManager(), 0, 0, false, 0)
+			if err := sc.MarkInactive(ctx, sess); err != nil {
+				t.Fatalf("MarkInactive returned error: %v", err)
+			}
+
+			stored, err := db.GetSession(ctx, chatID, threadID)
+			if err != nil {
+				t.Fatalf("GetSession: %v", err)
+			}
+			if stored == nil {
+				t.Fatal("GetSession returned nil")
+			}
+			if stored.Status != "inactive" {
+				t.Errorf("session status = %q, want inactive", stored.Status)
+			}
+
+			calls := tmux.tmuxCalls(t)
+			wantCall := "kill-window -t " + wantPaneTarget
+			if len(calls) != 1 || calls[0] != wantCall {
+				t.Errorf("tmux calls = %v, want [%q]", calls, wantCall)
+			}
+		})
+	}
+}
