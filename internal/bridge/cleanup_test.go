@@ -1,6 +1,10 @@
 package bridge
 
 import (
+	"bytes"
+	"context"
+	"log"
+	"strings"
 	"testing"
 	"time"
 )
@@ -268,5 +272,54 @@ func TestSessionCleanupZeroValues(t *testing.T) {
 	}
 	if sc.ptyMgr != nil {
 		t.Error("ptyMgr should be nil")
+	}
+}
+
+func TestSessionCleanupMarkInactiveKillPaneErrorIsNonFatal(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const chatID int64 = 987654321
+	const threadID int64 = 12345
+	sess := &Session{
+		ChatID:    chatID,
+		ThreadID:  threadID,
+		SessionID: "cleanup-session-error",
+		CWD:       "/tmp",
+	}
+	if err := db.UpsertGroup(ctx, &Group{ChatID: chatID, CWD: "/tmp"}); err != nil {
+		t.Fatalf("UpsertGroup: %v", err)
+	}
+	if err := db.CreateSession(ctx, sess); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// Prevent the test from killing a real tmux pane; this makes KillPane fail
+	// deterministically so the transaction behavior can be checked.
+	t.Setenv("PATH", t.TempDir())
+	var logs bytes.Buffer
+	previousLogWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousLogWriter) })
+
+	sc := NewSessionCleanup(db, &Sender{}, &PTYManager{}, 0, 0, false, 0)
+	if err := sc.MarkInactive(ctx, sess); err != nil {
+		t.Fatalf("MarkInactive returned error after KillPane failure: %v", err)
+	}
+
+	var status string
+	if err := db.db.QueryRowContext(ctx,
+		`SELECT status FROM sessions WHERE chat_id = ? AND thread_id = ?`, chatID, threadID).Scan(&status); err != nil {
+		t.Fatalf("query session status: %v", err)
+	}
+	if status != "inactive" {
+		t.Fatalf("session status = %q, want inactive", status)
+	}
+
+	logOutput := logs.String()
+	for _, want := range []string{"non-fatal", "failed to kill pane", "session_id=" + sess.SessionID, "executable file not found"} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("cleanup log does not contain %q: %s", want, logOutput)
+		}
 	}
 }

@@ -177,8 +177,8 @@ func (sc *SessionCleanup) MarkInactive(ctx context.Context, sess *Session) error
 	paneTarget := fmt.Sprintf("%s:%s", tmuxSessionName, paneName)
 	if err := sc.ptyMgr.KillPane(paneTarget); err != nil {
 		// Log but don't fail the transaction - the pane may already be dead
-		log.Printf("[cleanup] non-fatal: failed to kill pane for session (%d,%d): %v (pane may already be dead)",
-			sess.ChatID, sess.ThreadID, err)
+		log.Printf("[cleanup] non-fatal: failed to kill pane for session_id=%s (%d,%d): %v (pane may already be dead)",
+			sess.SessionID, sess.ChatID, sess.ThreadID, err)
 	} else {
 		log.Printf("[cleanup] killed pane for inactive session (%d,%d): %s",
 			sess.ChatID, sess.ThreadID, paneTarget)
