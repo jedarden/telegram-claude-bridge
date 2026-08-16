@@ -1753,13 +1753,13 @@ func TestSplitParallelPrompts_EmojiAtDelimiterBoundaries(t *testing.T) {
 			name:        "emoji adjacent to leading delimiter",
 			input:       "---\n🚀 launch\n---\n🔥 burn",
 			wantLen:     2,
-			wantPrompts: []string{"---\n🚀 launch", "🔥 burn"},
+			wantPrompts: []string{"🚀 launch", "🔥 burn"},
 		},
 		{
 			name:        "emoji adjacent to trailing delimiter",
 			input:       "🚀 launch\n---\n🔥 burn\n---",
 			wantLen:     2,
-			wantPrompts: []string{"🚀 launch", "🔥 burn\n---"},
+			wantPrompts: []string{"🚀 launch", "🔥 burn"},
 		},
 		{
 			name:        "emoji-only segment between consecutive delimiters",
