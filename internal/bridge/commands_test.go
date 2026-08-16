@@ -99,6 +99,54 @@ func TestSplitParallelPrompts(t *testing.T) {
 	}
 }
 
+func TestSplitParallelPrompts_ConsumesLineDelimiters(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "delimiter at beginning",
+			input: "---\ntext",
+			want:  []string{"text"},
+		},
+		{
+			name:  "delimiter at end",
+			input: "text\n---",
+			want:  []string{"text"},
+		},
+		{
+			name:  "spaces around delimiter",
+			input: "first\n --- \nsecond",
+			want:  []string{"first", "second"},
+		},
+		{
+			name:  "empty input",
+			input: "",
+			want:  nil,
+		},
+		{
+			name:  "bare delimiter is content",
+			input: "---",
+			want:  []string{"---"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := splitParallelPrompts(tc.input)
+			if len(got) != len(tc.want) {
+				t.Fatalf("splitParallelPrompts() returned %d prompts, want %d: %q", len(got), len(tc.want), got)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("prompt[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
 // ── Command Handler Setup ─────────────────────────────────────────────────────────────
 
 func newTestCommandHandler(t *testing.T, db *DB) *CommandHandler {

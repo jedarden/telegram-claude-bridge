@@ -2068,22 +2068,40 @@ func (h *CommandHandler) cmdParallel(ctx context.Context, update contract.Update
 	return fmt.Sprintf("Started %d parallel subtask(s)...", len(prompts)), nil
 }
 
-// splitParallelPrompts splits text by --- delimiter (surrounded by optional whitespace).
-// Empty prompts are filtered out. If no prompts remain, returns a single prompt with the trimmed original text.
+// splitParallelPrompts splits text by a --- line (with optional spaces around it).
+// Empty prompts are filtered out. A bare --- without a line break is content.
 func splitParallelPrompts(text string) []string {
-	// Split by --- on its own line (with optional surrounding whitespace)
-	parts := strings.Split(text, "\n---\n")
+	// A delimiter must be on a line of a multi-line input. This keeps a bare
+	// "---" prompt usable as content while consuming delimiters at either edge.
+	lines := strings.Split(text, "\n")
 	var prompts []string
-	for _, p := range parts {
-		prompt := strings.TrimSpace(p)
+	var currentPrompt []string
+	hasLineBreak := strings.Contains(text, "\n")
+
+	for _, line := range lines {
+		// Only spaces are accepted around the delimiter. In particular, a CRLF
+		// or tab-delimited lookalike is prompt content, not a separator.
+		if hasLineBreak && strings.Trim(line, " ") == "---" {
+			// Found a delimiter, save the current prompt if non-empty
+			prompt := strings.TrimSpace(strings.Join(currentPrompt, "\n"))
+			if prompt != "" {
+				prompts = append(prompts, prompt)
+			}
+			currentPrompt = nil
+			continue
+		}
+		// Not a delimiter, accumulate the line
+		currentPrompt = append(currentPrompt, line)
+	}
+
+	// Don't forget the last prompt
+	if len(currentPrompt) > 0 {
+		prompt := strings.TrimSpace(strings.Join(currentPrompt, "\n"))
 		if prompt != "" {
 			prompts = append(prompts, prompt)
 		}
 	}
-	// Fallback to single prompt if all parts were empty/whitespace
-	if len(prompts) == 0 && len(parts) > 0 {
-		return []string{strings.TrimSpace(text)}
-	}
+
 	return prompts
 }
 
