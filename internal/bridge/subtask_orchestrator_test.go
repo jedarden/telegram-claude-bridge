@@ -2590,6 +2590,431 @@ func TestSplitParallelPrompts_LengthLimitBoundaries(t *testing.T) {
 	}
 }
 
+// TestSplitParallelPrompts_ZeroWidthCharacters tests zero-width characters
+// including zero-width space (U+200B), zero-width non-joiner (U+200C), and
+// zero-width joiner (U+200D). These invisible characters must survive
+// splitting intact to preserve text rendering and formatting behavior.
+func TestSplitParallelPrompts_ZeroWidthCharacters(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+		verify      func([]string) bool
+	}{
+		{
+			name:        "zero-width space (U+200B) within text",
+			input:       "word​break​test\n---\nnext",
+			wantLen:     2,
+			wantPrompts: []string{"word​break​test", "next"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "​")
+			},
+		},
+		{
+			name:        "zero-width space at delimiter boundary",
+			input:       "test​\n---\n​start",
+			wantLen:     2,
+			wantPrompts: []string{"test​", "​start"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "​") && strings.Contains(prompts[1], "​")
+			},
+		},
+		{
+			name:        "zero-width non-joiner (U+200C) within text",
+			input:       "نَص‌عربي\n---\nnext",
+			wantLen:     2,
+			wantPrompts: []string{"نَص‌عربي", "next"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "‌")
+			},
+		},
+		{
+			name:        "zero-width non-joiner in Hindi text",
+			input:       "हिंदी‌पाठ\n---\nनमस्ते",
+			wantLen:     2,
+			wantPrompts: []string{"हिंदी‌पाठ", "नमस्ते"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "‌")
+			},
+		},
+		{
+			name:        "zero-width joiner (U+200D) outside emoji context",
+			input:       "test‍joined\n---\nnext",
+			wantLen:     2,
+			wantPrompts: []string{"test‍joined", "next"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "‍")
+			},
+		},
+		{
+			name:        "multiple zero-width characters in sequence",
+			input:       "a​‌‍b\n---\nc",
+			wantLen:     2,
+			wantPrompts: []string{"a​‌‍b", "c"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "​") &&
+					strings.Contains(prompts[0], "‌") &&
+					strings.Contains(prompts[0], "‍")
+			},
+		},
+		{
+			name:        "zero-width characters with emoji",
+			input:       "🚀​🔥\n---\n🎯‌🎉",
+			wantLen:     2,
+			wantPrompts: []string{"🚀​🔥", "🎯‌🎉"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "​") &&
+					strings.Contains(prompts[1], "‌")
+			},
+		},
+		{
+			name:        "zero-width characters in multilingual text",
+			input:       "English​日本语‌العربية\n---\nnext",
+			wantLen:     2,
+			wantPrompts: []string{"English​日本语‌العربية", "next"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "​") &&
+					strings.Contains(prompts[0], "‌")
+			},
+		},
+		{
+			name:        "zero-width characters survive long content",
+			input:       strings.Repeat("test", 1000) + "​‌‍\n---\nend",
+			wantLen:     2,
+			wantPrompts: []string{strings.Repeat("test", 1000) + "​‌‍", "end"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "​") &&
+					strings.Contains(prompts[0], "‌") &&
+					strings.Contains(prompts[0], "‍")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			if len(prompts) != tt.wantLen {
+				t.Errorf("got %d prompts, want %d", len(prompts), tt.wantLen)
+			}
+			if tt.wantPrompts != nil && len(prompts) > 0 {
+				for i, want := range tt.wantPrompts {
+					if i >= len(prompts) {
+						t.Errorf("expected prompt[%d] but got only %d prompts", i, len(prompts))
+						break
+					}
+					if prompts[i] != want {
+						t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
+					}
+				}
+			}
+			if tt.verify != nil && !tt.verify(prompts) {
+				t.Errorf("verification failed for prompts: %v", prompts)
+			}
+			for i, p := range prompts {
+				if !utf8.ValidString(p) {
+					t.Errorf("prompt[%d] = %q is not valid UTF-8", i, p)
+				}
+			}
+		})
+	}
+}
+
+// TestSplitParallelPrompts_KoreanHangul tests Korean text (Hangul) including
+// modern Hangul syllables, Jamo (consonant/vowel clusters), and mixed
+// Korean-ASCII content.
+func TestSplitParallelPrompts_KoreanHangul(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+		verify      func([]string) bool
+	}{
+		{
+			name:        "basic korean hangul syllables",
+			input:       "안녕하세요\n---\n반갑습니다\n---\n감사합니다",
+			wantLen:     3,
+			wantPrompts: []string{"안녕하세요", "반갑습니다", "감사합니다"},
+			verify: func(prompts []string) bool {
+				// Verify all Korean syllables are preserved
+				return utf8.RuneCountInString(prompts[0]) == 5 &&
+					utf8.RuneCountInString(prompts[1]) == 5 &&
+					utf8.RuneCountInString(prompts[2]) == 5
+			},
+		},
+		{
+			name:        "korean text with numbers",
+			input:       "테스트 123\n---\n결과 456",
+			wantLen:     2,
+			wantPrompts: []string{"테스트 123", "결과 456"},
+		},
+		{
+			name:        "korean with ascii words",
+			input:       "한글 Korean test\n---\nNext 다음 task",
+			wantLen:     2,
+			wantPrompts: []string{"한글 Korean test", "Next 다음 task"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "한글") &&
+					strings.Contains(prompts[1], "다음")
+			},
+		},
+		{
+			name:        "korean at delimiter boundaries",
+			input:       "안녕\n---\n하세요\n---\n반갑습니다",
+			wantLen:     3,
+			wantPrompts: []string{"안녕", "하세요", "반갑습니다"},
+		},
+		{
+			name:        "korean with emoji",
+			input:       "안녕하세요! 🇰🇷\n---\n반갑습니다 🎉\n---\n감사합니다 ❤️",
+			wantLen:     3,
+			wantPrompts: []string{"안녕하세요! 🇰🇷", "반갑습니다 🎉", "감사합니다 ❤️"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "안녕하세요") &&
+					strings.Contains(prompts[1], "반갑습니다") &&
+					strings.Contains(prompts[2], "감사합니다")
+			},
+		},
+		{
+			name:        "multiline korean text",
+			input:       "첫 번째 줄\n두 번째 줄\n---\n다음 텍스트",
+			wantLen:     2,
+			wantPrompts: []string{"첫 번째 줄\n두 번째 줄", "다음 텍스트"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "첫 번째") &&
+					strings.Contains(prompts[0], "\n")
+			},
+		},
+		{
+			name:        "korean technical terms with code",
+			input:       "Git 커밋 하기\n---\n코드 리뷰 `git diff`",
+			wantLen:     2,
+			wantPrompts: []string{"Git 커밋 하기", "코드 리뷰 `git diff`"},
+		},
+		{
+			name:        "korean programming terminology",
+			input:       "함수 Function 실행\n---\n배열 Array 정렬",
+			wantLen:     2,
+			wantPrompts: []string{"함수 Function 실행", "배열 Array 정렬"},
+		},
+		{
+			name:        "korean with other scripts",
+			input:       "한글 日本語 中文\n---\nEnglish 한국어 test",
+			wantLen:     2,
+			wantPrompts: []string{"한글 日本語 中文", "English 한국어 test"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "한글") &&
+					strings.Contains(prompts[0], "日本語") &&
+					strings.Contains(prompts[0], "中文") &&
+					strings.Contains(prompts[1], "한국어")
+			},
+		},
+		{
+			name:        "korean question and exclamation marks",
+			input:       "안녕하세요?\n---\n환영합니다!\n---\n감사합니다~",
+			wantLen:     3,
+			wantPrompts: []string{"안녕하세요?", "환영합니다!", "감사합니다~"},
+		},
+		{
+			name:        "long korean text preserved",
+			input:       strings.Repeat("한글 테스트", 100) + "\n---\nend",
+			wantLen:     2,
+			wantPrompts: []string{strings.Repeat("한글 테스트", 100), "end"},
+			verify: func(prompts []string) bool {
+				return strings.HasPrefix(prompts[0], "한글 테스트") && len(prompts[0]) > 1000
+			},
+		},
+		{
+			name:        "korean consonant jamo ᄀᄂᄃ",
+			input:       "ᄀᄂᄃ\n---\nᅡᅢᅣ",
+			wantLen:     2,
+			wantPrompts: []string{"ᄀᄂᄃ", "ᅡᅢᅣ"},
+		},
+		{
+			name:        "mixed jamo and syllables",
+			input:       "안녕하세요\n---\n반ᄀᆞᆸ습니다",
+			wantLen:     2,
+			wantPrompts: []string{"안녕하세요", "반ᄀᆞᆸ습니다"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			if len(prompts) != tt.wantLen {
+				t.Errorf("got %d prompts, want %d", len(prompts), tt.wantLen)
+			}
+			if tt.wantPrompts != nil && len(prompts) > 0 {
+				for i, want := range tt.wantPrompts {
+					if i >= len(prompts) {
+						t.Errorf("expected prompt[%d] but got only %d prompts", i, len(prompts))
+						break
+					}
+					if prompts[i] != want {
+						t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
+					}
+				}
+			}
+			if tt.verify != nil && !tt.verify(prompts) {
+				t.Errorf("verification failed for prompts: %v", prompts)
+			}
+			for i, p := range prompts {
+				if !utf8.ValidString(p) {
+					t.Errorf("prompt[%d] = %q is not valid UTF-8", i, p)
+				}
+				if strings.ContainsRune(p, utf8.RuneError) {
+					t.Errorf("prompt[%d] = %q contains the replacement character U+FFFD", i, p)
+				}
+			}
+		})
+	}
+}
+
+// TestSplitParallelPrompts_AdditionalCombiningMarks tests additional combining
+// diacritical marks beyond those already covered, including combining macron,
+// breve, diaeresis, cedilla, ogonek, and ring above in various scripts.
+func TestSplitParallelPrompts_AdditionalCombiningMarks(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantLen     int
+		wantPrompts []string
+		verify      func([]string) bool
+	}{
+		{
+			name:        "combining macron (āēīōū)",
+			input:       "ābēc̄dn\n---\nnext",
+			wantLen:     2,
+			wantPrompts: []string{"ābēc̄dn", "next"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "̄") // combining macron
+			},
+		},
+		{
+			name:        "combining breve (ăĭŏ)",
+			input:       "brevĕa tĕst\n---\nnext",
+			wantLen:     2,
+			wantPrompts: []string{"brevĕa tĕst", "next"},
+		},
+		{
+			name:        "combining diaeresis (äëïöü)",
+			input:       "Mädlėn's name\n---\nnaïve recäve",
+			wantLen:     2,
+			wantPrompts: []string{"Mädlėn's name", "naïve recäve"},
+		},
+		{
+			name:        "combining cedilla (çşţ)",
+			input:       "françois garçon\n---\ntest Romanian",
+			wantLen:     2,
+			wantPrompts: []string{"françois garçon", "test Romanian"},
+		},
+		{
+			name:        "combining ogonek (ąęįų)",
+			input:       "Polish język\n---\nnext test",
+			wantLen:     2,
+			wantPrompts: []string{"Polish język", "next test"},
+		},
+		{
+			name:        "combining ring above (åų)",
+			input:       "København Århus\n---\nnext test",
+			wantLen:     2,
+			wantPrompts: []string{"København Århus", "next test"},
+		},
+		{
+			name:        "combining tilde (ãñõ)",
+			input:       "añorance señor\n---\nõpalā",
+			wantLen:     2,
+			wantPrompts: []string{"añorance señor", "õpalā"},
+		},
+		{
+			name:        "combining dot above (żċ)",
+			input:       "Maltast żobb\n---\nnext",
+			wantLen:     2,
+			wantPrompts: []string{"Maltast żobb", "next"},
+		},
+		{
+			name:        "multiple combining marks on single character",
+			input:       "ā́n (macron + acute)\n---\nnext",
+			wantLen:     2,
+			wantPrompts: []string{"ā́n (macron + acute)", "next"},
+			verify: func(prompts []string) bool {
+				return strings.Contains(prompts[0], "̄") && strings.Contains(prompts[0], "́")
+			},
+		},
+		{
+			name:        "combining marks at delimiter boundaries",
+			input:       "năv\n---\nĭgăt\n---\nŭt",
+			wantLen:     3,
+			wantPrompts: []string{"năv", "ĭgăt", "ŭt"},
+		},
+		{
+			name:        "combining marks with emoji",
+			input:       "Test 🎯 with marks ē\n---\nNext 🚀",
+			wantLen:     2,
+			wantPrompts: []string{"Test 🎯 with marks ē", "Next 🚀"},
+		},
+		{
+			name:        "combining marks in multiple languages",
+			input:       "françois käse\n---\nnaïve võörk",
+			wantLen:     2,
+			wantPrompts: []string{"françois käse", "naïve võörk"},
+		},
+		{
+			name:        "combining caron (ščřž)",
+			input:       "Češki jězyk\n---\nPŕagůe",
+			wantLen:     2,
+			wantPrompts: []string{"Češki jězyk", "Pŕagůe"},
+		},
+		{
+			name:        "combining double acute (őű)",
+			input:       "Hungarian őű\n---\nnext",
+			wantLen:     2,
+			wantPrompts: []string{"Hungarian őű", "next"},
+		},
+		{
+			name:        "combining horn (ơư)",
+			input:       "Tiếng Việt ơ\n---\nđưà",
+			wantLen:     2,
+			wantPrompts: []string{"Tiếng Việt ơ", "đưà"},
+		},
+		{
+			name:        "combining hook above (ảỏ)",
+			input:       "Tiếng Việt ả\n---\nđỏ",
+			wantLen:     2,
+			wantPrompts: []string{"Tiếng Việt ả", "đỏ"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(tt.input)
+			if len(prompts) != tt.wantLen {
+				t.Errorf("got %d prompts, want %d", len(prompts), tt.wantLen)
+			}
+			if tt.wantPrompts != nil && len(prompts) > 0 {
+				for i, want := range tt.wantPrompts {
+					if i >= len(prompts) {
+						t.Errorf("expected prompt[%d] but got only %d prompts", i, len(prompts))
+						break
+					}
+					if prompts[i] != want {
+						t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
+					}
+				}
+			}
+			if tt.verify != nil && !tt.verify(prompts) {
+				t.Errorf("verification failed for prompts: %v", prompts)
+			}
+			for i, p := range prompts {
+				if !utf8.ValidString(p) {
+					t.Errorf("prompt[%d] = %q is not valid UTF-8", i, p)
+				}
+			}
+		})
+	}
+}
+
 // TestSplitParallelPrompts_MixedUnicodeASCII tests combinations of ASCII and
 // Unicode content within prompts and across delimiter boundaries. Verifies that
 // mixed scripts, emoji embedded in ASCII text, and alternating patterns are
