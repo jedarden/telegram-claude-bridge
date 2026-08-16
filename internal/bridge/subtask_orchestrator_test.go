@@ -2172,9 +2172,9 @@ func TestSplitParallelPrompts_ManyDelimitersInLongInput(t *testing.T) {
 			want:  []string{threeHuge[0], threeHuge[1]},
 		},
 		{
-			name:  "indented delimiters deep inside a long prompt do not split",
+			name:  "indented delimiters deep inside a long input split",
 			input: strings.Repeat("z", maxMessageLen) + "\n  ---  \n" + strings.Repeat("z", maxMessageLen),
-			want:  []string{strings.Repeat("z", maxMessageLen) + "\n  ---  \n" + strings.Repeat("z", maxMessageLen)},
+			want:  []string{strings.Repeat("z", maxMessageLen), strings.Repeat("z", maxMessageLen)},
 		},
 		{
 			name:  "long horizontal rules inside a long prompt do not split",
