@@ -1394,13 +1394,13 @@ func TestSplitParallelPrompts_UnicodeDelimiterBoundaries(t *testing.T) {
 			name:        "unicode content adjacent to leading delimiter",
 			input:       "---\nΓάμμα\n---\nΔέλτα",
 			wantLen:     2,
-			wantPrompts: []string{"---\nΓάμμα", "Δέλτα"},
+			wantPrompts: []string{"Γάμμα", "Δέλτα"},
 		},
 		{
 			name:        "unicode content adjacent to trailing delimiter",
 			input:       "Γάμμα\n---\nΔέλτα\n---",
 			wantLen:     2,
-			wantPrompts: []string{"Γάμμα", "Δέλτα\n---"},
+			wantPrompts: []string{"Γάμμα", "Δέλτα"},
 		},
 		{
 			name:        "unicode segment between consecutive delimiters",
