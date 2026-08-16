@@ -2,6 +2,8 @@
 Description=Telegram-Claude Bridge
 After=network-online.target
 Wants=network-online.target
+StartLimitBurst=3
+StartLimitIntervalSec=60
 
 [Service]
 Type=notify
@@ -11,8 +13,6 @@ ExecStart=/home/coding/telegram-claude-bridge/bin/bridge
 WorkingDirectory=/home/coding/telegram-claude-bridge
 Restart=on-failure
 RestartSec=5
-StartLimitBurst=3
-StartLimitIntervalSec=60
 ExecStopPost=/home/coding/telegram-claude-bridge/scripts/bridge-crash-alert.sh
 Environment=PATH=/home/coding/.local/bin:/home/coding/local/go/bin:/usr/bin:/bin
 Environment=HOME=/home/coding
