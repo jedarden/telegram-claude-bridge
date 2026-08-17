@@ -64,6 +64,17 @@ type PTYManager struct {
 	idleTimers map[string]*time.Timer // paneTarget → idle kill timer
 }
 
+// ResponseSource identifies which extraction path supplied a completed
+// response. The PTY path is still exercised before a stop-hook response can
+// be selected; the source is useful to diagnostics and canaries.
+type ResponseSource string
+
+const (
+	ResponseSourceUnknown  ResponseSource = "unknown"
+	ResponseSourceStopHook ResponseSource = "stop-hook"
+	ResponseSourcePTY      ResponseSource = "pty"
+)
+
 // NewPTYManager creates a new PTYManager.
 func NewPTYManager() *PTYManager {
 	return &PTYManager{
@@ -172,6 +183,13 @@ func (p *PTYManager) KillPane(paneTarget string) error {
 // Returns only when ❯ is visible with no dialog AND the screen has been stable
 // for screenIdleWindow — preventing false-positives from ❯ in old session history.
 func (p *PTYManager) WaitForStartup(paneTarget string) error {
+	return p.WaitForStartupContext(context.Background(), paneTarget)
+}
+
+// WaitForStartupContext is the context-aware form of WaitForStartup. It is
+// used by bounded health checks so a bridge shutdown or canary deadline cannot
+// leave a polling loop running until the normal startup timeout expires.
+func (p *PTYManager) WaitForStartupContext(ctx context.Context, paneTarget string) error {
 	const screenIdleWindow = 3 * time.Second
 
 	deadline := time.Now().Add(trustDialogTimeout + promptReadyTimeout)
@@ -180,6 +198,10 @@ func (p *PTYManager) WaitForStartup(paneTarget string) error {
 	lastChange := time.Now()
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("waiting for claude startup: %w", err)
+		}
+
 		screen, err := p.CaptureScreen(paneTarget)
 		if err == nil {
 			if screen != lastScreen {
@@ -215,7 +237,9 @@ func (p *PTYManager) WaitForStartup(paneTarget string) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timeout waiting for claude startup prompt")
 		}
-		time.Sleep(ptyPollInterval)
+		if err := waitWithContext(ctx, ptyPollInterval); err != nil {
+			return fmt.Errorf("waiting for claude startup: %w", err)
+		}
 	}
 }
 
@@ -277,6 +301,14 @@ func (p *PTYManager) CaptureScreen(paneTarget string) (string, error) {
 // When a stop-hook response file exists for this pane (written by bridge-stop-hook.sh),
 // its content is used as the authoritative final result in place of PTY extraction.
 func (p *PTYManager) WaitForResponse(ctx context.Context, paneTarget string, preInjectScreen string, onChunk func(text string)) (string, error) {
+	text, _, err := p.WaitForResponseWithSource(ctx, paneTarget, preInjectScreen, onChunk)
+	return text, err
+}
+
+// WaitForResponseWithSource is the source-reporting form of WaitForResponse.
+// It preserves the existing WaitForResponse API while allowing diagnostics to
+// tell whether the stop hook or PTY fallback supplied the final text.
+func (p *PTYManager) WaitForResponseWithSource(ctx context.Context, paneTarget string, preInjectScreen string, onChunk func(text string)) (string, ResponseSource, error) {
 	// Derive the pane name from the pane target ("telegram-bridge:t…" → "t…").
 	paneName := paneTarget
 	if idx := strings.LastIndex(paneTarget, ":"); idx >= 0 {
@@ -302,17 +334,19 @@ func (p *PTYManager) WaitForResponse(ctx context.Context, paneTarget string, pre
 	for {
 		select {
 		case <-ctx.Done():
-			return lastText, ctx.Err()
+			return lastText, ResponseSourceUnknown, ctx.Err()
 		default:
 		}
 
 		if !p.PaneAlive(paneTarget) {
-			return lastText, fmt.Errorf("pane died while waiting for response")
+			return lastText, ResponseSourceUnknown, fmt.Errorf("pane died while waiting for response")
 		}
 
 		screen, err := p.CaptureScreen(paneTarget)
 		if err != nil {
-			time.Sleep(ptyPollInterval)
+			if waitErr := waitWithContext(ctx, ptyPollInterval); waitErr != nil {
+				return lastText, ResponseSourceUnknown, waitErr
+			}
 			continue
 		}
 
@@ -323,9 +357,11 @@ func (p *PTYManager) WaitForResponse(ctx context.Context, paneTarget string, pre
 				lastScreen = screen
 				lastChange = time.Now()
 			} else if time.Now().After(preRespDeadline) {
-				return "", fmt.Errorf("timeout waiting for response start after %s", preRespTimeout)
+				return "", ResponseSourceUnknown, fmt.Errorf("timeout waiting for response start after %s", preRespTimeout)
 			}
-			time.Sleep(ptyPollInterval)
+			if waitErr := waitWithContext(ctx, ptyPollInterval); waitErr != nil {
+				return lastText, ResponseSourceUnknown, waitErr
+			}
 			continue
 		}
 
@@ -349,13 +385,27 @@ func (p *PTYManager) WaitForResponse(ctx context.Context, paneTarget string, pre
 			// Check for authoritative text from the stop hook.
 			if hookText, ok := readStopHookResponse(respFile, readyFile); ok {
 				log.Printf("[pty_mgr] WaitForResponse %s complete (stop-hook): text_len=%d idle=%v", paneTarget, len(hookText), idled)
-				return hookText, nil
+				return hookText, ResponseSourceStopHook, nil
 			}
 			log.Printf("[pty_mgr] WaitForResponse %s complete (pty): text_len=%d idle=%v", paneTarget, len(lastText), idled)
-			return lastText, nil
+			return lastText, ResponseSourcePTY, nil
 		}
 
-		time.Sleep(ptyPollInterval)
+		if waitErr := waitWithContext(ctx, ptyPollInterval); waitErr != nil {
+			return lastText, ResponseSourceUnknown, waitErr
+		}
+	}
+}
+
+// waitWithContext sleeps for d or returns when ctx is canceled.
+func waitWithContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

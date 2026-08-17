@@ -457,6 +457,67 @@ func TestPaneNaming_ParsePaneIdentifier(t *testing.T) {
 	}
 }
 
+func TestWaitForResponseWithSource(t *testing.T) {
+	t.Run("stop hook", func(t *testing.T) {
+		setupTmuxTest(t)
+		paneTarget := "telegram-bridge:source-stop-hook"
+		respFile := bridgeRespFile("source-stop-hook")
+		t.Cleanup(func() {
+			os.Remove(respFile)
+			os.Remove(respFile + ".ready")
+		})
+
+		go func() {
+			time.Sleep(25 * time.Millisecond)
+			_ = os.WriteFile(respFile, []byte("hook response"), 0o600)
+			_ = os.WriteFile(respFile+".ready", []byte("ready"), 0o600)
+		}()
+
+		got, source, err := NewPTYManager().WaitForResponseWithSource(context.Background(), paneTarget, "", nil)
+		if err != nil {
+			t.Fatalf("WaitForResponseWithSource() returned error: %v", err)
+		}
+		if got != "hook response" {
+			t.Errorf("response = %q, want %q", got, "hook response")
+		}
+		if source != ResponseSourceStopHook {
+			t.Errorf("source = %q, want %q", source, ResponseSourceStopHook)
+		}
+	})
+
+	t.Run("pty fallback", func(t *testing.T) {
+		setupTmuxTest(t)
+		paneTarget := "telegram-bridge:source-pty-fallback"
+		respFile := bridgeRespFile("source-pty-fallback")
+		t.Cleanup(func() {
+			os.Remove(respFile)
+			os.Remove(respFile + ".ready")
+		})
+
+		got, source, err := NewPTYManager().WaitForResponseWithSource(context.Background(), paneTarget, "", nil)
+		if err != nil {
+			t.Fatalf("WaitForResponseWithSource() returned error: %v", err)
+		}
+		if got != "Mock response\nMock response body" {
+			t.Errorf("response = %q, want PTY fixture response", got)
+		}
+		if source != ResponseSourcePTY {
+			t.Errorf("source = %q, want %q", source, ResponseSourcePTY)
+		}
+	})
+}
+
+func TestWaitForStartupContextCancellation(t *testing.T) {
+	setupTmuxTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := NewPTYManager().WaitForStartupContext(ctx, "telegram-bridge:startup-cancel")
+	if err == nil || !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("WaitForStartupContext() error = %v, want context canceled", err)
+	}
+}
+
 func TestIsUIChrome(t *testing.T) {
 	tests := []struct {
 		input    string

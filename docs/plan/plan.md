@@ -1677,7 +1677,7 @@ The bridge and proxy share a Go module (monorepo with `cmd/proxy/` and `cmd/brid
 | Token leak via Claude Code output | Bot token exposed | Impossible by design — token never reaches EX44 |
 | PTY screen scraping fragility | Response extraction breaks on claude UI changes | Pin sentinel characters (`●`, `────`) and test on each claude update; fall back to stop-hook file extraction |
 | tmux session missing on bridge restart | All warm panes lost | Expected and safe — dynamic model means panes are ephemeral; on next message the bridge does a cold resume via `--resume <session_id>`; no manual recovery needed |
-| claude interactive mode UI changes | Bracketed paste or startup behavior changes break injection | Keep PTY integration logic isolated in PTYManager; sentinel + timing constants are the fragile surface — document and test them |
+| claude interactive mode UI changes | Bracketed paste or startup behavior changes break injection | Keep PTY integration logic isolated in PTYManager; sentinel + timing constants are the fragile surface — document and test them; the bridge runs a bounded startup canary (and an optional periodic canary) that alerts `ADMIN_CHAT_ID` on extraction drift |
 
 ---
 

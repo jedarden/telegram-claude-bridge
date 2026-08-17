@@ -2,10 +2,15 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
-
 
 // TestRunCanaryTest_NoGroups verifies that the canary test handles the case
 // where no groups are configured gracefully.
@@ -44,14 +49,35 @@ func TestRunCanaryTest_NoGroups(t *testing.T) {
 // TestRunCanaryTest_SendsAlertOnFailure verifies that admin alerts are sent
 // when the canary test fails and ADMIN_CHAT_ID is configured.
 func TestRunCanaryTest_SendsAlertOnFailure(t *testing.T) {
+	var requestPath string
+	var requestBody struct {
+		ChatID   int64  `json:"chat_id"`
+		ThreadID *int64 `json:"thread_id"`
+		Text     string `json:"text"`
+	}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read alert request: %v", err)
+			return
+		}
+		if err := json.Unmarshal(body, &requestBody); err != nil {
+			t.Errorf("decode alert request: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"message_id":1}`))
+	}))
+	defer proxy.Close()
+
 	db, err := OpenDB(":memory:")
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
 
-	// Create a mock sender (we'll check if alert was sent)
-	sender, err := NewSender("http://fake-proxy", "")
+	sender, err := NewSender(proxy.URL, filepath.Join(t.TempDir(), "sender.db"))
 	if err != nil {
 		t.Fatalf("create sender: %v", err)
 	}
@@ -69,8 +95,18 @@ func TestRunCanaryTest_SendsAlertOnFailure(t *testing.T) {
 		t.Error("expected canary to fail")
 	}
 
-	// The alert should have been sent via the sender
-	// In a real test with a mock sender, we'd verify the SendToGeneral call
+	if requestPath != "/send" {
+		t.Errorf("alert request path = %q, want /send", requestPath)
+	}
+	if requestBody.ChatID != adminChatID {
+		t.Errorf("alert chat_id = %d, want %d", requestBody.ChatID, adminChatID)
+	}
+	if requestBody.ThreadID == nil || *requestBody.ThreadID != 1 {
+		t.Errorf("alert thread_id = %v, want General topic (1)", requestBody.ThreadID)
+	}
+	if !strings.Contains(requestBody.Text, "PTY Canary Test Failed") {
+		t.Errorf("alert text = %q, want canary failure text", requestBody.Text)
+	}
 }
 
 // TestCanaryResult_Fields verifies that all result fields are populated
@@ -179,4 +215,3 @@ func TestCanaryTest_NoAdminChat(t *testing.T) {
 
 	// No panic should occur (alert sending is skipped when adminChatID is 0)
 }
-

@@ -126,11 +126,13 @@ The proxy runs as a Docker container and has no host-level dependencies beyond a
 | `SESSION_TTL_HOURS` | `168` (7 days) | Age at which a session is considered stale |
 | `CLOSE_INACTIVE_TOPICS` | `false` | Close Telegram topics for stale sessions |
 | `ADMIN_USER_ID` | `0` | Bootstrap initial admin on startup |
-| `ADMIN_CHAT_ID` | `0` | Chat ID for crash-loop alerts (via ExecStopPost) |
+| `ADMIN_CHAT_ID` | `0` | Chat ID for crash-loop and PTY canary alerts |
 | `EVENT_PUBLISHING_ENABLED` | `false` | Enable dashboard Unix socket events |
 | `EVENT_SOCKET_PATH` | `/tmp/telegram-bridge-events.sock` | Dashboard socket path |
 | `MAX_GLOBAL_WORKERS` | `10` | Maximum concurrent `spawn_worker` Claude processes across all topics (`0` = disabled) |
 | `UPDATE_INTERVAL_MINUTES` | `5` | Self-update check interval (`0` = disabled) |
+| `CANARY_ENABLED` | `true` | Run the throwaway PTY/Claude drift check at startup |
+| `CANARY_INTERVAL_MINUTES` | `0` | Repeat the PTY canary periodically (`0` = startup only) |
 
 ---
 

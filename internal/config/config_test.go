@@ -392,6 +392,7 @@ func TestLoadBridgeConfig(t *testing.T) {
 			"SESSION_TTL_HOURS", "CLOSE_INACTIVE_TOPICS",
 			"ADMIN_USER_ID", "EVENT_PUBLISHING_ENABLED",
 			"EVENT_SOCKET_PATH", "MAX_GLOBAL_WORKERS", "GLOBAL_MAX_WORKERS",
+			"ADMIN_CHAT_ID", "CANARY_ENABLED", "CANARY_INTERVAL_MINUTES",
 		}
 		saved := make(map[string]string)
 		for _, e := range envs {
@@ -431,6 +432,9 @@ func TestLoadBridgeConfig(t *testing.T) {
 		os.Unsetenv("POLL_TIMEOUT")
 		os.Unsetenv("MAX_GLOBAL_WORKERS")
 		os.Unsetenv("GLOBAL_MAX_WORKERS")
+		os.Unsetenv("ADMIN_CHAT_ID")
+		os.Unsetenv("CANARY_ENABLED")
+		os.Unsetenv("CANARY_INTERVAL_MINUTES")
 
 		cfg, err := LoadBridgeConfig()
 		if err != nil {
@@ -459,6 +463,15 @@ func TestLoadBridgeConfig(t *testing.T) {
 		}
 		if cfg.GlobalMaxWorkers != 10 {
 			t.Errorf("GlobalMaxWorkers = %v, want %v", cfg.GlobalMaxWorkers, 10)
+		}
+		if cfg.AdminChatID != 0 {
+			t.Errorf("AdminChatID = %v, want 0", cfg.AdminChatID)
+		}
+		if !cfg.CanaryEnabled {
+			t.Error("CanaryEnabled = false, want true by default")
+		}
+		if cfg.CanaryIntervalMinutes != 0 {
+			t.Errorf("CanaryIntervalMinutes = %v, want 0", cfg.CanaryIntervalMinutes)
 		}
 	})
 
@@ -795,6 +808,30 @@ func TestLoadBridgeConfig(t *testing.T) {
 
 		if _, err := LoadBridgeConfig(); err == nil {
 			t.Error("LoadBridgeConfig() expected error for invalid MAX_GLOBAL_WORKERS")
+		}
+	})
+
+	t.Run("canary configuration", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		os.Setenv("PROXY_URL", "http://localhost:8080")
+		os.Setenv("ADMIN_CHAT_ID", "12345")
+		os.Setenv("CANARY_ENABLED", "yes")
+		os.Setenv("CANARY_INTERVAL_MINUTES", "30")
+
+		cfg, err := LoadBridgeConfig()
+		if err != nil {
+			t.Fatalf("LoadBridgeConfig() error = %v", err)
+		}
+		if cfg.AdminChatID != 12345 {
+			t.Errorf("AdminChatID = %v, want 12345", cfg.AdminChatID)
+		}
+		if !cfg.CanaryEnabled {
+			t.Error("CanaryEnabled = false, want true")
+		}
+		if cfg.CanaryIntervalMinutes != 30 {
+			t.Errorf("CanaryIntervalMinutes = %v, want 30", cfg.CanaryIntervalMinutes)
 		}
 	})
 }

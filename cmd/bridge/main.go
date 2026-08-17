@@ -154,13 +154,15 @@ func main() {
 			checker.LogInfo("canary_test_passed",
 				"duration_sec", canaryResult.DurationSec,
 				"stop_hook_ok", canaryResult.StopHookOK,
-				"pty_ok", canaryResult.PTYOK)
+				"pty_ok", canaryResult.PTYOK,
+				"extraction_source", canaryResult.Source)
 		} else {
 			checker.LogError("canary_test_failed",
 				"error", canaryResult.Error,
 				"duration_sec", canaryResult.DurationSec,
 				"stop_hook_ok", canaryResult.StopHookOK,
-				"pty_ok", canaryResult.PTYOK)
+				"pty_ok", canaryResult.PTYOK,
+				"extraction_source", canaryResult.Source)
 			// Log the failure but continue - the alert has already been sent
 		}
 
@@ -252,13 +254,15 @@ func runPeriodicCanary(ctx context.Context, sessionMgr *bridge.SessionManager, a
 				checker.LogInfo("periodic_canary_passed",
 					"duration_sec", result.DurationSec,
 					"stop_hook_ok", result.StopHookOK,
-					"pty_ok", result.PTYOK)
+					"pty_ok", result.PTYOK,
+					"extraction_source", result.Source)
 			} else {
 				checker.LogError("periodic_canary_failed",
 					"error", result.Error,
 					"duration_sec", result.DurationSec,
 					"stop_hook_ok", result.StopHookOK,
-					"pty_ok", result.PTYOK)
+					"pty_ok", result.PTYOK,
+					"extraction_source", result.Source)
 			}
 		case <-ctx.Done():
 			return
