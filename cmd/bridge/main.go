@@ -67,6 +67,7 @@ func main() {
 			CheckInterval: time.Duration(cfg.UpdateIntervalMinutes) * time.Minute,
 			Sender:        sender,
 			DB:            db,
+			BridgeDB:      db, // Pass bridge DB for persistent failure tracking
 			ProxyURL:      cfg.ProxyURL,
 			RunningCommit: CommitSHA,
 		})

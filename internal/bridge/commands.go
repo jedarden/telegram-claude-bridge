@@ -801,6 +801,18 @@ func (h *CommandHandler) checkUpdates(ctx context.Context) string {
 		return fmt.Sprintf("⚠️ Update check failed: %v", result.Error)
 	}
 	if !result.HasUpdate {
+		// Check for recent update failures to surface silent issues
+		failures, err := h.db.ListRecentUpdateFailures(ctx, 5, false)
+		if err == nil && len(failures) > 0 {
+			var sb strings.Builder
+			sb.WriteString("✅ No updates available\n\n")
+			sb.WriteString("⚠️ Recent update failures (last 5):\n")
+			for _, f := range failures {
+				since := time.Since(f.AttemptedAt).Round(time.Minute)
+				fmt.Fprintf(&sb, "  • %s — %s (%s ago)\n", f.ErrorType, f.ErrorMsg, since)
+			}
+			return sb.String()
+		}
 		return "✅ No updates available"
 	}
 	return fmt.Sprintf("📦 Update available: %s\n\nUse /update do to update now.", result.NewCommit[:8])

@@ -172,7 +172,16 @@ type ConversationMessage struct {
 	CreatedAt time.Time
 }
 
-const schemaVersion = 24
+// UpdateFailure represents a failed update check, persisted to surface silent updater failures.
+type UpdateFailure struct {
+	ID         int64     // Auto-increment ID
+	ErrorType  string    // 'build_failed', 'go_not_found', 'git_error', 'uncommitted_changes'
+	ErrorMsg   string    // Detailed error message
+	AttemptedAt time.Time // When the failure occurred
+	Resolved   bool      // Whether the failure has been resolved (success after failure)
+}
+
+const schemaVersion = 26
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -380,7 +389,31 @@ var migrations = []string{
 
 				CREATE INDEX IF NOT EXISTS idx_processed_updates_at
 					ON processed_updates (processed_at);`,
-	}
+
+				// Version 25 — add budget_alerts table for tracking one-time budget threshold alerts.
+				// Tracks which groups have already received alerts at 80% and 100% budget thresholds.
+				`CREATE TABLE IF NOT EXISTS budget_alerts (
+					chat_id      INTEGER NOT NULL,
+					threshold    INTEGER NOT NULL, -- 80 for 80%, 100 for 100%
+					alerted_at   TEXT NOT NULL DEFAULT (datetime('now')),
+					PRIMARY KEY (chat_id, threshold)
+				);
+
+				CREATE INDEX IF NOT EXISTS idx_budget_alerts_chat ON budget_alerts(chat_id);`,
+
+			// Version 26 — add update_failures table for tracking update check failures.
+			// Surfaces silent updater failures to operators via /status and /update commands.
+			`CREATE TABLE IF NOT EXISTS update_failures (
+				id         INTEGER PRIMARY KEY AUTOINCREMENT,
+				error_type TEXT NOT NULL,    -- 'build_failed', 'go_not_found', 'git_error', 'uncommitted_changes'
+				error_msg  TEXT NOT NULL,     -- detailed error message
+				attempted_at TEXT NOT NULL DEFAULT (datetime('now')),
+				resolved   INTEGER NOT NULL DEFAULT 0  -- 1 if resolved, 0 if still failing
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_update_failures_created_at ON update_failures(attempted_at);
+			CREATE INDEX IF NOT EXISTS idx_update_failures_resolved ON update_failures(resolved);`,
+		}
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
 // and applies any pending migrations.
 func OpenDB(path string) (*DB, error) {
@@ -1918,6 +1951,60 @@ func (d *DB) IsUpdateProcessed(ctx context.Context, updateID int64) (bool, error
 func (d *DB) MarkUpdateProcessed(ctx context.Context, updateID int64) error {
 	_, err := d.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO processed_updates (update_id) VALUES (?)`, updateID,
+	)
+	return err
+}
+
+// ── update_failures (persistent update failure tracking) ─────────────────────────────
+
+// RecordUpdateFailure records a failed update check. This surfaces silent updater
+// failures to operators via /status and /update commands instead of burying them
+// in journald logs where they're invisible to users.
+func (d *DB) RecordUpdateFailure(ctx context.Context, errorType, errorMsg string) error {
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO update_failures (error_type, error_msg, resolved) VALUES (?, ?, 0)`,
+		errorType, errorMsg,
+	)
+	return err
+}
+
+// ListRecentUpdateFailures returns the N most recent update failures, ordered
+// by attempted_at descending (newest first). Only returns unresolved failures
+// unless includeResolved is true.
+func (d *DB) ListRecentUpdateFailures(ctx context.Context, limit int, includeResolved bool) ([]*UpdateFailure, error) {
+	query := `SELECT id, error_type, error_msg, attempted_at, resolved
+		FROM update_failures`
+	if !includeResolved {
+		query += ` WHERE resolved = 0`
+	}
+	query += ` ORDER BY attempted_at DESC LIMIT ?`
+
+	rows, err := d.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var failures []*UpdateFailure
+	for rows.Next() {
+		f := &UpdateFailure{}
+		var attemptedAt string
+		var resolvedInt int
+		if err := rows.Scan(&f.ID, &f.ErrorType, &f.ErrorMsg, &attemptedAt, &resolvedInt); err != nil {
+			return nil, err
+		}
+		f.AttemptedAt, _ = time.Parse("2006-01-02T15:04:05Z", attemptedAt)
+		f.Resolved = resolvedInt != 0
+		failures = append(failures, f)
+	}
+	return failures, rows.Err()
+}
+
+// MarkUpdateFailuresResolved marks all unresolved update failures as resolved.
+// Called after a successful update to clear the failure state.
+func (d *DB) MarkUpdateFailuresResolved(ctx context.Context) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE update_failures SET resolved = 1 WHERE resolved = 0`,
 	)
 	return err
 }

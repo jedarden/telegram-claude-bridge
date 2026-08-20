@@ -54,6 +54,7 @@ type Updater struct {
 	db             *bridge.DB
 	proxyURL       string
 	runningCommit  string // CommitSHA embedded in the running binary (may be "unknown")
+	dbBridge       *bridge.DB // Bridge database for recording failures
 
 	// updateCh triggers an immediate update check (non-blocking send)
 	updateCh chan struct{}
@@ -80,6 +81,9 @@ type Config struct {
 	// DB is used to list groups for notifications
 	DB *bridge.DB
 
+	// BridgeDB is the bridge database for recording update failures (optional, for visibility)
+	BridgeDB *bridge.DB
+
 	// ProxyURL is the base URL of the proxy
 	ProxyURL string
 
@@ -100,6 +104,7 @@ func New(cfg *Config) *Updater {
 		checkInterval: cfg.CheckInterval,
 		sender:        cfg.Sender,
 		db:            cfg.DB,
+		dbBridge:      cfg.BridgeDB,
 		proxyURL:      cfg.ProxyURL,
 		runningCommit: cfg.RunningCommit,
 		updateCh:      make(chan struct{}, 1),
@@ -160,6 +165,7 @@ func (u *Updater) checkAndUpdate() {
 	// Check for uncommitted changes
 	if u.hasUncommittedChanges(ctx) {
 		log.Printf("[updater] skipping update: uncommitted changes in repo")
+		u.recordFailure(ctx, "uncommitted_changes", "Uncommitted changes in repository")
 		return
 	}
 
@@ -167,6 +173,7 @@ func (u *Updater) checkAndUpdate() {
 	newCommit, hasUpdate, err := u.fetchAndCompare(ctx)
 	if err != nil {
 		log.Printf("[updater] update check failed: %v", err)
+		u.recordFailure(ctx, "git_error", err.Error())
 		return
 	}
 	if !hasUpdate {
@@ -179,9 +186,13 @@ func (u *Updater) checkAndUpdate() {
 	// Build the new binary
 	if err := u.buildNewBinary(ctx); err != nil {
 		log.Printf("[updater] build failed: %v", err)
+		u.recordFailure(ctx, "build_failed", err.Error())
 		u.notifyBuildFailure(ctx, err)
 		return
 	}
+
+	// Mark any previous failures as resolved since we succeeded
+	u.markResolved(ctx)
 
 	// Send restart notifications to all groups
 	u.notifyRestarting(ctx)
@@ -790,5 +801,26 @@ func mustParseInt(s string) int64 {
 func jsonReader(v interface{}) *strings.Reader {
 	b, _ := json.Marshal(v)
 	return strings.NewReader(string(b))
+}
+
+// recordFailure records an update failure to the database for visibility.
+// Falls back to logging if the database is not available.
+func (u *Updater) recordFailure(ctx context.Context, errorType, errorMsg string) {
+	if u.dbBridge == nil {
+		return // No database configured, skip recording
+	}
+	if err := u.dbBridge.RecordUpdateFailure(ctx, errorType, errorMsg); err != nil {
+		log.Printf("[updater] failed to record update failure: %v", err)
+	}
+}
+
+// markResolved marks all unresolved update failures as resolved after a successful update.
+func (u *Updater) markResolved(ctx context.Context) {
+	if u.dbBridge == nil {
+		return // No database configured
+	}
+	if err := u.dbBridge.MarkUpdateFailuresResolved(ctx); err != nil {
+		log.Printf("[updater] failed to mark update failures resolved: %v", err)
+	}
 }
 
