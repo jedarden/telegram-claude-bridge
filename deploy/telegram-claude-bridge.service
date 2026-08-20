@@ -21,6 +21,7 @@ Environment=BINARY_PATH=bin/bridge
 Environment=PROXY_URL=http://telegram-proxy:8080
 Environment=UPDATE_INTERVAL_MINUTES=5
 Environment=ADMIN_CHAT_ID=0
+Environment=MAX_GLOBAL_WORKERS=30
 
 [Install]
 WantedBy=multi-user.target
