@@ -107,7 +107,9 @@ func TestParseCommand(t *testing.T) {
 	}
 }
 
-// ── generateJobID Tests ───────────────────────────────────────────────────────────
+// ── Test Helpers ─────────────────────────────────────────────────────────────────────
+
+// generateJobID Tests ───────────────────────────────────────────────────────────
 
 func TestGenerateJobID(t *testing.T) {
 	id1 := generateJobID()
@@ -367,8 +369,9 @@ func TestBackgroundJobManager_Kill(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// Wait for job to register
-	time.Sleep(100 * time.Millisecond)
+	// Wait for job to register and fully start (cmd.Start() needs time to complete)
+	// This prevents race where Kill() reads cmd.Process before Start() finishes writing it
+	time.Sleep(500 * time.Millisecond)
 
 	// Verify job exists
 	job, err := db.GetBackgroundJob(ctx, jobID)

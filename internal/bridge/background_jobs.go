@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -104,26 +105,26 @@ func (m *BackgroundJobManager) Start(ctx context.Context, chatID, threadID int64
 		return "", fmt.Errorf("create job record: %w", err)
 	}
 
-	// Track in memory
-	m.mu.Lock()
-	m.jobs[jobID] = job
-	m.cmds[jobID] = cmd
-	m.mu.Unlock()
-
 	// Start the job in a background goroutine
-	go m.runJob(ctx, job, cmd, stdout, stderr)
+	go m.runJob(ctx, job, cmd, stdout, stderr, jobID)
 
 	return jobID, nil
 }
 
 // runJob executes a background job, streams output, and handles completion.
-func (m *BackgroundJobManager) runJob(ctx context.Context, job *BackgroundJob, cmd *exec.Cmd, stdout, stderr interface{}) {
+func (m *BackgroundJobManager) runJob(ctx context.Context, job *BackgroundJob, cmd *exec.Cmd, stdout, stderr interface{}, jobID string) {
 	// Start the command
 	if err := cmd.Start(); err != nil {
 		log.Printf("[bg_jobs] job %s start failed: %v", job.ID, err)
 		m.handleJobCompletion(ctx, job, nil, fmt.Sprintf("Failed to start: %v", err))
 		return
 	}
+
+	// Track in memory AFTER Start() succeeds (prevents race on exec.Cmd struct)
+	m.mu.Lock()
+	m.jobs[jobID] = job
+	m.cmds[jobID] = cmd
+	m.mu.Unlock()
 
 	// Send initial notification
 	tidPtr := &job.ThreadID
@@ -136,27 +137,49 @@ func (m *BackgroundJobManager) runJob(ctx context.Context, job *BackgroundJob, c
 	outputLines := make(chan string, 100)
 	done := make(chan struct{})
 
+	// Use a WaitGroup to coordinate the two scanner goroutines
+	// They own outputLines and will close it when both finish
+	var scannersWg sync.WaitGroup
+	scannersWg.Add(2)
+
 	// Read stdout
 	go func() {
+		defer scannersWg.Done()
 		scanner := bufio.NewScanner(stdout.(interface{ Read([]byte) (int, error) }))
+		// Use a larger buffer to handle long lines (up to 1MB)
+		buf := make([]byte, 0, 1024*1024)
+		scanner.Buffer(buf, 1024*1024)
 		for scanner.Scan() {
 			outputLines <- scanner.Text()
+		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("[bg_jobs] job %s stdout scanner error: %v", job.ID, err)
 		}
 	}()
 
 	// Read stderr
 	go func() {
+		defer scannersWg.Done()
 		scanner := bufio.NewScanner(stderr.(interface{ Read([]byte) (int, error) }))
+		// Use a larger buffer to handle long lines (up to 1MB)
+		buf := make([]byte, 0, 1024*1024)
+		scanner.Buffer(buf, 1024*1024)
 		for scanner.Scan() {
 			outputLines <- scanner.Text()
 		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("[bg_jobs] job %s stderr scanner error: %v", job.ID, err)
+		}
 	}()
 
-	// Goroutine to close output channel when both pipes are done
+	// Goroutine to close output channel when both scanners finish, then wait for process
 	waitResult := make(chan error, 1)
 	go func() {
-		waitResult <- cmd.Wait()
+		// Wait for both scanners to finish reading all output
+		scannersWg.Wait()
+		// Now it's safe to close the channel and call Wait
 		close(outputLines)
+		waitResult <- cmd.Wait()
 		close(done)
 	}()
 
@@ -316,39 +339,55 @@ func (m *BackgroundJobManager) Kill(ctx context.Context, jobID string) error {
 	m.mu.Lock()
 	job, jobOk := m.jobs[jobID]
 	cmd, cmdOk := m.cmds[jobID]
+
+	// Capture the fields we need while holding the lock
+	var process *os.Process
+	var chatID int64
+	var threadID int64
+	var jobCopy BackgroundJob
+
+	if cmdOk && cmd != nil && cmd.Process != nil {
+		process = cmd.Process
+	}
+	if jobOk && job != nil {
+		chatID = job.ChatID
+		threadID = job.ThreadID
+		jobCopy = *job // Copy the job struct
+		job.Status = "interrupted"
+	}
+
+	// Remove from in-memory tracking while holding the lock
+	if jobOk {
+		delete(m.jobs, jobID)
+	}
+	if cmdOk {
+		delete(m.cmds, jobID)
+	}
 	m.mu.Unlock()
 
 	if !jobOk {
 		return fmt.Errorf("job %s not found or not running", jobID)
 	}
 
-	if !cmdOk || cmd == nil || cmd.Process == nil {
+	if process == nil {
 		return fmt.Errorf("job %s has no active process", jobID)
 	}
 
-	// Send SIGTERM
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	// Send SIGTERM (using captured process reference, no lock needed)
+	if err := process.Signal(syscall.SIGTERM); err != nil {
 		return fmt.Errorf("send signal to job %s: %w", jobID, err)
 	}
 
-	// Update job status immediately
-	job.Status = "interrupted"
-
 	// Update database
-	if err := m.db.UpdateBackgroundJob(ctx, job); err != nil {
+	jobCopy.Status = "interrupted"
+	if err := m.db.UpdateBackgroundJob(ctx, &jobCopy); err != nil {
 		log.Printf("[bg_jobs] update job %s after kill failed: %v", jobID, err)
 	}
 
-	// Remove from in-memory tracking
-	m.mu.Lock()
-	delete(m.jobs, jobID)
-	delete(m.cmds, jobID)
-	m.mu.Unlock()
-
 	// Send notification
-	tidPtr := &job.ThreadID
+	tidPtr := &threadID
 	msg := fmt.Sprintf("⚠️ Job `%s` killed", jobID)
-	if err := m.sender.SendResponse(ctx, job.ChatID, tidPtr, 0, msg); err != nil {
+	if err := m.sender.SendResponse(ctx, chatID, tidPtr, 0, msg); err != nil {
 		log.Printf("[bg_jobs] job %s send kill notification failed: %v", jobID, err)
 	}
 
