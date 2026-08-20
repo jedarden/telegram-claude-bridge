@@ -56,8 +56,8 @@ exit 1
 	}
 
 	// Only check for leaks if we're not in short mode and we have a real tmux
-	if verifyRealTmuxIsRunning(nil) {
-		windowCount := countTmuxWindows(nil)
+	if verifyRealTmuxIsRunning() {
+		windowCount := countTmuxWindows()
 		// The test suite should not leave any new windows
 		// We allow up to 5 for any existing windows from before the test run
 		if windowCount > 5 {
@@ -96,8 +96,7 @@ func TestPoisonedPath_VerifyGuard(t *testing.T) {
 
 // verifyRealTmuxIsRunning checks if there's a real tmux server running.
 // Returns true if tmux is available and has the telegram-bridge session.
-func verifyRealTmuxIsRunning(t *testing.T) bool {
-	t.Helper()
+func verifyRealTmuxIsRunning() bool {
 	// Check if tmux binary exists
 	if _, err := exec.LookPath("tmux"); err != nil {
 		return false
@@ -109,8 +108,7 @@ func verifyRealTmuxIsRunning(t *testing.T) bool {
 
 // countTmuxWindows counts windows in the telegram-bridge tmux session.
 // Returns 0 if tmux is not available or session doesn't exist.
-func countTmuxWindows(t *testing.T) int {
-	t.Helper()
+func countTmuxWindows() int {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		return 0
 	}
