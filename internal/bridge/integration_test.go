@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -423,6 +424,58 @@ func newIntegrationTestSender(t *testing.T) *Sender {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+// recordedSend captures one request the sender issued against the proxy.
+type recordedSend struct {
+	Path string
+	Body contract.SendRequest
+}
+
+// sendRecorder records every JSON request an httptest proxy receives.
+// It is safe for concurrent use: subtask goroutines may post results while a
+// test is asserting on earlier sends.
+type sendRecorder struct {
+	mu    sync.Mutex
+	sends []recordedSend
+}
+
+func (r *sendRecorder) add(s recordedSend) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sends = append(r.sends, s)
+}
+
+// all returns a copy of the recorded sends.
+func (r *sendRecorder) all() []recordedSend {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]recordedSend(nil), r.sends...)
+}
+
+// newRecordingProxy starts an httptest server that records every request body
+// it receives and replies OK. It stands in for the real proxy so tests can
+// assert on what the bridge actually sent. The returned sender points at it.
+func newRecordingProxy(t *testing.T) (*Sender, *sendRecorder) {
+	t.Helper()
+	rec := &sendRecorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body contract.SendRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		rec.add(recordedSend{Path: r.URL.Path, Body: body})
+		_ = json.NewEncoder(w).Encode(contract.SendResponse{OK: true, MessageID: 1})
+	}))
+	t.Cleanup(srv.Close)
+
+	s, err := NewSender(srv.URL, filepath.Join(t.TempDir(), "recording-sender.db"))
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s, rec
 }
 
 // newTestSessionManager creates a SessionManager for testing.
@@ -2446,13 +2499,26 @@ func TestCommandHandler_cmdParallel_NoSessionFound(t *testing.T) {
 		},
 	}
 
-	// No session created for this topic
-	_, err := h.cmdParallel(ctx, update, group, "test")
-	if err == nil {
-		t.Error("expected error when no session found, got nil")
+	// No session created for this topic. GetSession returns (nil, nil) for a
+	// missing session, so the handler proceeds with a nil parent session
+	// instead of failing.
+	reply, err := h.cmdParallel(ctx, update, group, "test")
+	if err != nil {
+		t.Fatalf("cmdParallel without session: %v", err)
 	}
-	if err != nil && !containsSubstring(err.Error(), "get session") {
-		t.Errorf("error = %q, want to contain 'get session'", err.Error())
+	if !containsSubstring(reply, "Started 1") {
+		t.Errorf("reply = %q, want to contain 'Started 1'", reply)
+	}
+
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 1 {
+		t.Fatalf("expected 1 subtask, got %d", len(subtasks))
+	}
+	if subtasks[0].SessionID != "" {
+		t.Errorf("subtask.SessionID = %q, want empty (no parent session exists)", subtasks[0].SessionID)
 	}
 }
 
@@ -2742,11 +2808,16 @@ func TestCommandHandler_cmdParallel_VeryLongPrompts(t *testing.T) {
 	if len(subtasks) != 2 {
 		t.Fatalf("expected 2 subtasks, got %d", len(subtasks))
 	}
-	if len(subtasks[0].Prompt) != len(longPrompt1) {
-		t.Errorf("first prompt stored length = %d, want %d (full prompt preserved)", len(subtasks[0].Prompt), len(longPrompt1))
+	// splitParallelPrompts trims surrounding whitespace from each prompt, and
+	// both repeated strings end with a trailing space, so the stored prompts
+	// are one byte shorter than the raw inputs.
+	wantLen1 := len(strings.TrimSpace(longPrompt1))
+	wantLen2 := len(strings.TrimSpace(longPrompt2))
+	if len(subtasks[0].Prompt) != wantLen1 {
+		t.Errorf("first prompt stored length = %d, want %d (full trimmed prompt preserved)", len(subtasks[0].Prompt), wantLen1)
 	}
-	if len(subtasks[1].Prompt) != len(longPrompt2) {
-		t.Errorf("second prompt stored length = %d, want %d (full prompt preserved)", len(subtasks[1].Prompt), len(longPrompt2))
+	if len(subtasks[1].Prompt) != wantLen2 {
+		t.Errorf("second prompt stored length = %d, want %d (full trimmed prompt preserved)", len(subtasks[1].Prompt), wantLen2)
 	}
 }
 
@@ -2886,6 +2957,422 @@ func TestCommandHandler_cmdParallel_SixPromptsExceedsLimit(t *testing.T) {
 	}
 	if len(subtasks) != 0 {
 		t.Errorf("expected 0 subtasks when exceeding limit, got %d", len(subtasks))
+	}
+}
+
+// parallelCommandUpdate builds a bot-command update for /parallel with a
+// well-formed bot_command entity, as the proxy would deliver it.
+func parallelCommandUpdate(chatID int64, threadID *int64, msgID int64, userID int64, text string) contract.Update {
+	return contract.Update{
+		UpdateID:  1,
+		Type:      "message",
+		ChatID:    chatID,
+		ThreadID:  threadID,
+		MessageID: msgID,
+		FromUser: contract.FromUser{
+			ID: userID,
+		},
+		Content: &contract.Content{
+			Type:     contract.ContentTypeText,
+			Text:     &text,
+			Entities: []contract.Entity{{Type: "bot_command", Offset: 0, Length: len("/parallel")}},
+		},
+	}
+}
+
+// TestCommandHandler_Handle_ParallelCommand_MultiplePrompts exercises the full
+// dispatch path: raw command text → Handle → cmdParallel → orchestrator.Run →
+// reply delivered to the proxy, subtasks persisted. It verifies arg extraction
+// from the multi-line command text and the wiring between handler, session
+// manager, and subtask orchestrator.
+func TestCommandHandler_Handle_ParallelCommand_MultiplePrompts(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		TimeoutSec:   300,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	session := &Session{
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "sess-dispatch",
+		CWD:       "/tmp/test",
+		Model:     "claude-sonnet-4-6",
+		Status:    "active",
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	sender, rec := newRecordingProxy(t)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	so := NewSubtaskOrchestrator(db, sender, sm)
+
+	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	h.SetSubtaskOrchestrator(so)
+
+	threadID := int64(10)
+	text := "/parallel Summarize file A\n---\nSummarize file B"
+	update := parallelCommandUpdate(100, &threadID, 777, 12345, text)
+
+	h.Handle(ctx, update, group)
+
+	// The handler's reply must reach the proxy /send endpoint addressed to
+	// the originating topic.
+	sends := rec.all()
+	var replySend *recordedSend
+	for i := range sends {
+		if containsSubstring(sends[i].Body.Text, "Started 2 parallel subtask(s)") {
+			replySend = &sends[i]
+			break
+		}
+	}
+	if replySend == nil {
+		t.Fatalf("no /send request contained the parallel start reply; sends = %+v", sends)
+	}
+	if replySend.Path != "/send" {
+		t.Errorf("reply path = %q, want /send", replySend.Path)
+	}
+	if replySend.Body.ChatID != 100 {
+		t.Errorf("reply ChatID = %d, want 100", replySend.Body.ChatID)
+	}
+	if replySend.Body.ThreadID == nil || *replySend.Body.ThreadID != 10 {
+		t.Errorf("reply ThreadID = %v, want 10", replySend.Body.ThreadID)
+	}
+
+	// Both prompts must be persisted as running subtasks linked to the topic
+	// session, attributed to the spawning message.
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 2 {
+		t.Fatalf("expected 2 subtasks, got %d", len(subtasks))
+	}
+	prompts := map[string]bool{}
+	for _, st := range subtasks {
+		prompts[st.Prompt] = true
+		if st.SessionID != "sess-dispatch" {
+			t.Errorf("subtask SessionID = %q, want 'sess-dispatch'", st.SessionID)
+		}
+		if st.ParentMsgID != 777 {
+			t.Errorf("subtask ParentMsgID = %d, want 777", st.ParentMsgID)
+		}
+		if st.Status != "running" {
+			t.Errorf("subtask Status = %q, want 'running'", st.Status)
+		}
+	}
+	if !prompts["Summarize file A"] || !prompts["Summarize file B"] {
+		t.Errorf("stored prompts = %v, want both split prompts", prompts)
+	}
+}
+
+// TestCommandHandler_Handle_ParallelCommand_NoArgs_UsageSent verifies that a
+// bare /parallel routed through Handle produces the usage reply (delivered via
+// the proxy) and spawns no subtasks.
+func TestCommandHandler_Handle_ParallelCommand_NoArgs_UsageSent(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender, rec := newRecordingProxy(t)
+	so := NewSubtaskOrchestrator(db, sender, newTestSessionManager(t, db, sender))
+
+	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	h.SetSubtaskOrchestrator(so)
+
+	threadID := int64(10)
+	update := parallelCommandUpdate(100, &threadID, 1000, 12345, "/parallel")
+
+	h.Handle(ctx, update, group)
+
+	sends := rec.all()
+	if len(sends) != 1 {
+		t.Fatalf("expected 1 send, got %d: %+v", len(sends), sends)
+	}
+	if !containsSubstring(sends[0].Body.Text, "Usage:") {
+		t.Errorf("reply = %q, want to contain 'Usage:'", sends[0].Body.Text)
+	}
+	if !containsSubstring(sends[0].Body.Text, "Up to 5 prompts") {
+		t.Errorf("reply = %q, want to contain 'Up to 5 prompts'", sends[0].Body.Text)
+	}
+
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 0 {
+		t.Errorf("expected 0 subtasks for usage reply, got %d", len(subtasks))
+	}
+}
+
+// TestRouter_ParallelCommand_UnauthorizedUserDropped verifies the security
+// boundary in front of /parallel: a user absent from allowed_users is dropped
+// by the router before any command handler runs — nothing is sent and no
+// subtasks are created.
+func TestRouter_ParallelCommand_UnauthorizedUserDropped(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender, rec := newRecordingProxy(t)
+	so := NewSubtaskOrchestrator(db, sender, newTestSessionManager(t, db, sender))
+	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	h.SetSubtaskOrchestrator(so)
+
+	handled := false
+	router := NewRouter(db, nil)
+	router.OnCommand = func(ctx context.Context, update contract.Update, group *Group) {
+		handled = true
+		h.Handle(ctx, update, group)
+	}
+
+	// User 12345 is not in allowed_users.
+	update := parallelCommandUpdate(100, nil, 1000, 12345, "/parallel do work")
+	router.Route(ctx, update)
+
+	if handled {
+		t.Error("OnCommand fired for unauthorized user; router must drop the update first")
+	}
+	if sends := rec.all(); len(sends) != 0 {
+		t.Errorf("expected 0 sends for unauthorized user, got %d: %+v", len(sends), sends)
+	}
+	subtasks, err := db.ListSubtasks(ctx, 100, 1)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 0 {
+		t.Errorf("expected 0 subtasks for unauthorized user, got %d", len(subtasks))
+	}
+}
+
+// TestRouter_ParallelCommand_AllowedNonAdminUserDispatched verifies that an
+// allow-listed user with the non-admin "user" role reaches the command handler:
+// /parallel has no admin gate of its own (unlike e.g. /cwd <path>). Sent from
+// the General topic, it hits the topic-session guard and the guard reply is
+// delivered through the proxy.
+func TestRouter_ParallelCommand_AllowedNonAdminUserDispatched(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	// Allow-listed, but not an admin.
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 12345, Role: "user"}); err != nil {
+		t.Fatalf("upsert allowed user: %v", err)
+	}
+	isAdmin, err := db.IsUserAdmin(ctx, 12345)
+	if err != nil {
+		t.Fatalf("IsUserAdmin: %v", err)
+	}
+	if isAdmin {
+		t.Fatal("sanity check failed: user 12345 should have the non-admin role")
+	}
+
+	sender, rec := newRecordingProxy(t)
+	so := NewSubtaskOrchestrator(db, sender, newTestSessionManager(t, db, sender))
+	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	h.SetSubtaskOrchestrator(so)
+
+	handled := false
+	router := NewRouter(db, nil)
+	router.OnCommand = func(ctx context.Context, update contract.Update, group *Group) {
+		handled = true
+		h.Handle(ctx, update, group)
+	}
+
+	// General topic (nil thread ID) — the handler's topic-session guard fires.
+	update := parallelCommandUpdate(100, nil, 1000, 12345, "/parallel do work")
+	router.Route(ctx, update)
+
+	if !handled {
+		t.Fatal("OnCommand did not fire for allow-listed non-admin user")
+	}
+	sends := rec.all()
+	if len(sends) != 1 {
+		t.Fatalf("expected 1 send, got %d: %+v", len(sends), sends)
+	}
+	if !containsSubstring(sends[0].Body.Text, "topic session") {
+		t.Errorf("reply = %q, want to contain 'topic session'", sends[0].Body.Text)
+	}
+	subtasks, err := db.ListSubtasks(ctx, 100, 1)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 0 {
+		t.Errorf("expected 0 subtasks from General topic guard, got %d", len(subtasks))
+	}
+}
+
+// TestCommandHandler_cmdParallel_NonAdminUserAllowed verifies that a
+// non-admin, allow-listed user can start parallel subtasks from within a
+// topic session — /parallel is not restricted to admins.
+func TestCommandHandler_cmdParallel_NonAdminUserAllowed(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		TimeoutSec:   300,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	session := &Session{
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "sess-nonadmin",
+		CWD:       "/tmp/test",
+		Model:     "claude-sonnet-4-6",
+		Status:    "active",
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 777, Role: "user"}); err != nil {
+		t.Fatalf("upsert allowed user: %v", err)
+	}
+	isAdmin, err := db.IsUserAdmin(ctx, 777)
+	if err != nil {
+		t.Fatalf("IsUserAdmin: %v", err)
+	}
+	if isAdmin {
+		t.Fatal("sanity check failed: user 777 should have the non-admin role")
+	}
+
+	sender := newIntegrationTestSender(t)
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	so := NewSubtaskOrchestrator(db, sender, sm)
+
+	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	h.SetSubtaskOrchestrator(so)
+
+	threadID := int64(10)
+	text := "/parallel What is 2+2?"
+	update := contract.Update{
+		ChatID:    100,
+		ThreadID:  &threadID,
+		MessageID: 1000,
+		FromUser: contract.FromUser{
+			ID: 777, // non-admin user
+		},
+		Content: &contract.Content{
+			Text: &text,
+		},
+	}
+
+	reply, err := h.cmdParallel(ctx, update, group, "What is 2+2?")
+	if err != nil {
+		t.Fatalf("cmdParallel as non-admin user: %v", err)
+	}
+	if !containsSubstring(reply, "Started 1") {
+		t.Errorf("reply = %q, want to contain 'Started 1'", reply)
+	}
+
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 1 {
+		t.Fatalf("expected 1 subtask, got %d", len(subtasks))
+	}
+	if subtasks[0].SessionID != "sess-nonadmin" {
+		t.Errorf("subtask.SessionID = %q, want 'sess-nonadmin'", subtasks[0].SessionID)
+	}
+}
+
+// TestCommandHandler_cmdParallel_WhitespaceOnlyArgs covers the invalid-syntax
+// case where args are non-empty but contain no prompts after splitting: the
+// handler replies "No prompts found" and never reaches the orchestrator.
+func TestCommandHandler_cmdParallel_WhitespaceOnlyArgs(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{
+		ChatID:       100,
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender := newIntegrationTestSender(t)
+	so := NewSubtaskOrchestrator(db, sender, newTestSessionManager(t, db, sender))
+
+	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	h.SetSubtaskOrchestrator(so)
+
+	threadID := int64(10)
+	update := contract.Update{
+		ChatID:    100,
+		ThreadID:  &threadID,
+		MessageID: 1000,
+		FromUser: contract.FromUser{
+			ID: 12345,
+		},
+	}
+
+	reply, err := h.cmdParallel(ctx, update, group, "\n   \n\t\n")
+	if err != nil {
+		t.Fatalf("cmdParallel with whitespace-only args: %v", err)
+	}
+	if !containsSubstring(reply, "No prompts found") {
+		t.Errorf("reply = %q, want to contain 'No prompts found'", reply)
+	}
+
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 0 {
+		t.Errorf("expected 0 subtasks for whitespace-only args, got %d", len(subtasks))
 	}
 }
 
@@ -3814,7 +4301,9 @@ func TestCommandHandler_cmdParallel_GetSessionError(t *testing.T) {
 		t.Fatalf("upsert group: %v", err)
 	}
 
-	// Don't create a session - GetSession will return error
+	// Don't create a session. A missing session alone does NOT make GetSession
+	// fail (it returns nil, nil), so close the database to force a real
+	// lookup error and exercise the handler's error branch.
 
 	sender := newIntegrationTestSender(t)
 	so := NewSubtaskOrchestrator(db, sender, newTestSessionManager(t, db, sender))
@@ -3832,11 +4321,15 @@ func TestCommandHandler_cmdParallel_GetSessionError(t *testing.T) {
 		},
 	}
 
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
 	_, err := h.cmdParallel(ctx, update, group, "test")
 	if err == nil {
-		t.Error("expected error when GetSession fails, got nil")
+		t.Fatal("expected error when GetSession fails, got nil")
 	}
-	if err != nil && !containsSubstring(err.Error(), "get session") {
+	if !containsSubstring(err.Error(), "get session") {
 		t.Errorf("error = %q, want to contain 'get session'", err.Error())
 	}
 }
@@ -4039,6 +4532,19 @@ func TestCommandHandler_cmdParallel_SessionDifferentChatID(t *testing.T) {
 		t.Fatalf("upsert group: %v", err)
 	}
 
+	// The sessions table has a foreign key on chat_id, so the chat-999 group
+	// must exist before a session for it can be created.
+	otherGroup := &Group{
+		ChatID:       999,
+		CWD:          "/tmp/test-999",
+		DefaultModel: "claude-sonnet-4-6",
+		MaxSubtasks:  5,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, otherGroup); err != nil {
+		t.Fatalf("upsert group 999: %v", err)
+	}
+
 	// Create a session for a different chat ID
 	session := &Session{
 		ChatID:    999, // Different chat ID
@@ -4053,7 +4559,8 @@ func TestCommandHandler_cmdParallel_SessionDifferentChatID(t *testing.T) {
 	}
 
 	sender := newIntegrationTestSender(t)
-	so := NewSubtaskOrchestrator(db, sender, newTestSessionManager(t, db, sender))
+	sm := newTestSessionManagerWithTmux(t, db, sender)
+	so := NewSubtaskOrchestrator(db, sender, sm)
 
 	h := NewCommandHandler(db, sender, "http://fake.test", nil, nil, "v1.0.0", "abc123", "2024-01-01")
 	h.SetSubtaskOrchestrator(so)
@@ -4068,11 +4575,25 @@ func TestCommandHandler_cmdParallel_SessionDifferentChatID(t *testing.T) {
 		},
 	}
 
-	// GetSession should return session for chat 100, thread 10
-	// Since we only created a session for chat 999, this should return nil/error
-	_, err := h.cmdParallel(ctx, update, group, "test")
-	if err == nil {
-		t.Error("expected error when session not found for chat, got nil")
+	// GetSession(100, 10) finds no row — the chat-999 session must not be
+	// picked up — so the handler proceeds with a nil parent session.
+	reply, err := h.cmdParallel(ctx, update, group, "test")
+	if err != nil {
+		t.Fatalf("cmdParallel: %v", err)
+	}
+	if !containsSubstring(reply, "Started 1") {
+		t.Errorf("reply = %q, want to contain 'Started 1'", reply)
+	}
+
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 1 {
+		t.Fatalf("expected 1 subtask, got %d", len(subtasks))
+	}
+	if subtasks[0].SessionID != "" {
+		t.Errorf("subtask.SessionID = %q, want empty (chat-999 session must not leak into chat 100)", subtasks[0].SessionID)
 	}
 }
 
