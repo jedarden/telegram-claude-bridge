@@ -39,7 +39,7 @@ func TestLoadProxyConfig(t *testing.T) {
 	saveEnv := func() map[string]string {
 		envs := []string{
 			"BOT_TOKEN", "TELEGRAM_TOKEN", "PROXY_LISTEN_ADDR",
-			"PROXY_DB_PATH", "OFFSET_FILE_PATH", "POLL_TIMEOUT",
+			"OFFSET_FILE_PATH", "POLL_TIMEOUT",
 			"OPENBAO_ADDR", "OPENBAO_TOKEN", "OPENBAO_SECRET_PATH", "OPENBAO_SECRET_KEY",
 		}
 		saved := make(map[string]string)
@@ -120,9 +120,6 @@ func TestLoadProxyConfig(t *testing.T) {
 		if cfg.ListenAddr != ":8080" {
 			t.Errorf("ListenAddr = %v, want %v", cfg.ListenAddr, ":8080")
 		}
-		if cfg.DBPath != "proxy.db" {
-			t.Errorf("DBPath = %v, want %v", cfg.DBPath, "proxy.db")
-		}
 		if cfg.OffsetFilePath != "/data/offset.json" {
 			t.Errorf("OffsetFilePath = %v, want %v", cfg.OffsetFilePath, "/data/offset.json")
 		}
@@ -137,7 +134,6 @@ func TestLoadProxyConfig(t *testing.T) {
 
 		os.Setenv("BOT_TOKEN", "test_token")
 		os.Setenv("PROXY_LISTEN_ADDR", ":9090")
-		os.Setenv("PROXY_DB_PATH", "custom.db")
 		os.Setenv("OFFSET_FILE_PATH", "/custom/offset.json")
 
 		cfg, err := LoadProxyConfig()
@@ -146,9 +142,6 @@ func TestLoadProxyConfig(t *testing.T) {
 		}
 		if cfg.ListenAddr != ":9090" {
 			t.Errorf("ListenAddr = %v, want %v", cfg.ListenAddr, ":9090")
-		}
-		if cfg.DBPath != "custom.db" {
-			t.Errorf("DBPath = %v, want %v", cfg.DBPath, "custom.db")
 		}
 		if cfg.OffsetFilePath != "/custom/offset.json" {
 			t.Errorf("OffsetFilePath = %v, want %v", cfg.OffsetFilePath, "/custom/offset.json")

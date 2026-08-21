@@ -24,10 +24,8 @@ type ProxyConfig struct {
 	// PollTimeout is the Telegram long-poll timeout in seconds (default: 30).
 	PollTimeout int
 
-	// DBPath is the path to the SQLite database file.
-	DBPath string
-
-	// OffsetFilePath is the path to persist the Telegram polling offset.
+	// OffsetFilePath is the path to the JSON state file persisting the Telegram
+	// polling offset and retained unacked updates.
 	// If empty, offset is not persisted and will be lost on restart.
 	OffsetFilePath string
 
@@ -185,7 +183,6 @@ func fetchOpenBaoSecret(addr, token, secretPath, secretKey string) (string, erro
 func LoadProxyConfig() (*ProxyConfig, error) {
 	cfg := &ProxyConfig{
 		ListenAddr:     envOrDefault("PROXY_LISTEN_ADDR", ":8080"),
-		DBPath:         envOrDefault("PROXY_DB_PATH", "proxy.db"),
 		OffsetFilePath: envOrDefault("OFFSET_FILE_PATH", "/data/offset.json"),
 		PollTimeout:    30,
 	}

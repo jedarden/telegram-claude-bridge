@@ -8,7 +8,7 @@ A bridge that connects a Telegram bot to [Claude Code](https://github.com/anthro
 
 The system is split into two processes:
 
-**Proxy** — A lightweight container that holds the Telegram bot token, long-polls the Telegram `getUpdates` endpoint, and exposes an internal HTTP API (`/updates`, `/send`, `/edit`, etc.) for the bridge to consume. It holds no session state. Update delivery mirrors Telegram's own offset protocol: the proxy acknowledges updates to Telegram as soon as they arrive, but keeps its copy in a retained buffer and re-delivers everything in that buffer on every `GET /updates` call until the bridge acknowledges it. The bridge sends `?ack=<update_id>` — the highest update_id it has durably recorded in its SQLite dedup table — and the proxy discards only the updates covered by that ack; anything the bridge fetched but never acked (crash mid-request, restart, deploy) is simply delivered again, and the bridge's deduplication absorbs the overlap. The retained buffer is bounded (10,000 updates by default; when the cap is exceeded during a bridge outage the oldest updates are dropped and logged — they are already acknowledged to Telegram and cannot be recovered, the cap exists to bound proxy memory) and is persisted alongside the Telegram offset, so it survives a proxy restart.
+**Proxy** — A lightweight container that holds the Telegram bot token, long-polls the Telegram `getUpdates` endpoint, and exposes an internal HTTP API (`/updates`, `/send`, `/edit`, etc.) for the bridge to consume. It holds no session state — its only persisted state is the Telegram polling offset and the retained update buffer, both kept in a JSON file (`OFFSET_FILE_PATH`, default `/data/offset.json`). Update delivery mirrors Telegram's own offset protocol: the proxy acknowledges updates to Telegram as soon as they arrive, but keeps its copy in a retained buffer and re-delivers everything in that buffer on every `GET /updates` call until the bridge acknowledges it. The bridge sends `?ack=<update_id>` — the highest update_id it has durably recorded in its SQLite dedup table — and the proxy discards only the updates covered by that ack; anything the bridge fetched but never acked (crash mid-request, restart, deploy) is simply delivered again, and the bridge's deduplication absorbs the overlap. The retained buffer is bounded (10,000 updates by default; when the cap is exceeded during a bridge outage the oldest updates are dropped and logged — they are already acknowledged to Telegram and cannot be recovered, the cap exists to bound proxy memory) and is persisted alongside the Telegram offset, so it survives a proxy restart.
 
 **Bridge** — The stateful brain, running as a systemd service on the bare-metal host. It polls the proxy, manages Claude Code sessions, spawns `claude` inside tmux panes (one pane per forum topic), streams responses back via the proxy, and stores session metadata in a local SQLite database.
 
@@ -111,7 +111,7 @@ The proxy runs as a Docker container and has no host-level dependencies beyond a
 |----------|---------|-------------|
 | `BOT_TOKEN` (or `TELEGRAM_TOKEN`) | — | **Required.** Telegram bot token. |
 | `PROXY_LISTEN_ADDR` | `:8080` | HTTP listen address |
-| `PROXY_DB_PATH` | `proxy.db` | SQLite DB path for offset tracking |
+| `OFFSET_FILE_PATH` | `/data/offset.json` | JSON state file for the Telegram polling offset and retained unacked updates; the path must be writable or the offset is lost on restart |
 | `POLL_TIMEOUT` | `30` | Telegram long-poll timeout (seconds) |
 
 ### Bridge environment variables
@@ -217,7 +217,7 @@ The resulting Docker image is scratch-based and approximately 5 MB.
 
 ### Proxy (Docker container)
 
-The proxy runs as a stateless container. It only needs the bot token and a writable path for its offset-tracking database.
+The proxy runs as a stateless container. It only needs the bot token and a writable path for its offset file (`OFFSET_FILE_PATH`, default `/data/offset.json`).
 
 ```yaml
 # Example docker-compose snippet
@@ -227,7 +227,7 @@ services:
     environment:
       BOT_TOKEN: "<your-telegram-bot-token>"
       PROXY_LISTEN_ADDR: ":8080"
-      PROXY_DB_PATH: "/data/proxy.db"
+      OFFSET_FILE_PATH: "/data/offset.json"
     volumes:
       - ./proxy-data:/data
     ports:
