@@ -7,8 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -5876,5 +5878,213 @@ func TestWorkerPool_DB_MultipleStateTransitions(t *testing.T) {
 	}
 	if finishedAtDiff > time.Second {
 		t.Logf("Note: FinishedAt changed by %v between transitions (first: %v, second: %v)", finishedAtDiff, *firstFinishedAt, *retrieved.FinishedAt)
+	}
+}
+
+// ── processBatch outbound media Integration Tests ─────────────────────────────────
+
+// recordedMediaSend captures one multipart media request (photo or document)
+// the sender issued against the proxy.
+type recordedMediaSend struct {
+	Path     string // "/send_photo" or "/send_document"
+	ChatID   string
+	ThreadID string
+	Filename string
+	Content  []byte
+}
+
+// mediaRecorder records multipart media requests. It is safe for concurrent
+// use: the topic worker goroutine posts media while other sends are in flight.
+type mediaRecorder struct {
+	mu    sync.Mutex
+	sends []recordedMediaSend
+}
+
+func (r *mediaRecorder) add(s recordedMediaSend) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sends = append(r.sends, s)
+}
+
+// all returns a copy of every recorded media send.
+func (r *mediaRecorder) all() []recordedMediaSend {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]recordedMediaSend(nil), r.sends...)
+}
+
+// byPath returns the recorded sends for one proxy endpoint.
+func (r *mediaRecorder) byPath(path string) []recordedMediaSend {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []recordedMediaSend
+	for _, s := range r.sends {
+		if s.Path == path {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// newMediaRecordingProxy stands up an httptest proxy that accepts every JSON
+// endpoint the bridge uses and records multipart /send_photo and
+// /send_document uploads. It returns a real Sender pointed at it.
+func newMediaRecordingProxy(t *testing.T) (*Sender, *mediaRecorder) {
+	t.Helper()
+	rec := &mediaRecorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/send_photo" || r.URL.Path == "/send_document" {
+			if err := r.ParseMultipartForm(32 << 20); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			field := "photo"
+			if r.URL.Path == "/send_document" {
+				field = "document"
+			}
+			file, header, err := r.FormFile(field)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			defer file.Close()
+			content, err := io.ReadAll(file)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			rec.add(recordedMediaSend{
+				Path:     r.URL.Path,
+				ChatID:   r.FormValue("chat_id"),
+				ThreadID: r.FormValue("thread_id"),
+				Filename: header.Filename,
+				Content:  content,
+			})
+			_ = json.NewEncoder(w).Encode(contract.SendResponse{OK: true, MessageID: 1})
+			return
+		}
+		// JSON endpoints (/send, /edit, /edit_topic, /pin_message, ...).
+		// Drain and discard the body; every caller only needs an OK reply.
+		var body contract.SendRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewEncoder(w).Encode(contract.SendResponse{OK: true, MessageID: 1})
+	}))
+	t.Cleanup(srv.Close)
+
+	s, err := NewSender(srv.URL, filepath.Join(t.TempDir(), "media-recording-sender.db"))
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s, rec
+}
+
+// TestProcessBatch_SendsGeneratedImagesAndDocuments drives a full processBatch
+// invocation against the tmux fixtures: the mocked pane produces a text
+// response while "generating" a .png and a .pdf in the group working
+// directory. The batch must deliver both files to the proxy — the image via
+// /send_photo (SendPhoto) and the document via /send_document (SendDocument).
+func TestProcessBatch_SendsGeneratedImagesAndDocuments(t *testing.T) {
+	db := openTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cwd := t.TempDir()
+	const chatID = int64(-10099942)
+	const threadID = int64(77)
+	group := &Group{
+		ChatID:       chatID,
+		Name:         "media-integration",
+		CWD:          cwd,
+		DefaultModel: "claude-sonnet-4-6",
+		TimeoutSec:   45,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	sender, rec := newMediaRecordingProxy(t)
+	sm := NewSessionManager(db, sender, sender.proxyURL, nil, 5)
+
+	tmuxState := setupTmuxTest(t)
+	// Startup screen: claude sitting at the ❯ prompt with no response bullet
+	// yet. WaitForResponse counts ● markers against this pre-inject baseline,
+	// so the response screen written below must add exactly one.
+	mockTmuxCommand(t, "capture-pane", "❯\n")
+
+	const pngContent = "fake-png-bytes"
+	const pdfContent = "fake-pdf-bytes"
+
+	// Stand in for the claude process inside the mocked pane: once the prompt
+	// has been injected (paste-buffer in the tmux call log), emit the completed
+	// response screen and leave generated media files in the working directory.
+	// They are created mid-invocation, so detectGeneratedMedia sees them as new.
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		callsPath := filepath.Join(tmuxState.fixtureDir, "calls")
+		responseScreen := "● Analysis complete\n❯\n"
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			data, err := os.ReadFile(callsPath)
+			if err == nil && strings.Contains(string(data), "paste-buffer") {
+				_ = os.WriteFile(filepath.Join(cwd, "chart.png"), []byte(pngContent), 0o644)
+				_ = os.WriteFile(filepath.Join(cwd, "report.pdf"), []byte(pdfContent), 0o644)
+				_ = os.WriteFile(filepath.Join(tmuxState.fixtureDir, "capture-pane.stdout"), []byte(responseScreen), 0o644)
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+
+	text := "analyze the dataset"
+	update := contract.Update{
+		Type:      "message",
+		ChatID:    chatID,
+		ThreadID:  int64Ptr(threadID),
+		MessageID: 7,
+		FromUser:  contract.FromUser{ID: 1, FirstName: "Tester"},
+		Content:   &contract.Content{Type: contract.ContentTypeText, Text: &text},
+	}
+	sm.processBatch(ctx, topicKey{chatID: chatID, threadID: threadID}, []sessionMsg{{update: update, group: group}})
+	select {
+	case <-watcherDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fixture watcher never observed the injected prompt")
+	}
+
+	photos := rec.byPath("/send_photo")
+	if len(photos) != 1 {
+		t.Fatalf("expected exactly 1 /send_photo call, got %d (recorded media sends: %+v)", len(photos), rec.all())
+	}
+	if photos[0].Filename != "chart.png" {
+		t.Errorf("photo filename = %q, want chart.png", photos[0].Filename)
+	}
+	if string(photos[0].Content) != pngContent {
+		t.Errorf("photo content = %q, want %q", photos[0].Content, pngContent)
+	}
+	if photos[0].ChatID != fmt.Sprintf("%d", chatID) {
+		t.Errorf("photo chat_id = %q, want %d", photos[0].ChatID, chatID)
+	}
+	if photos[0].ThreadID != fmt.Sprintf("%d", threadID) {
+		t.Errorf("photo thread_id = %q, want %d", photos[0].ThreadID, threadID)
+	}
+
+	docs := rec.byPath("/send_document")
+	if len(docs) != 1 {
+		t.Fatalf("expected exactly 1 /send_document call, got %d", len(docs))
+	}
+	if docs[0].Filename != "report.pdf" {
+		t.Errorf("document filename = %q, want report.pdf", docs[0].Filename)
+	}
+	if string(docs[0].Content) != pdfContent {
+		t.Errorf("document content = %q, want %q", docs[0].Content, pdfContent)
+	}
+	if docs[0].ChatID != fmt.Sprintf("%d", chatID) {
+		t.Errorf("document chat_id = %q, want %d", docs[0].ChatID, chatID)
+	}
+	if docs[0].ThreadID != fmt.Sprintf("%d", threadID) {
+		t.Errorf("document thread_id = %q, want %d", docs[0].ThreadID, threadID)
 	}
 }

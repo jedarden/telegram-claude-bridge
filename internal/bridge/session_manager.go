@@ -1505,6 +1505,36 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 		}
 	}
 
+	// Send any generated image files
+	for _, img := range out.ImageFiles {
+		content, err := os.ReadFile(img.Path)
+		if err != nil {
+			log.Printf("[session_mgr] read image file %s: %v", img.Path, err)
+			continue
+		}
+		if err := m.sender.SendPhoto(ctx, key.chatID, tidPtr, 0, img.Caption, img.Filename, content); err != nil {
+			log.Printf("[session_mgr] send image %s: %v", img.Filename, err)
+			// Continue with other files even if one fails
+		} else {
+			log.Printf("[session_mgr] sent image file: %s", img.Filename)
+		}
+	}
+
+	// Send any generated document files
+	for _, doc := range out.DocumentFiles {
+		content, err := os.ReadFile(doc.Path)
+		if err != nil {
+			log.Printf("[session_mgr] read document file %s: %v", doc.Path, err)
+			continue
+		}
+		if err := m.sender.SendDocument(ctx, key.chatID, tidPtr, 0, doc.Caption, doc.Filename, content); err != nil {
+			log.Printf("[session_mgr] send document %s: %v", doc.Filename, err)
+			// Continue with other files even if one fails
+		} else {
+			log.Printf("[session_mgr] sent document file: %s", doc.Filename)
+		}
+	}
+
 	// Update the pinned metadata message with the new message count and cost
 	if session != nil && session.PinnedMessageID != 0 {
 		if err := m.updatePinnedMetadata(ctx, session, group); err != nil {
