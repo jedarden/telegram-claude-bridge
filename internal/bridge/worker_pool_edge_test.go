@@ -101,6 +101,14 @@ func TestWorkerPool_WorkerCompletionFreesTopicSlot(t *testing.T) {
 		t.Fatalf("running workers after worker 1 completed = %d, want 0", count)
 	}
 
+	// finishWorker queues the pending result only after its Telegram post,
+	// and the sender's dedup insert can stall for seconds on SQLITE_BUSY
+	// retries — so the status flip observed above does not yet mean the
+	// result is queued. Sync on the queued result before spawning worker 2,
+	// whose fast mocked failure would otherwise race its own finishWorker
+	// ahead of worker 1's and invert the results ordering asserted below.
+	waitForPendingWorkerResults(t, env.sm, 100, 10, 1, 2*time.Second)
+
 	// Worker 2 on the same topic must now be admitted. It is terminated at
 	// pane creation to keep the test fast; the admission (no "max workers"
 	// rejection) is the assertion, not worker 2's outcome.
