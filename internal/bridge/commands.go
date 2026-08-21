@@ -255,25 +255,35 @@ func (h *CommandHandler) cmdCWD(ctx context.Context, update contract.Update, gro
 		return "", fmt.Errorf("stat %q: %w", args, err)
 	}
 
-	newGroup := &Group{
-		ChatID:    update.ChatID,
-		CWD:       args,
-		CreatedAt: time.Now().UTC(),
-	}
+	var saveGroup *Group
 	if group != nil {
-		// Preserve existing settings when only updating the path.
-		newGroup.Name         = group.Name
-		newGroup.DefaultModel = group.DefaultModel
-		newGroup.MaxBudget    = group.MaxBudget
-		newGroup.TimeoutSec   = group.TimeoutSec
+		// Path update: mutate the fetched record in place so every configured
+		// setting survives. A hand-copied field list here previously reset
+		// progress_interval_sec, max_subtasks, max_workers, dispatcher_mode,
+		// and the tool restrictions to zero values on every /cwd call.
+		group.CWD = args
+		saveGroup = group
 	} else {
-		newGroup.DefaultModel   = "claude-sonnet-4-6"
-		newGroup.MaxBudget      = 5.0
-		newGroup.TimeoutSec     = 300
-		newGroup.PermissionMode = defaultPermissionMode
+		saveGroup = &Group{
+			ChatID:         update.ChatID,
+			CWD:            args,
+			DefaultModel:   "claude-sonnet-4-6",
+			MaxBudget:      5.0,
+			TimeoutSec:     300,
+			PermissionMode: defaultPermissionMode,
+			// Mirror the schema defaults (state.go migrations): UpsertGroup
+			// writes these columns explicitly, so the DB DEFAULT never
+			// applies and a zero value here would disable the feature —
+			// progress_interval_sec 0 silently killed the progress ticker.
+			MaxSubtasks:         5,
+			MaxWorkers:          5,
+			ProgressIntervalSec: 120,
+			DispatcherMode:      1,
+			CreatedAt:           time.Now().UTC(),
+		}
 	}
 
-	if err := h.db.UpsertGroup(ctx, newGroup); err != nil {
+	if err := h.db.UpsertGroup(ctx, saveGroup); err != nil {
 		return "", fmt.Errorf("save group: %w", err)
 	}
 	return fmt.Sprintf("Working directory set to: %s", args), nil

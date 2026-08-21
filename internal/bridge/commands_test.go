@@ -465,6 +465,132 @@ func TestCmdCWD_SetPath_Success(t *testing.T) {
 	}
 }
 
+func TestCmdCWD_RegisterGroup_SetsSchemaDefaults(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	tempDir := t.TempDir()
+
+	admin := &AllowedUser{
+		UserID:  12345,
+		Role:    "admin",
+		AddedAt: time.Now().UTC(),
+	}
+	if err := db.UpsertAllowedUser(ctx, admin); err != nil {
+		t.Fatalf("upsert admin: %v", err)
+	}
+
+	h := newTestCommandHandler(t, db)
+	update := makeUpdate(100, nil, 100, "/cwd "+tempDir, 12345)
+
+	reply, err := h.cmdCWD(ctx, update, nil, tempDir)
+	if err != nil {
+		t.Fatalf("cmdCWD: %v", err)
+	}
+
+	if !strings.Contains(reply, "Working directory set to") {
+		t.Errorf("should confirm path set, got: %s", reply)
+	}
+
+	// UpsertGroup writes every column explicitly, so the DB DEFAULTs never
+	// apply — registration must set the same values itself. A zero
+	// progress_interval_sec here silently disables the Phase 8.4 ticker.
+	created, err := db.GetGroup(ctx, 100)
+	if err != nil {
+		t.Fatalf("get group: %v", err)
+	}
+	if created.ProgressIntervalSec != 120 {
+		t.Errorf("ProgressIntervalSec = %d, want 120 (schema default; 0 disables the ticker)", created.ProgressIntervalSec)
+	}
+	if created.MaxSubtasks != 5 {
+		t.Errorf("MaxSubtasks = %d, want 5 (schema default)", created.MaxSubtasks)
+	}
+	if created.MaxWorkers != 5 {
+		t.Errorf("MaxWorkers = %d, want 5 (schema default)", created.MaxWorkers)
+	}
+	if created.DispatcherMode != 1 {
+		t.Errorf("DispatcherMode = %d, want 1 (schema default)", created.DispatcherMode)
+	}
+}
+
+func TestCmdCWD_SetPath_PreservesConfiguredSettings(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	tempDir := t.TempDir()
+
+	admin := &AllowedUser{
+		UserID:  12345,
+		Role:    "admin",
+		AddedAt: time.Now().UTC(),
+	}
+	if err := db.UpsertAllowedUser(ctx, admin); err != nil {
+		t.Fatalf("upsert admin: %v", err)
+	}
+
+	group := &Group{
+		ChatID:              100,
+		CWD:                 "/existing/path",
+		DefaultModel:        "claude-opus-4-6",
+		PermissionMode:      "dontAsk",
+		AllowedTools:        `["Read","Grep"]`,
+		DisallowedTools:     `["Bash"]`,
+		MaxSubtasks:         7,
+		MaxWorkers:          3,
+		ProgressIntervalSec: 60,
+		DispatcherMode:      0,
+		TranscriptVerify:    true,
+		CreatedAt:           time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	h := newTestCommandHandler(t, db)
+	update := makeUpdate(100, nil, 100, "/cwd "+tempDir, 12345)
+
+	reply, err := h.cmdCWD(ctx, update, group, tempDir)
+	if err != nil {
+		t.Fatalf("cmdCWD: %v", err)
+	}
+
+	if !strings.Contains(reply, "Working directory set to") {
+		t.Errorf("should confirm path set, got: %s", reply)
+	}
+
+	updated, err := db.GetGroup(ctx, 100)
+	if err != nil {
+		t.Fatalf("get group: %v", err)
+	}
+	if updated.CWD != tempDir {
+		t.Errorf("CWD in DB = %q, want %q", updated.CWD, tempDir)
+	}
+	if updated.ProgressIntervalSec != 60 {
+		t.Errorf("ProgressIntervalSec = %d, want 60 (path update must not reset it)", updated.ProgressIntervalSec)
+	}
+	if updated.PermissionMode != "dontAsk" {
+		t.Errorf("PermissionMode = %q, want dontAsk", updated.PermissionMode)
+	}
+	if updated.AllowedTools != `["Read","Grep"]` {
+		t.Errorf("AllowedTools = %q, want [\"Read\",\"Grep\"]", updated.AllowedTools)
+	}
+	if updated.DisallowedTools != `["Bash"]` {
+		t.Errorf("DisallowedTools = %q, want [\"Bash\"]", updated.DisallowedTools)
+	}
+	if updated.MaxSubtasks != 7 {
+		t.Errorf("MaxSubtasks = %d, want 7", updated.MaxSubtasks)
+	}
+	if updated.MaxWorkers != 3 {
+		t.Errorf("MaxWorkers = %d, want 3", updated.MaxWorkers)
+	}
+	if updated.DispatcherMode != 0 {
+		t.Errorf("DispatcherMode = %d, want 0", updated.DispatcherMode)
+	}
+	if !updated.TranscriptVerify {
+		t.Error("TranscriptVerify = false, want true")
+	}
+}
+
 // ── cmdConfig Tests ───────────────────────────────────────────────────────────────────
 
 func TestCmdConfig_ShowAll(t *testing.T) {
