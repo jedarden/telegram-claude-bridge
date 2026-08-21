@@ -790,3 +790,464 @@ func TestSessionCleanupMarkInactivePaneAlreadyDeadRealTmux(t *testing.T) {
 		}
 	}
 }
+
+// ── Stale worker sweep ────────────────────────────────────────────────────────
+
+// TestSweepStaleWorkers force-fails running workers past the worker TTL and
+// kills each one's tmux pane. Two stale workers have live panes (a kill-window
+// must be issued for each), a third stale worker's pane is already gone
+// (force-failed without a kill attempt), and a fresh worker with a live pane
+// must come through entirely untouched.
+func TestSweepStaleWorkers(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	staleWithPaneA := &Worker{
+		ID: "worker_1_sweep", ChatID: 100, ThreadID: 10, ParentMsg: 1000,
+		Prompt: "stale worker A", Status: "running",
+		StartedAt: now.Add(-15 * time.Minute), // past the 10m DefaultWorkerTTL
+	}
+	staleWithPaneB := &Worker{
+		ID: "worker_2_sweep", ChatID: 100, ThreadID: 10, ParentMsg: 1001,
+		Prompt: "stale worker B", Status: "running",
+		StartedAt: now.Add(-2 * time.Hour),
+	}
+	// Stale whose pane died before the sweep ran: no window matches its
+	// "w-worker_4-" prefix, so it is force-failed without a kill-window.
+	staleNoPane := &Worker{
+		ID: "worker_4_sweep", ChatID: 100, ThreadID: 10, ParentMsg: 1002,
+		Prompt: "stale worker, pane already gone", Status: "running",
+		StartedAt: now.Add(-30 * time.Minute),
+	}
+	fresh := &Worker{
+		ID: "worker_3_sweep", ChatID: 100, ThreadID: 10, ParentMsg: 1003,
+		Prompt: "fresh worker", Status: "running",
+		StartedAt: now.Add(-1 * time.Minute), // inside the TTL
+	}
+	for _, w := range []*Worker{staleWithPaneA, staleWithPaneB, staleNoPane, fresh} {
+		if err := db.CreateWorker(ctx, w); err != nil {
+			t.Fatalf("CreateWorker %s: %v", w.ID, err)
+		}
+	}
+
+	tmuxState := setupTmuxTest(t)
+	// One window per worker except worker_4; the numeric suffixes are the
+	// Unix-nano creation stamps WorkerPool embeds in worker window names.
+	mockTmuxCommand(t, "list-windows", strings.Join([]string{
+		"w-worker_1-1234567890",
+		"w-worker_2-9876543210",
+		"w-worker_3-5555555555",
+	}, "\n")+"\n")
+
+	cleanup := NewSessionCleanup(db, &Sender{}, NewPTYManager(), 0, 0, false, DefaultWorkerTTL)
+	cleanup.sweepStaleWorkers(ctx)
+
+	const forceFailReason = "Force-failed: exceeded worker TTL after bridge restart or crash"
+	for _, w := range []*Worker{staleWithPaneA, staleWithPaneB, staleNoPane} {
+		got, err := db.GetWorker(ctx, w.ID)
+		if err != nil {
+			t.Fatalf("GetWorker %s after sweep: %v", w.ID, err)
+		}
+		if got == nil {
+			t.Fatalf("worker %s record missing after sweep", w.ID)
+		}
+		if got.Status != "failed" {
+			t.Errorf("stale worker %s status = %q, want failed", w.ID, got.Status)
+		}
+		if !strings.Contains(got.Error, forceFailReason) {
+			t.Errorf("stale worker %s error = %q, want force-fail reason", w.ID, got.Error)
+		}
+		if got.FinishedAt == nil || got.FinishedAt.IsZero() {
+			t.Errorf("stale worker %s FinishedAt unset after sweep", w.ID)
+		}
+	}
+
+	got, err := db.GetWorker(ctx, fresh.ID)
+	if err != nil {
+		t.Fatalf("GetWorker %s after sweep: %v", fresh.ID, err)
+	}
+	if got == nil {
+		t.Fatalf("worker %s record missing after sweep", fresh.ID)
+	}
+	if got.Status != "running" {
+		t.Errorf("fresh worker status = %q, want running", got.Status)
+	}
+	if got.Error != "" {
+		t.Errorf("fresh worker error = %q, want empty", got.Error)
+	}
+	if got.FinishedAt != nil {
+		t.Errorf("fresh worker FinishedAt = %v, want nil", got.FinishedAt)
+	}
+
+	// KillPane issued exactly once per stale worker that has a pane. The mock
+	// logs full argv, so equality rules out prefix collisions between panes.
+	killsFor := func(target string) int {
+		count := 0
+		for _, call := range tmuxState.tmuxCalls(t) {
+			if call == "kill-window -t "+target {
+				count++
+			}
+		}
+		return count
+	}
+	for _, target := range []string{
+		tmuxSessionName + ":w-worker_1-1234567890",
+		tmuxSessionName + ":w-worker_2-9876543210",
+	} {
+		if got := killsFor(target); got != 1 {
+			t.Errorf("kill-window calls for %s = %d, want 1", target, got)
+		}
+	}
+
+	// No other kill-window: neither the fresh worker's pane nor a lookup for
+	// the pane-less stale worker may produce one.
+	totalKills := 0
+	for _, call := range tmuxState.tmuxCalls(t) {
+		if !strings.HasPrefix(call, "kill-window ") {
+			continue
+		}
+		totalKills++
+		if call == "kill-window -t "+tmuxSessionName+":w-worker_3-5555555555" {
+			t.Error("fresh worker's pane was killed by the sweep")
+		}
+	}
+	if totalKills != 2 {
+		t.Errorf("total kill-window calls = %d, want 2", totalKills)
+	}
+}
+
+// ── Stale worker sweep idempotence ────────────────────────────────────────────
+
+// TestSweepStaleWorkersIdempotent runs the stale worker sweep twice against
+// the same fixtures. The second pass must be a complete no-op: force-failed
+// workers no longer match the 'running' predicate, so no pane is killed a
+// second time and no worker row is rewritten — finished_at and the force-fail
+// reason are preserved verbatim, not duplicated or re-stamped.
+func TestSweepStaleWorkersIdempotent(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Stale past the 10-minute DefaultWorkerTTL; ID[:8]="worker_1" matches
+	// the "w-worker_1-1234567890" window in the list-windows fixture.
+	staleWithPane := &Worker{
+		ID: "worker_1_idem", ChatID: 100, ThreadID: 10, ParentMsg: 2000,
+		Prompt: "stale with a live pane", Status: "running",
+		StartedAt: now.Add(-30 * time.Minute),
+	}
+	// Stale with no matching pane (the pane died before the sweep ran).
+	staleNoPane := &Worker{
+		ID: "worker_2_idem", ChatID: 100, ThreadID: 10, ParentMsg: 2001,
+		Prompt: "stale with no pane", Status: "running",
+		StartedAt: now.Add(-2 * time.Hour),
+	}
+	// Fresh: inside the TTL, must survive both sweeps untouched.
+	fresh := &Worker{
+		ID: "worker_3_idem", ChatID: 100, ThreadID: 10, ParentMsg: 2002,
+		Prompt: "fresh task", Status: "running",
+		StartedAt: now.Add(-1 * time.Minute),
+	}
+	for _, w := range []*Worker{staleWithPane, staleNoPane, fresh} {
+		if err := db.CreateWorker(ctx, w); err != nil {
+			t.Fatalf("CreateWorker %s: %v", w.ID, err)
+		}
+	}
+
+	tmuxState := setupTmuxTest(t)
+	cleanup := NewSessionCleanup(db, &Sender{}, NewPTYManager(), 0, 0, false, DefaultWorkerTTL)
+
+	cleanup.sweepStaleWorkers(ctx)
+
+	const forceFailReason = "Force-failed: exceeded worker TTL after bridge restart or crash"
+	workerPaneTarget := tmuxSessionName + ":w-worker_1-1234567890"
+
+	killCount := func(target string) int {
+		count := 0
+		for _, call := range tmuxState.tmuxCalls(t) {
+			if strings.Contains(call, "kill-window") && strings.Contains(call, "-t "+target) {
+				count++
+			}
+		}
+		return count
+	}
+
+	// First sweep: both stale workers force-failed with a finish timestamp.
+	type sweptState struct {
+		status     string
+		errMsg     string
+		finishedAt string
+	}
+	firstPass := make(map[string]sweptState)
+	for _, id := range []string{staleWithPane.ID, staleNoPane.ID} {
+		got, err := db.GetWorker(ctx, id)
+		if err != nil {
+			t.Fatalf("GetWorker %s after first sweep: %v", id, err)
+		}
+		if got == nil {
+			t.Fatalf("worker %s record missing after first sweep", id)
+		}
+		if got.Status != "failed" {
+			t.Fatalf("worker %s status after first sweep = %q, want failed", id, got.Status)
+		}
+		if got.FinishedAt == nil || got.FinishedAt.IsZero() {
+			t.Fatalf("worker %s FinishedAt unset after first sweep", id)
+		}
+		firstPass[id] = sweptState{
+			status:     got.Status,
+			errMsg:     got.Error,
+			finishedAt: got.FinishedAt.Format(time.RFC3339),
+		}
+	}
+	if got := killCount(workerPaneTarget); got != 1 {
+		t.Fatalf("kill-window calls for %s after first sweep = %d, want 1", workerPaneTarget, got)
+	}
+
+	// The sweep consumed the stale set: nothing is eligible for a second pass.
+	remaining, err := db.ListStaleWorkers(ctx, DefaultWorkerTTL)
+	if err != nil {
+		t.Fatalf("ListStaleWorkers after first sweep: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("ListStaleWorkers after first sweep = %d workers, want 0", len(remaining))
+	}
+
+	callsAfterFirst := len(tmuxState.tmuxCalls(t))
+
+	cleanup.sweepStaleWorkers(ctx)
+
+	// Second sweep issued no tmux commands at all.
+	if got := len(tmuxState.tmuxCalls(t)); got != callsAfterFirst {
+		t.Errorf("tmux call count after second sweep = %d, want %d (no-op)", got, callsAfterFirst)
+	}
+	if got := killCount(workerPaneTarget); got != 1 {
+		t.Errorf("kill-window calls for %s after second sweep = %d, want 1 (no double kill)", workerPaneTarget, got)
+	}
+
+	for _, id := range []string{staleWithPane.ID, staleNoPane.ID} {
+		got, err := db.GetWorker(ctx, id)
+		if err != nil {
+			t.Fatalf("GetWorker %s after second sweep: %v", id, err)
+		}
+		if got == nil {
+			t.Fatalf("worker %s record missing after second sweep", id)
+		}
+		first := firstPass[id]
+		if got.Status != first.status {
+			t.Errorf("worker %s status rewritten on second sweep: %q → %q", id, first.status, got.Status)
+		}
+		if got.Error != first.errMsg {
+			t.Errorf("worker %s error rewritten on second sweep: %q → %q", id, first.errMsg, got.Error)
+		}
+		if count := strings.Count(got.Error, forceFailReason); count != 1 {
+			t.Errorf("worker %s force-fail reason appears %d times, want exactly 1: %q", id, count, got.Error)
+		}
+		finished := ""
+		if got.FinishedAt != nil {
+			finished = got.FinishedAt.Format(time.RFC3339)
+		}
+		if finished != first.finishedAt {
+			t.Errorf("worker %s finished_at re-stamped on second sweep: %q → %q", id, first.finishedAt, finished)
+		}
+	}
+
+	// Fresh worker untouched by either pass.
+	got, err := db.GetWorker(ctx, fresh.ID)
+	if err != nil {
+		t.Fatalf("GetWorker %s: %v", fresh.ID, err)
+	}
+	if got == nil || got.Status != "running" {
+		t.Errorf("fresh worker after second sweep = %+v, want still running", got)
+	}
+	if got != nil && got.FinishedAt != nil {
+		t.Errorf("fresh worker FinishedAt = %v, want nil", got.FinishedAt)
+	}
+
+	remaining, err = db.ListStaleWorkers(ctx, DefaultWorkerTTL)
+	if err != nil {
+		t.Fatalf("ListStaleWorkers after second sweep: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Errorf("ListStaleWorkers after second sweep = %d workers, want 0", len(remaining))
+	}
+}
+
+// ── Full cleanup cycle ────────────────────────────────────────────────────────
+
+// TestSessionCleanupRunCleanupFullCycle drives one full runCleanup pass over a
+// workspace holding both a stale worker and a stale session, plus fresh
+// counterparts that must survive. The cycle must force-fail the stale worker
+// and kill its pane, mark the stale session inactive and kill its pane,
+// update the topic color and close the topic, and leave the fresh worker and
+// session untouched.
+func TestSessionCleanupRunCleanupFullCycle(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	const (
+		chatID      int64 = -100 // |chatID| names session panes: t100-<thread>
+		staleThread int64 = 10   // t100-10 is present in the list-windows fixture
+		freshThread int64 = 20
+	)
+	if err := db.UpsertGroup(ctx, &Group{ChatID: chatID, CWD: "/tmp"}); err != nil {
+		t.Fatalf("UpsertGroup: %v", err)
+	}
+
+	staleSession := &Session{
+		ChatID:    chatID,
+		ThreadID:  staleThread,
+		SessionID: "full-cycle-stale-session",
+		CWD:       "/tmp",
+		// Older than the 1h session TTL below.
+		LastActive: now.Add(-2 * time.Hour),
+	}
+	freshSession := &Session{
+		ChatID:    chatID,
+		ThreadID:  freshThread,
+		SessionID: "full-cycle-fresh-session",
+		CWD:       "/tmp",
+		LastActive: now,
+	}
+	for _, s := range []*Session{staleSession, freshSession} {
+		if err := db.CreateSession(ctx, s); err != nil {
+			t.Fatalf("CreateSession (%d,%d): %v", s.ChatID, s.ThreadID, err)
+		}
+	}
+
+	staleWorker := &Worker{
+		ID: "worker_1_cycle", ChatID: chatID, ThreadID: staleThread, ParentMsg: 3000,
+		Prompt: "orphaned worker", Status: "running",
+		StartedAt: now.Add(-30 * time.Minute), // past the 10m worker TTL
+	}
+	freshWorker := &Worker{
+		ID: "worker_3_cycle", ChatID: chatID, ThreadID: freshThread, ParentMsg: 3001,
+		Prompt: "active worker", Status: "running",
+		StartedAt: now.Add(-2 * time.Minute),
+	}
+	for _, w := range []*Worker{staleWorker, freshWorker} {
+		if err := db.CreateWorker(ctx, w); err != nil {
+			t.Fatalf("CreateWorker %s: %v", w.ID, err)
+		}
+	}
+
+	tmuxState := setupTmuxTest(t)
+	// The summary pane is denied at spawn on purpose: the static capture-pane
+	// fixture never develops a second ● marker, so a successful spawn would
+	// leave WaitForResponse blocked for its 120s pre-response timeout. A
+	// failed summary is a documented non-fatal step of the cycle — the
+	// session must still be swept.
+	mockTmuxCommandFailure(t, "new-window", "summary pane spawn refused", 1)
+
+	sender, rec := newRecordingProxy(t)
+	cleanup := NewSessionCleanup(db, sender, NewPTYManager(), 0, time.Hour, true /*closeTopics*/, DefaultWorkerTTL)
+
+	cleanup.runCleanup(ctx)
+
+	// Stale worker: force-failed with the TTL reason and a finish timestamp.
+	gotWorker, err := db.GetWorker(ctx, staleWorker.ID)
+	if err != nil {
+		t.Fatalf("GetWorker %s: %v", staleWorker.ID, err)
+	}
+	if gotWorker == nil {
+		t.Fatalf("worker %s record missing after cleanup cycle", staleWorker.ID)
+	}
+	if gotWorker.Status != "failed" {
+		t.Errorf("stale worker status = %q, want failed", gotWorker.Status)
+	}
+	if !strings.Contains(gotWorker.Error, "Force-failed: exceeded worker TTL") {
+		t.Errorf("stale worker error = %q, want TTL force-fail reason", gotWorker.Error)
+	}
+	if gotWorker.FinishedAt == nil || gotWorker.FinishedAt.IsZero() {
+		t.Error("stale worker FinishedAt should be set after cleanup cycle")
+	}
+
+	// Fresh worker: untouched.
+	gotWorker, err = db.GetWorker(ctx, freshWorker.ID)
+	if err != nil {
+		t.Fatalf("GetWorker %s: %v", freshWorker.ID, err)
+	}
+	if gotWorker == nil {
+		t.Fatalf("worker %s record missing after cleanup cycle", freshWorker.ID)
+	}
+	if gotWorker.Status != "running" {
+		t.Errorf("fresh worker status = %q, want running", gotWorker.Status)
+	}
+	if gotWorker.FinishedAt != nil {
+		t.Errorf("fresh worker FinishedAt = %v, want nil", gotWorker.FinishedAt)
+	}
+
+	// Stale session: marked inactive; fresh session still active.
+	gotSession, err := db.GetSession(ctx, chatID, staleThread)
+	if err != nil {
+		t.Fatalf("GetSession (%d,%d): %v", chatID, staleThread, err)
+	}
+	if gotSession == nil {
+		t.Fatal("stale session record missing after cleanup cycle")
+	}
+	if gotSession.Status != "inactive" {
+		t.Errorf("stale session status = %q, want inactive", gotSession.Status)
+	}
+
+	gotSession, err = db.GetSession(ctx, chatID, freshThread)
+	if err != nil {
+		t.Fatalf("GetSession (%d,%d): %v", chatID, freshThread, err)
+	}
+	if gotSession == nil {
+		t.Fatal("fresh session record missing after cleanup cycle")
+	}
+	if gotSession.Status != "active" {
+		t.Errorf("fresh session status = %q, want active", gotSession.Status)
+	}
+
+	// Panes: exactly one kill for the stale worker's pane and one for the
+	// stale session's pane; nothing for the fresh session's pane.
+	killCount := func(target string) int {
+		count := 0
+		for _, call := range tmuxState.tmuxCalls(t) {
+			if strings.Contains(call, "kill-window") && strings.Contains(call, "-t "+target) {
+				count++
+			}
+		}
+		return count
+	}
+	if got := killCount(tmuxSessionName + ":w-worker_1-1234567890"); got != 1 {
+		t.Errorf("kill-window calls for stale worker pane = %d, want 1", got)
+	}
+	if got := killCount(tmuxSessionName + fmt.Sprintf(":t%d-%d", -chatID, staleThread)); got != 1 {
+		t.Errorf("kill-window calls for stale session pane = %d, want 1", got)
+	}
+	if got := killCount(tmuxSessionName + fmt.Sprintf(":t%d-%d", -chatID, freshThread)); got != 0 {
+		t.Errorf("kill-window calls for fresh session pane = %d, want 0", got)
+	}
+
+	// Proxy traffic: the stale session's topic icon was updated and the topic
+	// closed; no summary message was sent (summary generation failed at
+	// spawn, which is non-fatal).
+	var editTopic, closeTopic, sends int
+	for _, r := range rec.all() {
+		switch r.Path {
+		case "/edit_topic":
+			editTopic++
+		case "/close_topic":
+			closeTopic++
+		case "/send":
+			sends++
+		}
+		if r.Path == "/edit_topic" || r.Path == "/close_topic" {
+			if r.Body.ChatID != chatID || r.Body.ThreadID == nil || *r.Body.ThreadID != staleThread {
+				t.Errorf("%s recorded for (%d,%v), want (%d,%d)",
+					r.Path, r.Body.ChatID, r.Body.ThreadID, chatID, staleThread)
+			}
+		}
+	}
+	if editTopic != 1 {
+		t.Errorf("/edit_topic calls = %d, want 1", editTopic)
+	}
+	if closeTopic != 1 {
+		t.Errorf("/close_topic calls = %d, want 1", closeTopic)
+	}
+	if sends != 0 {
+		t.Errorf("/send calls = %d, want 0 (summary generation failed at spawn)", sends)
+	}
+}
