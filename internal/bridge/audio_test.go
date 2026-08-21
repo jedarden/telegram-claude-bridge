@@ -376,6 +376,7 @@ func TestProcessAudio_Args(t *testing.T) {
 			fileID:        "voice_unicode",
 			transcription: "Unicode characters path test.",
 			wantCmdName:   "whisper",
+			tempDirSuffix: "ünïcode-日本語-✓ dir",
 		},
 		{
 			name:          "whisper with simple path pattern /tmp/test.ogg equivalent",
