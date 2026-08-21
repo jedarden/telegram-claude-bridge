@@ -94,10 +94,10 @@ func resizePhotoFile(path string) error {
 	var newW, newH int
 	if w >= h {
 		newW = imageMaxDim
-		newH = h * imageMaxDim / w
+		newH = (h*imageMaxDim + w/2) / w
 	} else {
 		newH = imageMaxDim
-		newW = w * imageMaxDim / h
+		newW = (w*imageMaxDim + h/2) / h
 	}
 	if newH < 1 {
 		newH = 1

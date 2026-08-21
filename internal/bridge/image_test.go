@@ -142,7 +142,7 @@ func TestCalculateResizeBounds(t *testing.T) {
 			h:          2,
 			maxDim:     800,
 			wantNewW:   800,
-			wantNewH:   1,
+			wantNewH:   2,
 			wantResize: true,
 		},
 		{
@@ -150,7 +150,7 @@ func TestCalculateResizeBounds(t *testing.T) {
 			w:          2,
 			h:          801,
 			maxDim:     800,
-			wantNewW:   1,
+			wantNewW:   2,
 			wantNewH:   800,
 			wantResize: true,
 		},
@@ -183,10 +183,10 @@ func TestCalculateResizeBounds(t *testing.T) {
 			var newW, newH int
 			if tc.w >= tc.h {
 				newW = tc.maxDim
-				newH = tc.h * tc.maxDim / tc.w
+				newH = (tc.h*tc.maxDim + tc.w/2) / tc.w
 			} else {
 				newH = tc.maxDim
-				newW = tc.w * tc.maxDim / tc.h
+				newW = (tc.w*tc.maxDim + tc.h/2) / tc.h
 			}
 
 			// Ensure minimum dimensions
@@ -247,10 +247,10 @@ func TestCalculateResizeBoundsWithMaxDim(t *testing.T) {
 			var newW, newH int
 			if tc.w >= tc.h {
 				newW = tc.maxDim
-				newH = tc.h * tc.maxDim / tc.w
+				newH = (tc.h*tc.maxDim + tc.w/2) / tc.w
 			} else {
 				newH = tc.maxDim
-				newW = tc.w * tc.maxDim / tc.h
+				newW = (tc.w*tc.maxDim + tc.h/2) / tc.h
 			}
 
 			if newW < 1 {
@@ -291,10 +291,10 @@ func TestAspectRatioPreservation(t *testing.T) {
 			var newW, newH int
 			if tc.w >= tc.h {
 				newW = tc.maxDim
-				newH = tc.h * tc.maxDim / tc.w
+				newH = (tc.h*tc.maxDim + tc.w/2) / tc.w
 			} else {
 				newH = tc.maxDim
-				newW = tc.w * tc.maxDim / tc.h
+				newW = (tc.w*tc.maxDim + tc.h/2) / tc.h
 			}
 
 			if newH < 1 {
