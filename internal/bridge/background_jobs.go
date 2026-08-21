@@ -24,9 +24,10 @@ type BackgroundJobManager struct {
 	db     *DB
 	sender *Sender
 
-	mu    sync.Mutex
-	jobs  map[string]*BackgroundJob   // ID -> Job
-	cmds  map[string]*exec.Cmd        // ID -> running exec.Cmd
+	mu     sync.Mutex
+	jobs   map[string]*BackgroundJob // ID -> Job
+	cmds   map[string]*exec.Cmd      // ID -> running exec.Cmd
+	killed map[string]bool           // ID -> Kill() ran; runJob must not finalize the job
 }
 
 // NewBackgroundJobManager creates a new BackgroundJobManager.
@@ -36,6 +37,7 @@ func NewBackgroundJobManager(db *DB, sender *Sender) *BackgroundJobManager {
 		sender: sender,
 		jobs:   make(map[string]*BackgroundJob),
 		cmds:   make(map[string]*exec.Cmd),
+		killed: make(map[string]bool),
 	}
 	// Load running jobs from DB and mark them as interrupted
 	mgr.recoverRunningJobs()
@@ -307,23 +309,36 @@ func (m *BackgroundJobManager) runJob(ctx context.Context, job *BackgroundJob, c
 
 // handleJobCompletion updates job state and sends completion notification.
 func (m *BackgroundJobManager) handleJobCompletion(ctx context.Context, job *BackgroundJob, exitCode *int, message string) {
-	// Update job status
-	job.Status = "complete"
-	if exitCode != nil && *exitCode != 0 {
-		job.Status = "error"
+	// A job killed via Kill() is finalized by Kill itself: it already
+	// persisted "interrupted" and sent the kill notification. Don't
+	// overwrite the status with the signal exit code (-1 -> "error") or
+	// send a second, contradictory completion message.
+	m.mu.Lock()
+	killed := m.killed[job.ID]
+	delete(m.killed, job.ID)
+	delete(m.jobs, job.ID)
+	delete(m.cmds, job.ID)
+	if !killed {
+		// Mutate shared job fields under m.mu: Kill copies the whole
+		// job struct while holding the lock, so writing these outside
+		// it would be a data race.
+		job.Status = "complete"
+		if exitCode != nil && *exitCode != 0 {
+			job.Status = "error"
+		}
+		job.ExitCode = exitCode
 	}
-	job.ExitCode = exitCode
+	m.mu.Unlock()
+
+	if killed {
+		log.Printf("[bg_jobs] job %s exited after kill: keeping interrupted status", job.ID)
+		return
+	}
 
 	// Update database
 	if err := m.db.UpdateBackgroundJob(ctx, job); err != nil {
 		log.Printf("[bg_jobs] update job %s failed: %v", job.ID, err)
 	}
-
-	// Remove from in-memory tracking
-	m.mu.Lock()
-	delete(m.jobs, job.ID)
-	delete(m.cmds, job.ID)
-	m.mu.Unlock()
 
 	// Send completion notification
 	tidPtr := &job.ThreadID
@@ -352,33 +367,39 @@ func (m *BackgroundJobManager) Kill(ctx context.Context, jobID string) error {
 	if jobOk && job != nil {
 		chatID = job.ChatID
 		threadID = job.ThreadID
-		jobCopy = *job // Copy the job struct
-		job.Status = "interrupted"
+		jobCopy = *job // Copy the job struct (mutable fields are only written under m.mu)
 	}
-
-	// Remove from in-memory tracking while holding the lock
-	if jobOk {
-		delete(m.jobs, jobID)
-	}
-	if cmdOk {
-		delete(m.cmds, jobID)
-	}
-	m.mu.Unlock()
 
 	if !jobOk {
+		m.mu.Unlock()
 		return fmt.Errorf("job %s not found or not running", jobID)
 	}
 
 	if process == nil {
+		m.mu.Unlock()
 		return fmt.Errorf("job %s has no active process", jobID)
 	}
 
-	// Send SIGTERM (using captured process reference, no lock needed)
+	// Signal while still holding the lock so Kill either commits fully or
+	// leaves no trace: if the signal fails, the runJob goroutine keeps its
+	// normal completion path. Signaling under m.mu is safe — it is a quick
+	// syscall that touches no manager state.
 	if err := process.Signal(syscall.SIGTERM); err != nil {
+		m.mu.Unlock()
 		return fmt.Errorf("send signal to job %s: %w", jobID, err)
 	}
 
-	// Update database
+	// The runJob goroutine for this job is still alive. Mark it killed (in
+	// the same critical section as untracking) so its completion handler
+	// keeps the interrupted status instead of overwriting it with the
+	// signal's exit code and double-notifying.
+	m.killed[jobID] = true
+	delete(m.jobs, jobID)
+	delete(m.cmds, jobID)
+	m.mu.Unlock()
+
+	// Update database — only the local copy is mutated, never the shared
+	// job the runJob goroutine holds.
 	jobCopy.Status = "interrupted"
 	if err := m.db.UpdateBackgroundJob(ctx, &jobCopy); err != nil {
 		log.Printf("[bg_jobs] update job %s after kill failed: %v", jobID, err)

@@ -731,12 +731,11 @@ func TestBackgroundJobManager_Kill(t *testing.T) {
 
 	mgr := NewBackgroundJobManager(db, sender)
 
-	// The stub ignores SIGTERM and exits on its own shortly after, so
-	// Kill's synchronous "interrupted" write is the only status write while
-	// we assert. A process that dies from the signal instead triggers
-	// runJob's completion path, which races Kill's write and can overwrite
-	// the status (kill-vs-completion ordering is not deterministic in the
-	// manager).
+	// The stub ignores SIGTERM and exits on its own shortly after, keeping
+	// this test focused on Kill's synchronous "interrupted" write. The full
+	// kill-vs-completion interleaving — the process dying from the signal
+	// while runJob's completion handler runs — is covered by
+	// TestBackgroundJobManager_Kill_KeepsInterruptedStatus.
 	jobID, err := mgr.Start(ctx, 100, 10, `sh -c "trap '' TERM; sleep 2"`, "/tmp")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -783,6 +782,67 @@ func TestBackgroundJobManager_Kill_Nonexistent(t *testing.T) {
 	err := mgr.Kill(ctx, "nonexistent")
 	if err == nil {
 		t.Error("Kill nonexistent job: expected error, got nil")
+	}
+}
+
+// TestBackgroundJobManager_Kill_KeepsInterruptedStatus is the regression test
+// for the kill-vs-completion race: Kill marks a job interrupted and notifies
+// once, but the job's runJob goroutine is still alive. When the SIGTERMed
+// process is reaped, the completion handler must not overwrite the persisted
+// "interrupted" status with "error" (the signal surfaces as exit code -1) or
+// send a contradictory "Job failed" message on top of the kill notification.
+func TestBackgroundJobManager_Kill_KeepsInterruptedStatus(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	sender, rec := newRecordingProxy(t)
+
+	mgr := NewBackgroundJobManager(db, sender)
+
+	// sleep dies from Kill's SIGTERM, which drives runJob's completion path:
+	// cmd.Wait() returns an ExitError whose exit code is -1.
+	jobID, err := mgr.Start(ctx, 100, 10, "sleep 30", "/tmp")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitForJobTracked(t, mgr, jobID, true)
+
+	if err := mgr.Kill(ctx, jobID); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+
+	// Wait for the runJob goroutine to run its completion handler; the kill
+	// marker is consumed there, only after the process is reaped.
+	waitForKillHandled(t, mgr, jobID)
+
+	final, err := db.GetBackgroundJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("get job after kill: %v", err)
+	}
+	if final == nil {
+		t.Fatal("job row missing from DB after kill")
+	}
+	if final.Status != "interrupted" {
+		t.Errorf("job status after kill = %q, want interrupted", final.Status)
+	}
+	if final.ExitCode != nil {
+		t.Errorf("interrupted job exit code = %d, want unset", *final.ExitCode)
+	}
+
+	// Exactly one kill notification and zero completion messages.
+	var kills, failures int
+	for _, text := range recordedSendTexts(rec) {
+		if strings.Contains(text, "killed") {
+			kills++
+		}
+		if strings.Contains(text, "Job failed") {
+			failures++
+		}
+	}
+	if kills != 1 {
+		t.Errorf("kill notifications = %d, want 1; sends were: %q", kills, recordedSendTexts(rec))
+	}
+	if failures != 0 {
+		t.Errorf("job-failed completion messages = %d, want 0; sends were: %q", failures, recordedSendTexts(rec))
 	}
 }
 
@@ -902,6 +962,26 @@ func waitForJobTracked(t *testing.T, mgr *BackgroundJobManager, jobID string, wa
 	}
 }
 
+// waitForKillHandled polls until the manager's kill marker for jobID has been
+// consumed by the job's completion handler — the deterministic signal that the
+// runJob goroutine has finished finalizing the killed job.
+func waitForKillHandled(t *testing.T, mgr *BackgroundJobManager, jobID string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mgr.mu.Lock()
+		_, pending := mgr.killed[jobID]
+		mgr.mu.Unlock()
+		if !pending {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job %s kill marker never consumed: runJob goroutine stuck", jobID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // recordedSendTexts returns the text body of every request the recording
 // proxy received.
 func recordedSendTexts(rec *sendRecorder) []string {
@@ -935,9 +1015,8 @@ func TestJobLifecycle(t *testing.T) {
 		mgr := NewBackgroundJobManager(db, sender)
 
 		// A short self-finishing job: the subtest observes the running state
-		// and then waits for natural completion. It deliberately never kills
-		// the job — Kill racing the completion handler on the shared job
-		// struct is unsynchronized in the manager (see the kill subtest).
+		// and then waits for natural completion. Killing mid-flight is
+		// covered by the dedicated kill tests.
 		jobID, err := mgr.Start(ctx, 100, 10, "sleep 1", "/tmp")
 		if err != nil {
 			t.Fatalf("Start: %v", err)
@@ -1062,10 +1141,9 @@ func TestJobLifecycle(t *testing.T) {
 
 		// The stub ignores SIGTERM and exits on its own shortly after, so
 		// Kill's synchronous "interrupted" write is the only status write
-		// while we assert. (A process that dies from the SIGTERM triggers
-		// runJob's completion path, which races Kill's write and can flip
-		// the status to "error" — kill-vs-completion ordering is not
-		// deterministic in the manager.)
+		// while we assert. The completion handler keeps the interrupted
+		// status even when the process dies from the signal (see
+		// TestBackgroundJobManager_Kill_KeepsInterruptedStatus).
 		jobID, err := mgr.Start(ctx, 100, 10, `sh -c "trap '' TERM; sleep 1"`, "/tmp")
 		if err != nil {
 			t.Fatalf("Start: %v", err)
