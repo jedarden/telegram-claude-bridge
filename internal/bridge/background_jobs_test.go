@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -224,6 +225,332 @@ func TestBackgroundJobManager_RecoverRunningJobs_DBError(t *testing.T) {
 	mgr := NewBackgroundJobManager(db, sender)
 	if mgr == nil {
 		t.Error("NewBackgroundJobManager should not panic even with DB error")
+	}
+}
+
+// ── Restart Recovery Tests ─────────────────────────────────────────────────────
+//
+// recoverRunningJobs() runs synchronously inside NewBackgroundJobManager and is
+// purely database-driven: no PID or process handle survives a bridge restart,
+// so recovery never probes whether an orphaned process is still alive — every
+// status=running row is marked interrupted unconditionally. The tests below
+// pin that contract from several angles: which rows recovery touches (and
+// which it must not), what it preserves, what it clears, how a second manager
+// (a simulated restart) interacts with a genuinely-live orphaned process, and
+// that recovery is silent (no Telegram notifications on startup). Because
+// recovery is synchronous, none of these tests sleep after constructing the
+// manager — the constructor returning is itself the recovery barrier.
+
+// TestBackgroundJobRecovery_OnlyRunningJobsAreInterrupted pins the selectivity
+// of restart recovery: only status=running rows flip to interrupted. Jobs that
+// already reached a terminal status (complete, error, interrupted) keep their
+// status and exit codes — a restart must not rewrite history. Recovery is also
+// idempotent: a second restart finds no running rows and changes nothing.
+func TestBackgroundJobRecovery_OnlyRunningJobsAreInterrupted(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	sender, _ := newRecordingProxy(t)
+
+	seeded := []struct {
+		id       string
+		status   string
+		exitCode *int
+	}{
+		{"recover-done", "complete", intPtr(0)},
+		{"recover-fail", "error", intPtr(1)},
+		{"recover-killed", "interrupted", nil},
+		{"recover-live", "running", nil},
+	}
+	for _, s := range seeded {
+		job := &BackgroundJob{
+			ID:        s.id,
+			ChatID:    100,
+			ThreadID:  10,
+			Command:   "cmd-" + s.id,
+			Status:    s.status,
+			ExitCode:  s.exitCode,
+			StartedAt: time.Now().UTC(),
+		}
+		if err := db.CreateBackgroundJob(ctx, job); err != nil {
+			t.Fatalf("create %s: %v", s.id, err)
+		}
+		// CreateBackgroundJob does not persist exit_code; terminal rows get
+		// theirs through the same UPDATE path the manager uses.
+		if s.exitCode != nil {
+			if err := db.UpdateBackgroundJob(ctx, job); err != nil {
+				t.Fatalf("update %s: %v", s.id, err)
+			}
+		}
+	}
+
+	// Restart: a fresh manager recovers synchronously in its constructor.
+	_ = NewBackgroundJobManager(db, sender)
+
+	for _, s := range seeded {
+		job, err := db.GetBackgroundJob(ctx, s.id)
+		if err != nil {
+			t.Fatalf("get %s: %v", s.id, err)
+		}
+		if job == nil {
+			t.Fatalf("job %s missing from DB", s.id)
+		}
+		wantStatus := s.status
+		if s.status == "running" {
+			wantStatus = "interrupted"
+		}
+		if job.Status != wantStatus {
+			t.Errorf("job %s status = %q, want %q", s.id, job.Status, wantStatus)
+		}
+		switch {
+		case s.exitCode == nil && job.ExitCode != nil:
+			t.Errorf("job %s exit code = %d, want unset", s.id, *job.ExitCode)
+		case s.exitCode != nil && job.ExitCode == nil:
+			t.Errorf("job %s exit code = nil, want %d", s.id, *s.exitCode)
+		case s.exitCode != nil && *job.ExitCode != *s.exitCode:
+			t.Errorf("job %s exit code = %d, want %d", s.id, *job.ExitCode, *s.exitCode)
+		}
+	}
+
+	// A second restart changes nothing: the first pass left no running rows.
+	_ = NewBackgroundJobManager(db, sender)
+	job, err := db.GetBackgroundJob(ctx, "recover-live")
+	if err != nil {
+		t.Fatalf("get recover-live after second recovery: %v", err)
+	}
+	if job == nil || job.Status != "interrupted" {
+		t.Errorf("recover-live after second recovery = %+v, want status interrupted", job)
+	}
+}
+
+// TestBackgroundJobRecovery_PreservesJobMetadata verifies recovery rewrites
+// only the status: orphaned running rows from several chats/threads keep their
+// identity (ID, chat, thread, command, start time) so /jobs history survives
+// the restart intact.
+func TestBackgroundJobRecovery_PreservesJobMetadata(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	sender, _ := newRecordingProxy(t)
+
+	topics := []struct {
+		chatID, threadID int64
+		id, command      string
+	}{
+		{100, 10, "meta-a", "echo a"},
+		{100, 20, "meta-b", "sleep 60"},
+		{200, 30, "meta-c", "go test ./..."},
+	}
+	// Truncate to whole seconds: started_at round-trips through RFC3339,
+	// which drops sub-second precision.
+	started := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
+	for _, tp := range topics {
+		job := &BackgroundJob{
+			ID:        tp.id,
+			ChatID:    tp.chatID,
+			ThreadID:  tp.threadID,
+			Command:   tp.command,
+			Status:    "running",
+			StartedAt: started,
+		}
+		if err := db.CreateBackgroundJob(ctx, job); err != nil {
+			t.Fatalf("create %s: %v", tp.id, err)
+		}
+	}
+
+	_ = NewBackgroundJobManager(db, sender)
+
+	for _, tp := range topics {
+		job, err := db.GetBackgroundJob(ctx, tp.id)
+		if err != nil {
+			t.Fatalf("get %s: %v", tp.id, err)
+		}
+		if job == nil {
+			t.Fatalf("job %s missing from DB", tp.id)
+		}
+		if job.Status != "interrupted" {
+			t.Errorf("job %s status = %q, want interrupted", tp.id, job.Status)
+		}
+		if job.ChatID != tp.chatID {
+			t.Errorf("job %s chat ID = %d, want %d", tp.id, job.ChatID, tp.chatID)
+		}
+		if job.ThreadID != tp.threadID {
+			t.Errorf("job %s thread ID = %d, want %d", tp.id, job.ThreadID, tp.threadID)
+		}
+		if job.Command != tp.command {
+			t.Errorf("job %s command = %q, want %q", tp.id, job.Command, tp.command)
+		}
+		if !job.StartedAt.Equal(started) {
+			t.Errorf("job %s started_at = %v, want %v", tp.id, job.StartedAt, started)
+		}
+	}
+}
+
+// TestBackgroundJobRecovery_ClearsStaleExitCode pins the ExitCode=nil branch of
+// recovery: a row that is running but somehow carries an exit code (a
+// half-finished status write from a crash) must not keep it — interrupted jobs
+// have no exit code, which is what /jobs output relies on.
+func TestBackgroundJobRecovery_ClearsStaleExitCode(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	sender, _ := newRecordingProxy(t)
+
+	job := &BackgroundJob{
+		ID:        "stale-exit",
+		ChatID:    100,
+		ThreadID:  10,
+		Command:   "echo stale",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateBackgroundJob(ctx, job); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// Force the corrupt state: a running row with a lingering exit code.
+	job.ExitCode = intPtr(5)
+	if err := db.UpdateBackgroundJob(ctx, job); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	_ = NewBackgroundJobManager(db, sender)
+
+	recovered, err := db.GetBackgroundJob(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if recovered == nil {
+		t.Fatal("recovered job row missing from DB")
+	}
+	if recovered.Status != "interrupted" {
+		t.Errorf("recovered job status = %q, want interrupted", recovered.Status)
+	}
+	if recovered.ExitCode != nil {
+		t.Errorf("recovered job exit code = %d, want unset", *recovered.ExitCode)
+	}
+}
+
+// TestBackgroundJobRecovery_IsSilent pins that startup recovery writes to the
+// database only: users get no per-job "interrupted" notifications on every
+// bridge restart, which would otherwise spam every topic with historical jobs.
+func TestBackgroundJobRecovery_IsSilent(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	sender, rec := newRecordingProxy(t)
+
+	for i := 0; i < 3; i++ {
+		job := &BackgroundJob{
+			ID:        fmt.Sprintf("silent-%d", i),
+			ChatID:    100,
+			ThreadID:  10,
+			Command:   fmt.Sprintf("cmd %d", i),
+			Status:    "running",
+			StartedAt: time.Now().UTC(),
+		}
+		if err := db.CreateBackgroundJob(ctx, job); err != nil {
+			t.Fatalf("create job %d: %v", i, err)
+		}
+	}
+
+	_ = NewBackgroundJobManager(db, sender)
+
+	if sends := rec.all(); len(sends) != 0 {
+		t.Errorf("recovery sent %d notifications, want 0: %q", len(sends), recordedSendTexts(rec))
+	}
+}
+
+// TestBackgroundJobRecovery_RestartWithLiveOrphanedProcess is the stale-process
+// scenario: the bridge restarts while a job's OS process is genuinely still
+// alive (children are orphaned, not killed, when the bridge dies). Recovery has
+// no process-state detection — no PID is persisted — so the still-running
+// process is marked interrupted anyway, and the new manager cannot signal it:
+// it holds no exec.Cmd for the job, so Kill reports the job as not running and
+// List reports the interrupted status straight from the DB.
+func TestBackgroundJobRecovery_RestartWithLiveOrphanedProcess(t *testing.T) {
+	db := openTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel) // reaps the orphaned sleep once assertions are done
+	sender, _ := newRecordingProxy(t)
+
+	mgr := NewBackgroundJobManager(db, sender)
+	jobID, err := mgr.Start(ctx, 100, 10, "sleep 30", "/tmp")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitForJobTracked(t, mgr, jobID, true)
+
+	// The restart: a second manager over the same DB, in-memory state empty.
+	restarted := NewBackgroundJobManager(db, sender)
+
+	recovered := waitForJobStatus(t, db, jobID, "interrupted")
+	if recovered.ExitCode != nil {
+		t.Errorf("recovered job exit code = %d, want unset", *recovered.ExitCode)
+	}
+
+	// The orphaned process outlived the restart, but the new manager has no
+	// handle on it — killing must fail loudly, not silently succeed.
+	if err := restarted.Kill(ctx, jobID); err == nil {
+		t.Error("Kill of orphaned job via restarted manager: expected error, got nil")
+	} else if !strings.Contains(err.Error(), "not found or not running") {
+		t.Errorf("Kill error = %q, want it to mention the job is not running", err.Error())
+	}
+
+	// List must not overlay "running" onto the recovered row: the restarted
+	// manager does not track the orphaned process.
+	jobs, err := restarted.List(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	var listed *BackgroundJob
+	for _, j := range jobs {
+		if j.ID == jobID {
+			listed = j
+		}
+	}
+	if listed == nil {
+		t.Fatalf("job %s missing from List after restart", jobID)
+	}
+	if listed.Status != "interrupted" {
+		t.Errorf("List reported status %q after restart, want interrupted", listed.Status)
+	}
+}
+
+// TestBackgroundJobRecovery_AfterDBReopen simulates the restart end to end at
+// the storage layer: the first manager's DB connection is closed (process
+// death), the database file is reopened by a fresh manager, and recovery still
+// finds the orphaned rows — recovery depends only on persisted state.
+func TestBackgroundJobRecovery_AfterDBReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "bridge.db")
+
+	db1, err := OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	stale := &BackgroundJob{
+		ID:        "reopen-stale",
+		ChatID:    100,
+		ThreadID:  10,
+		Command:   "sleep 60",
+		Status:    "running",
+		StartedAt: time.Now().UTC(),
+	}
+	if err := db1.CreateBackgroundJob(context.Background(), stale); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	db1.Close()
+
+	db2, err := OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	t.Cleanup(func() { db2.Close() })
+	sender, _ := newRecordingProxy(t)
+
+	_ = NewBackgroundJobManager(db2, sender)
+
+	job, err := db2.GetBackgroundJob(context.Background(), stale.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if job == nil || job.Status != "interrupted" {
+		t.Errorf("job after reopen = %+v, want status interrupted", job)
 	}
 }
 
