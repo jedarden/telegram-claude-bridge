@@ -283,6 +283,138 @@ func TestSession_ListAndDelete(t *testing.T) {
 	}
 }
 
+func TestSession_MarkSessionClosing(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	g := &Group{ChatID: 1, CWD: "/tmp", DefaultModel: "claude-sonnet-4-6", MaxBudget: 5.0, TimeoutSec: 300, CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, g); err != nil {
+		t.Fatal(err)
+	}
+
+	seed := func(threadID int64, status string) {
+		t.Helper()
+		s := &Session{ChatID: 1, ThreadID: threadID, SessionID: "s", CWD: "/tmp", Status: status}
+		if err := db.CreateSession(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(10, "active")
+	seed(11, "closing")
+	seed(12, "closed")
+
+	// active → closing: the caller wins the claim.
+	claimed, err := db.MarkSessionClosing(ctx, 1, 10)
+	if err != nil {
+		t.Fatalf("MarkSessionClosing(active): %v", err)
+	}
+	if !claimed {
+		t.Error("expected claim on active session, got false")
+	}
+
+	// Already closing: no second claim, status untouched.
+	claimed, err = db.MarkSessionClosing(ctx, 1, 11)
+	if err != nil {
+		t.Fatalf("MarkSessionClosing(closing): %v", err)
+	}
+	if claimed {
+		t.Error("expected no claim on already-closing session, got true")
+	}
+
+	// Already closed: no claim.
+	claimed, err = db.MarkSessionClosing(ctx, 1, 12)
+	if err != nil {
+		t.Fatalf("MarkSessionClosing(closed): %v", err)
+	}
+	if claimed {
+		t.Error("expected no claim on closed session, got true")
+	}
+
+	// Missing session: no claim, no error.
+	claimed, err = db.MarkSessionClosing(ctx, 1, 99)
+	if err != nil {
+		t.Fatalf("MarkSessionClosing(missing): %v", err)
+	}
+	if claimed {
+		t.Error("expected no claim on missing session, got true")
+	}
+
+	for threadID, want := range map[int64]string{10: "closing", 11: "closing", 12: "closed"} {
+		s, err := db.GetSession(ctx, 1, threadID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Status != want {
+			t.Errorf("session %d status = %q, want %q", threadID, s.Status, want)
+		}
+	}
+}
+
+func TestSession_RecoverStuckClosingSessions(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	g := &Group{ChatID: 1, CWD: "/tmp", DefaultModel: "claude-sonnet-4-6", MaxBudget: 5.0, TimeoutSec: 300, CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, g); err != nil {
+		t.Fatal(err)
+	}
+
+	seed := func(threadID int64, status string) {
+		t.Helper()
+		s := &Session{ChatID: 1, ThreadID: threadID, SessionID: "s", CWD: "/tmp", Status: status}
+		if err := db.CreateSession(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Sessions 20 and 21 are stranded by a dead process mid-summary; 22 and
+	// 23 must be untouched by the recovery sweep.
+	seed(20, "closing")
+	seed(21, "closing")
+	seed(22, "closed")
+	seed(23, "active")
+
+	recovered, err := db.RecoverStuckClosingSessions(ctx)
+	if err != nil {
+		t.Fatalf("RecoverStuckClosingSessions: %v", err)
+	}
+	if recovered != 2 {
+		t.Errorf("recovered = %d, want 2", recovered)
+	}
+
+	for threadID, want := range map[int64]string{
+		20: "active", // stranded claim released — close can be retried
+		21: "active",
+		22: "closed", // non-closing statuses untouched
+		23: "active",
+	} {
+		s, err := db.GetSession(ctx, 1, threadID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Status != want {
+			t.Errorf("session %d status = %q, want %q", threadID, s.Status, want)
+		}
+	}
+
+	// A recovered session is closeable again: MarkSessionClosing can re-claim it.
+	claimed, err := db.MarkSessionClosing(ctx, 1, 20)
+	if err != nil {
+		t.Fatalf("MarkSessionClosing after recovery: %v", err)
+	}
+	if !claimed {
+		t.Error("expected claim on recovered session, got false")
+	}
+
+	// Idempotent: a second sweep with nothing stranded reports zero.
+	recovered, err = db.RecoverStuckClosingSessions(ctx)
+	if err != nil {
+		t.Fatalf("second RecoverStuckClosingSessions: %v", err)
+	}
+	if recovered != 1 { // session 20 was re-claimed above
+		t.Errorf("second recovered = %d, want 1", recovered)
+	}
+}
+
 // ── allowed_users ─────────────────────────────────────────────────────────────
 
 func TestAllowedUser_UpsertGetDelete(t *testing.T) {

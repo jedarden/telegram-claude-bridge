@@ -50,6 +50,15 @@ func main() {
 	// Initialize health checker with structured JSON logging
 	checker := health.NewChecker(cfg.ProxyURL, db.SqlDB())
 
+	// Release close claims stranded by a previous process that died while
+	// generating a close summary; without this those sessions could never
+	// be closed again.
+	if n, err := db.RecoverStuckClosingSessions(context.Background()); err != nil {
+		checker.LogWarn("recover_stuck_closing_sessions_failed", "error", err)
+	} else if n > 0 {
+		checker.LogInfo("recovered_stuck_closing_sessions", "count", n)
+	}
+
 	// The sender uses its own database for tracking sent message IDs.
 	sender, err := bridge.NewSender(cfg.ProxyURL, cfg.DBPath+".sender")
 	if err != nil {

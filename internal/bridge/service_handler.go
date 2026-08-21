@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
@@ -21,22 +22,44 @@ type SessionCloser struct {
 	proxyURL string
 	client   *http.Client
 	ptyMgr   *PTYManager
+
+	// wg tracks in-flight asynchronous close/summary goroutines.
+	wg sync.WaitGroup
+
+	// summarizeSession generates a session summary. Overridable in tests to
+	// control latency and output.
+	summarizeSession func(ctx context.Context, session *Session, group *Group) (string, error)
 }
 
 // NewSessionCloser creates a SessionCloser with the given dependencies.
 func NewSessionCloser(db *DB, sender *Sender, proxyURL string, client *http.Client, ptyMgr *PTYManager) *SessionCloser {
-	return &SessionCloser{
+	sc := &SessionCloser{
 		db:       db,
 		sender:   sender,
 		proxyURL: proxyURL,
 		client:   client,
 		ptyMgr:   ptyMgr,
 	}
+	sc.summarizeSession = sc.generateSessionSummary
+	return sc
 }
 
-// CloseSessionWithSummary generates a summary, sends it to the topic, pins it,
-// stores it in the database, and marks the session as closed.
-// This is the shared implementation used by both /close command and service messages.
+// WaitForAsyncCloses blocks until every in-flight asynchronous close/summary
+// goroutine started by CloseSessionWithSummary has finished. Intended for
+// tests and for draining before shutdown.
+func (sc *SessionCloser) WaitForAsyncCloses() {
+	sc.wg.Wait()
+}
+
+// CloseSessionWithSummary claims the session, then generates a summary,
+// sends it to the topic, pins it, stores it in the database, and marks the
+// session as closed. This is the shared implementation used by both the
+// /close command and service messages.
+//
+// Summary generation can block for up to 120s, so it runs in a goroutine:
+// CloseSessionWithSummary returns as soon as the session is claimed. The
+// claim is atomic — a second close attempt while a summary is in flight
+// (status "closing") is a no-op rather than a duplicate summary.
 func (sc *SessionCloser) CloseSessionWithSummary(ctx context.Context, chatID, threadID int64, group *Group) error {
 	session, err := sc.db.GetSession(ctx, chatID, threadID)
 	if err != nil {
@@ -49,8 +72,30 @@ func (sc *SessionCloser) CloseSessionWithSummary(ctx context.Context, chatID, th
 		return nil // Already closed, nothing to do
 	}
 
-	// Generate and pin summary before closing
-	summary, summaryErr := sc.generateSessionSummary(ctx, session, group)
+	// Atomically claim the close; if a /close command or a duplicate service
+	// event is already generating the summary, bow out.
+	claimed, err := sc.db.MarkSessionClosing(ctx, chatID, threadID)
+	if err != nil {
+		return fmt.Errorf("mark session closing: %w", err)
+	}
+	if !claimed {
+		return nil // close already in flight
+	}
+
+	sc.wg.Add(1)
+	go func() {
+		defer sc.wg.Done()
+		sc.finishClose(ctx, chatID, threadID, session, group)
+	}()
+	return nil
+}
+
+// finishClose is the asynchronous tail of CloseSessionWithSummary: generate
+// the summary, post and pin it in the topic, store it, then close the
+// session. It must only run after the session has been claimed via
+// MarkSessionClosing.
+func (sc *SessionCloser) finishClose(ctx context.Context, chatID, threadID int64, session *Session, group *Group) {
+	summary, summaryErr := sc.summarizeSession(ctx, session, group)
 	if summaryErr != nil {
 		log.Printf("[bridge/closer] generate summary failed for (%d, %d): %v", chatID, threadID, summaryErr)
 		// Continue with closing even if summary fails
@@ -84,7 +129,13 @@ func (sc *SessionCloser) CloseSessionWithSummary(ctx context.Context, chatID, th
 	}
 
 	if err := sc.db.CloseSession(ctx, chatID, threadID); err != nil {
-		return fmt.Errorf("close session: %w", err)
+		log.Printf("[bridge/closer] close session failed for (%d, %d): %v", chatID, threadID, err)
+		// Release the claim so a later close attempt can retry instead of
+		// the session being stuck in "closing" forever.
+		if revertErr := sc.db.SetSessionStatus(ctx, chatID, threadID, session.Status); revertErr != nil {
+			log.Printf("[bridge/closer] revert closing status failed for (%d, %d): %v", chatID, threadID, revertErr)
+		}
+		return
 	}
 
 	// Set the color to green (complete) when closing
@@ -94,8 +145,6 @@ func (sc *SessionCloser) CloseSessionWithSummary(ctx context.Context, chatID, th
 	if colorErr := sc.editTopicColor(ctx, chatID, threadID, ColorComplete); colorErr != nil {
 		log.Printf("[bridge/closer] edit topic color failed for (%d, %d): %v", chatID, threadID, colorErr)
 	}
-
-	return nil
 }
 
 // generateSessionSummary asks Claude to summarize the session via a transient PTY pane.

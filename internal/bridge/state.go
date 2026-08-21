@@ -896,6 +896,50 @@ func (d *DB) SetSessionStatus(ctx context.Context, chatID, threadID int64, statu
 	return err
 }
 
+// MarkSessionClosing atomically transitions a session to "closing", the
+// in-flight state used while a close summary is being generated asynchronously.
+// It returns true only when this call performed the transition; a session that
+// is already "closing" or "closed" is left untouched and reported as false, so
+// concurrent /close attempts (or a topic-closed service event racing a /close)
+// cannot start a second summary for the same session. A process that dies
+// while holding the claim is cleaned up by RecoverStuckClosingSessions at
+// startup.
+func (d *DB) MarkSessionClosing(ctx context.Context, chatID, threadID int64) (bool, error) {
+	res, err := d.db.ExecContext(ctx,
+		`UPDATE sessions SET status = 'closing'
+		  WHERE chat_id = ? AND thread_id = ? AND status NOT IN ('closing', 'closed')`,
+		chatID, threadID,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// RecoverStuckClosingSessions reverts every session still in the transient
+// "closing" state to "active". A previous process that crashed or was stopped
+// while generating a close summary leaves sessions stranded there, and a
+// stranded session can never be closed again — both /close and the
+// topic-closed service event treat "closing" as a claim held elsewhere.
+// Reverting releases the claim so the close can be retried; the summary is
+// regenerated on the retry. Called once at bridge startup.
+func (d *DB) RecoverStuckClosingSessions(ctx context.Context) (int64, error) {
+	res, err := d.db.ExecContext(ctx,
+		`UPDATE sessions SET status = 'active' WHERE status = 'closing'`)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // UpdateSessionCost adds to the total_cost_usd for a session.
 func (d *DB) UpdateSessionCost(ctx context.Context, chatID, threadID int64, costUSD float64) error {
 	_, err := d.db.ExecContext(ctx,

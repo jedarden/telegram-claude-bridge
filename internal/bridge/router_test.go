@@ -2,6 +2,11 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -97,6 +102,25 @@ func serviceUpdate(userID, chatID int64, threadID *int64, svcType string) contra
 		ThreadID: threadID,
 		FromUser: contract.FromUser{ID: userID},
 		Service:  &contract.Service{Type: svcType},
+	}
+}
+
+// commandTextUpdate builds a General-topic command update whose bot_command
+// entity covers only the command token, leaving the rest of the text as args
+// (unlike textUpdate, which marks the whole string as the command).
+func commandTextUpdate(userID, chatID int64, messageID int64, text string) contract.Update {
+	command := strings.Fields(text)[0]
+	return contract.Update{
+		UpdateID:  1,
+		Type:      "message",
+		ChatID:    chatID,
+		MessageID: messageID,
+		FromUser:  contract.FromUser{ID: userID},
+		Content: &contract.Content{
+			Type:     contract.ContentTypeText,
+			Text:     strPtr(text),
+			Entities: []contract.Entity{{Type: "bot_command", Offset: 0, Length: len([]rune(command))}},
+		},
 	}
 }
 
@@ -326,5 +350,101 @@ func TestRouter_NilHandlers_NoPanic(t *testing.T) {
 	}
 	for _, u := range updates {
 		r.Route(context.Background(), u) // must not panic
+	}
+}
+
+// TestRouter_CloseSummaryDoesNotBlockSubsequentUpdates guards against
+// head-of-line blocking on the single-threaded router loop. /close used to
+// generate its summary synchronously, so one /close stalled every other
+// update in the bridge for up to the 120s summary timeout. With the summary
+// generator stubbed to block until released, both the /close itself and a
+// subsequent command must complete without waiting for the summary.
+func TestRouter_CloseSummaryDoesNotBlockSubsequentUpdates(t *testing.T) {
+	db := openTestDB(t)
+	seedUser(t, db, 1)
+	seedGroup(t, db, 100)
+	seedSession(t, db, 100, 10)
+
+	var mu sync.Mutex
+	var sent []contract.SendRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/send":
+			var req contract.SendRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode send request: %v", err)
+				return
+			}
+			mu.Lock()
+			sent = append(sent, req)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(contract.SendResponse{OK: true, MessageID: 900})
+		case "/pin_message", "/close_topic", "/edit_topic", "/edit":
+			_ = json.NewEncoder(w).Encode(contract.OKResponse{OK: true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	sender, err := NewSender(srv.URL, t.TempDir()+"/sender.db")
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer sender.Close()
+
+	h := NewCommandHandler(db, sender, srv.URL, nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	release := make(chan struct{})
+	h.summarizeSession = func(context.Context, *Session, *Group) (string, error) {
+		<-release // simulate a summary that is slow to arrive
+		return "• did a thing", nil
+	}
+
+	r := NewRouter(db, nil)
+	r.OnCommand = h.Handle
+
+	ctx := context.Background()
+
+	// The /close route must return promptly with an ack even though summary
+	// generation blocks indefinitely.
+	start := time.Now()
+	r.Route(ctx, commandTextUpdate(1, 100, 50, "/close 10"))
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Route(/close) blocked %v behind summary generation; it must ack immediately", elapsed)
+	}
+
+	// A subsequent update must be handled without waiting for the summary.
+	start = time.Now()
+	r.Route(ctx, commandTextUpdate(1, 100, 51, "/help"))
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Route(/help) blocked %v behind in-flight /close summary; router loop is stalled", elapsed)
+	}
+
+	// /help was actually answered, not just dropped.
+	mu.Lock()
+	helpAnswered := false
+	for _, s := range sent {
+		if strings.Contains(s.Text, "Available commands:") {
+			helpAnswered = true
+		}
+	}
+	mu.Unlock()
+	if !helpAnswered {
+		t.Fatal("/help was not answered while the /close summary was still in flight")
+	}
+
+	// Let the summary finish and verify the async close completed correctly.
+	close(release)
+	h.WaitForAsyncCloses()
+
+	got, err := db.GetSession(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.Status != "closed" {
+		t.Errorf("session status = %q after async close, want closed", got.Status)
+	}
+	if got.Summary != "• did a thing" {
+		t.Errorf("session summary = %q, want %q", got.Summary, "• did a thing")
 	}
 }

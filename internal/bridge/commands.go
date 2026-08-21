@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
@@ -79,6 +80,14 @@ type CommandHandler struct {
 	bridgeVer           string
 	bridgeSHA           string
 	buildDate           string
+
+	// closeWG tracks in-flight asynchronous close/summary goroutines
+	// started by cmdClose.
+	closeWG sync.WaitGroup
+
+	// summarizeSession generates a session summary for cmdClose's async
+	// tail. Overridable in tests to control latency and output.
+	summarizeSession func(ctx context.Context, session *Session, group *Group) (string, error)
 }
 
 // UpdaterInterface defines the interface for update commands.
@@ -100,7 +109,7 @@ type UpdateResult struct {
 // eventPublisher is optional; pass nil to disable event publishing.
 // version, commitSHA, and buildDate are build-time version info.
 func NewCommandHandler(db *DB, sender *Sender, proxyURL string, updater UpdaterInterface, eventPublisher events.Publishable, version, commitSHA, buildDate string) *CommandHandler {
-	return &CommandHandler{
+	h := &CommandHandler{
 		db:             db,
 		sender:         sender,
 		proxyURL:       proxyURL,
@@ -111,6 +120,15 @@ func NewCommandHandler(db *DB, sender *Sender, proxyURL string, updater UpdaterI
 		bridgeSHA:      commitSHA,
 		buildDate:      buildDate,
 	}
+	h.summarizeSession = h.generateSessionSummary
+	return h
+}
+
+// WaitForAsyncCloses blocks until every in-flight asynchronous close/summary
+// goroutine started by cmdClose has finished. Intended for tests and for
+// draining before shutdown.
+func (h *CommandHandler) WaitForAsyncCloses() {
+	h.closeWG.Wait()
 }
 
 // SetSessionManager sets the session manager for context commands.
@@ -598,6 +616,14 @@ func (h *CommandHandler) cmdSessions(ctx context.Context) (string, error) {
 
 // cmdClose handles /close <thread_id> — marks a session as closed and
 // closes the corresponding Telegram topic via the proxy.
+//
+// Summary generation can block for up to 120s waiting on a transient Claude
+// pane, so it must not run on the router loop: every other update in the
+// bridge would queue behind it. cmdClose instead claims the session
+// atomically (status "closing"), replies with an acknowledgement, and a
+// goroutine finishes the work — see finishClose. A second /close arriving
+// while the summary is in flight sees the "closing" status and is rejected,
+// so exactly one summary is produced per session.
 func (h *CommandHandler) cmdClose(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
 	if args == "" {
 		return "Usage: /close <thread_id>", nil
@@ -622,63 +648,100 @@ func (h *CommandHandler) cmdClose(ctx context.Context, update contract.Update, g
 		return fmt.Sprintf("Session for thread %d is already closed.", threadID), nil
 	}
 
-	// Generate and pin summary before closing
-	summary, summaryErr := h.generateSessionSummary(ctx, session, group)
+	// Atomically claim the close so a concurrent /close (or a topic-closed
+	// service event racing it) cannot start a second summary.
+	claimed, err := h.db.MarkSessionClosing(ctx, update.ChatID, threadID)
+	if err != nil {
+		return "", fmt.Errorf("mark session closing: %w", err)
+	}
+	if !claimed {
+		return fmt.Sprintf("Session for thread %d is already closing — its summary will be posted shortly.", threadID), nil
+	}
+
+	h.closeWG.Add(1)
+	go func() {
+		defer h.closeWG.Done()
+		h.finishClose(ctx, update.ChatID, threadID, session, group)
+	}()
+
+	return fmt.Sprintf("Closing session for thread %d — the summary will be posted and pinned in the topic when ready.", threadID), nil
+}
+
+// finishClose is the asynchronous tail of /close: generate the summary, post
+// and pin it in the topic, store it, then close the session and the Telegram
+// topic. It must only run after cmdClose has claimed the session via
+// MarkSessionClosing.
+func (h *CommandHandler) finishClose(ctx context.Context, chatID, threadID int64, session *Session, group *Group) {
+	summary, summaryErr := h.summarizeSession(ctx, session, group)
 	if summaryErr != nil {
-		log.Printf("[bridge/commands] generate summary failed for (%d, %d): %v", update.ChatID, threadID, summaryErr)
+		log.Printf("[bridge/commands] generate summary failed for (%d, %d): %v", chatID, threadID, summaryErr)
 		// Continue with closing even if summary fails
 	}
 
 	if summary != "" {
-		// Send the summary as a new message in the topic
-		tidPtr := &threadID
 		summaryText := fmt.Sprintf("📋 <b>Session Summary</b>\n\n%s", summary)
-		var sendReq contract.SendRequest
-		sendReq.ChatID = update.ChatID
-		sendReq.ThreadID = tidPtr
-		sendReq.Text = summaryText
-		var sendResp contract.SendResponse
-		if sendErr := h.postJSON(ctx, "/send", sendReq, &sendResp); sendErr != nil {
-			log.Printf("[bridge/commands] send summary failed for (%d, %d): %v", update.ChatID, threadID, sendErr)
-		} else {
-			// Pin the summary message
-			if pinErr := h.pinMessage(ctx, update.ChatID, sendResp.MessageID); pinErr != nil {
-				log.Printf("[bridge/commands] pin summary failed for (%d, %d): %v", update.ChatID, threadID, pinErr)
-				// Non-fatal: continue anyway
-			}
+		if msgID, sendErr := h.sendTopicMessage(ctx, chatID, threadID, summaryText); sendErr != nil {
+			log.Printf("[bridge/commands] send summary failed for (%d, %d): %v", chatID, threadID, sendErr)
+		} else if pinErr := h.pinMessage(ctx, chatID, msgID); pinErr != nil {
+			log.Printf("[bridge/commands] pin summary failed for (%d, %d): %v", chatID, threadID, pinErr)
+			// Non-fatal: continue anyway
 		}
 
 		// Store the summary in the database
-		if storeErr := h.db.UpdateSessionSummary(ctx, update.ChatID, threadID, summary); storeErr != nil {
-			log.Printf("[bridge/commands] store summary failed for (%d, %d): %v", update.ChatID, threadID, storeErr)
+		if storeErr := h.db.UpdateSessionSummary(ctx, chatID, threadID, summary); storeErr != nil {
+			log.Printf("[bridge/commands] store summary failed for (%d, %d): %v", chatID, threadID, storeErr)
 			// Non-fatal: continue anyway
 		}
 	}
 
-	if err := h.db.CloseSession(ctx, update.ChatID, threadID); err != nil {
-		return "", fmt.Errorf("close session: %w", err)
+	if err := h.db.CloseSession(ctx, chatID, threadID); err != nil {
+		log.Printf("[bridge/commands] close session failed for (%d, %d): %v", chatID, threadID, err)
+		// Release the claim so a later /close can retry instead of the
+		// session being stuck in "closing" forever.
+		if revertErr := h.db.SetSessionStatus(ctx, chatID, threadID, session.Status); revertErr != nil {
+			log.Printf("[bridge/commands] revert closing status failed for (%d, %d): %v", chatID, threadID, revertErr)
+		}
+		return
 	}
 
 	// Publish session closed event
 	if h.eventPublisher != nil {
-		h.eventPublisher.PublishSessionClosed(update.ChatID, threadID, session.SessionID)
+		h.eventPublisher.PublishSessionClosed(chatID, threadID, session.SessionID)
 	}
 
 	// Set the color to green (complete) when closing
-	if colorErr := h.db.SetSessionIconColor(ctx, update.ChatID, threadID, ColorComplete); colorErr != nil {
-		log.Printf("[bridge/commands] set icon color failed for (%d, %d): %v", update.ChatID, threadID, colorErr)
+	if colorErr := h.db.SetSessionIconColor(ctx, chatID, threadID, ColorComplete); colorErr != nil {
+		log.Printf("[bridge/commands] set icon color failed for (%d, %d): %v", chatID, threadID, colorErr)
 	}
-	if colorErr := h.editTopicColor(ctx, update.ChatID, threadID, ColorComplete); colorErr != nil {
-		log.Printf("[bridge/commands] edit topic color failed for (%d, %d): %v", update.ChatID, threadID, colorErr)
-	}
-
-	// Best-effort: also close the Telegram topic via proxy.
-	if topicErr := h.closeTopic(ctx, update.ChatID, threadID); topicErr != nil {
-		log.Printf("[bridge/commands] close_topic failed for (%d, %d): %v", update.ChatID, threadID, topicErr)
-		return fmt.Sprintf("Session closed and marked complete (thread %d). Note: could not close Telegram topic: %v", threadID, topicErr), nil
+	if colorErr := h.editTopicColor(ctx, chatID, threadID, ColorComplete); colorErr != nil {
+		log.Printf("[bridge/commands] edit topic color failed for (%d, %d): %v", chatID, threadID, colorErr)
 	}
 
-	return fmt.Sprintf("Session closed and marked complete (thread %d).", threadID), nil
+	// Best-effort: also close the Telegram topic via proxy. The command has
+	// already been acknowledged, so surface a failure as a note in the topic
+	// rather than a reply.
+	if topicErr := h.closeTopic(ctx, chatID, threadID); topicErr != nil {
+		log.Printf("[bridge/commands] close_topic failed for (%d, %d): %v", chatID, threadID, topicErr)
+		note := fmt.Sprintf("⚠️ Session closed, but the Telegram topic could not be closed: %v", topicErr)
+		if _, sendErr := h.sendTopicMessage(ctx, chatID, threadID, note); sendErr != nil {
+			log.Printf("[bridge/commands] send close_topic failure note failed for (%d, %d): %v", chatID, threadID, sendErr)
+		}
+	}
+}
+
+// sendTopicMessage posts text to a forum topic via the proxy and returns the
+// new message ID.
+func (h *CommandHandler) sendTopicMessage(ctx context.Context, chatID, threadID int64, text string) (int64, error) {
+	sendReq := contract.SendRequest{
+		ChatID:   chatID,
+		ThreadID: &threadID,
+		Text:     text,
+	}
+	var sendResp contract.SendResponse
+	if err := h.postJSON(ctx, "/send", sendReq, &sendResp); err != nil {
+		return 0, err
+	}
+	return sendResp.MessageID, nil
 }
 
 // generateSessionSummary asks Claude to summarize the session via a transient PTY pane.

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -4034,16 +4035,19 @@ func TestCmdClose_SuccessWithoutSessionManager(t *testing.T) {
 		t.Fatalf("create session: %v", err)
 	}
 
-	// No session manager wired: generateSessionSummary fails, which cmdClose
-	// must tolerate and close the session anyway.
+	// No session manager wired: the default summary generator fails, which
+	// the close must tolerate and close the session anyway.
 	h := newTestCommandHandler(t, db)
 	reply, err := h.cmdClose(ctx, makeUpdate(100, &threadID, 50, "/close 10", 42), group, "10")
 	if err != nil {
 		t.Fatalf("cmdClose: %v", err)
 	}
-	if want := "Session closed and marked complete (thread 10)."; reply != want {
-		t.Errorf("reply = %q, want %q", reply, want)
+	// The close is asynchronous: cmdClose acks immediately and a goroutine
+	// finishes the summary + close.
+	if want := "Closing session for thread 10"; !strings.HasPrefix(reply, want) {
+		t.Errorf("reply = %q, want prefix %q", reply, want)
 	}
+	h.WaitForAsyncCloses()
 
 	closed, err := db.GetSession(ctx, 100, 10)
 	if err != nil {
@@ -4057,6 +4061,74 @@ func TestCmdClose_SuccessWithoutSessionManager(t *testing.T) {
 	}
 	if closed.Summary != "" {
 		t.Errorf("Summary = %q, want empty when summary generation is unavailable", closed.Summary)
+	}
+}
+
+// A second /close arriving while the first close's summary is still being
+// generated must not start a second summary — the atomic "closing" claim
+// rejects it — and the first close must still complete normally.
+func TestCmdClose_SecondCloseWhileSummaryInFlight(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+	threadID := int64(10)
+	if err := db.CreateSession(ctx, &Session{
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "sess-1",
+		CWD:       group.CWD,
+		Status:    "active",
+	}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	h := newTestCommandHandler(t, db)
+	release := make(chan struct{})
+	var summaryCalls int32
+	h.summarizeSession = func(context.Context, *Session, *Group) (string, error) {
+		atomic.AddInt32(&summaryCalls, 1)
+		<-release
+		return "• summary", nil
+	}
+
+	update := makeUpdate(100, &threadID, 50, "/close 10", 42)
+
+	reply, err := h.cmdClose(ctx, update, group, "10")
+	if err != nil {
+		t.Fatalf("first cmdClose: %v", err)
+	}
+	if !strings.Contains(reply, "Closing session for thread 10") {
+		t.Errorf("first reply = %q, want close acknowledgement", reply)
+	}
+
+	// Second /close while the summary is in flight.
+	reply, err = h.cmdClose(ctx, update, group, "10")
+	if err != nil {
+		t.Fatalf("second cmdClose: %v", err)
+	}
+	if !strings.Contains(reply, "already closing") {
+		t.Errorf("second reply = %q, want already-closing rejection", reply)
+	}
+
+	close(release)
+	h.WaitForAsyncCloses()
+
+	if got := atomic.LoadInt32(&summaryCalls); got != 1 {
+		t.Fatalf("summary generated %d times, want exactly 1", got)
+	}
+	closed, err := db.GetSession(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if closed.Status != "closed" {
+		t.Errorf("Status = %q, want closed", closed.Status)
+	}
+	if closed.Summary != "• summary" {
+		t.Errorf("Summary = %q, want %q", closed.Summary, "• summary")
 	}
 }
 
