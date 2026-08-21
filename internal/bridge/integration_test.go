@@ -17,6 +17,401 @@ import (
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
 )
 
+// ── SessionCleanup Integration Tests ─────────────────────────────────────────────────
+
+// TestSessionCleanup_MarkInactive_KillsTmuxPane verifies that MarkInactive kills the
+// associated tmux pane and marks the session as inactive in the database.
+func TestSessionCleanup_MarkInactive_KillsTmuxPane(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create test group
+	group := &Group{
+		ChatID:       -100, // Negative for Telegram groups
+		Name:         "test-group",
+		CWD:          "/tmp/test",
+		DefaultModel: "claude-sonnet-4-6",
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	// Create an active session with a tmux pane
+	session := &Session{
+		ChatID:     -100,
+		ThreadID:   42,
+		SessionID:  "test-session-1",
+		CWD:        "/tmp/test",
+		Model:      "claude-sonnet-4-6",
+		Status:     "active",
+		CreatedAt:  time.Now().UTC(),
+		LastActive: time.Now().UTC(),
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Set up tmux test fixtures
+	tmuxState := setupTmuxTest(t)
+
+	// Create SessionCleanup instance
+	sender := newIntegrationTestSender(t)
+	ptyMgr := NewPTYManager()
+	cleanup := NewSessionCleanup(db, sender, ptyMgr, 0, 0, false, 0)
+
+	// Call MarkInactive
+	if err := cleanup.MarkInactive(ctx, session); err != nil {
+		t.Fatalf("MarkInactive: %v", err)
+	}
+
+	// Verify session status is now inactive
+	sess, err := db.GetSession(ctx, -100, 42)
+	if err != nil {
+		t.Fatalf("get session after cleanup: %v", err)
+	}
+	if sess == nil {
+		t.Fatal("session not found after cleanup")
+	}
+	if sess.Status != "inactive" {
+		t.Errorf("session status = %q, want inactive", sess.Status)
+	}
+
+	// Verify tmux kill-window was called
+	calls := tmuxState.tmuxCalls(t)
+	var killCallFound bool
+	var killCallTarget string
+	for _, call := range calls {
+		if strings.Contains(call, "kill-window") {
+			killCallFound = true
+			// Extract the target from: tmux kill-window -t telegram-bridge:t100-42
+			parts := strings.Fields(call)
+			for i, part := range parts {
+				if part == "-t" && i+1 < len(parts) {
+					killCallTarget = parts[i+1]
+					break
+				}
+			}
+			break
+		}
+	}
+	if !killCallFound {
+		t.Error("tmux kill-window was not called, pane may be orphaned")
+	}
+	// Verify the target matches the expected pane naming: t{absChatID}-{threadID}
+	expectedTarget := fmt.Sprintf("%s:t100-42", tmuxSessionName)
+	if killCallTarget != expectedTarget {
+		t.Errorf("kill-window target = %q, want %q", killCallTarget, expectedTarget)
+	}
+}
+
+// TestSessionCleanup_MarkInactive_PaneAlreadyDead verifies that MarkInactive handles
+// the case where the tmux pane is already dead gracefully.
+func TestSessionCleanup_MarkInactive_PaneAlreadyDead(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create test group
+	group := &Group{
+		ChatID:       -200,
+		Name:         "test-group-2",
+		CWD:          "/tmp/test-2",
+		DefaultModel: "claude-sonnet-4-6",
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	// Create an active session
+	session := &Session{
+		ChatID:     -200,
+		ThreadID:   99,
+		SessionID:  "test-session-2",
+		CWD:        "/tmp/test-2",
+		Model:      "claude-sonnet-4-6",
+		Status:     "active",
+		CreatedAt:  time.Now().UTC(),
+		LastActive: time.Now().UTC(),
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Set up tmux test fixtures with a failing kill-window (pane already dead)
+	tmuxState := setupTmuxTest(t)
+	mockTmuxCommandFailure(t, "kill-window", "pane doesn't exist: telegram-bridge:t200-99\n", 1)
+
+	// Create SessionCleanup instance
+	sender := newIntegrationTestSender(t)
+	ptyMgr := NewPTYManager()
+	cleanup := NewSessionCleanup(db, sender, ptyMgr, 0, 0, false, 0)
+
+	// Call MarkInactive - should not fail even if pane is already dead
+	if err := cleanup.MarkInactive(ctx, session); err != nil {
+		t.Fatalf("MarkInactive with dead pane should not fail: %v", err)
+	}
+
+	// Verify session status is still inactive despite pane failure
+	sess, err := db.GetSession(ctx, -200, 99)
+	if err != nil {
+		t.Fatalf("get session after cleanup: %v", err)
+	}
+	if sess == nil {
+		t.Fatal("session not found after cleanup")
+	}
+	if sess.Status != "inactive" {
+		t.Errorf("session status = %q, want inactive (cleanup should succeed despite dead pane)", sess.Status)
+	}
+
+	// Verify tmux kill-window was attempted
+	calls := tmuxState.tmuxCalls(t)
+	var killCallFound bool
+	for _, call := range calls {
+		if strings.Contains(call, "kill-window") {
+			killCallFound = true
+			break
+		}
+	}
+	if !killCallFound {
+		t.Error("tmux kill-window was not attempted")
+	}
+}
+
+// TestSessionCleanup_sweepStaleWorkers_ForceFailsStaleWorkers verifies the
+// orphan-worker handling path: workers stuck in 'running' past the TTL are
+// force-failed in the DB, their tmux panes are killed, and fresh or already
+// completed workers are left untouched.
+func TestSessionCleanup_sweepStaleWorkers_ForceFailsStaleWorkers(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Stale worker with a live pane: ID[:8] = "worker_1" matches the fixture
+	// window "w-worker_1-1234567890" from tmuxListWindowsOutput.
+	staleWithPane := &Worker{
+		ID:        "worker_1_1000",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "orphaned task",
+		Status:    "running",
+		StartedAt: now.Add(-2 * time.Hour),
+	}
+	// Stale worker whose pane is already gone (bridge crash cleanup path).
+	staleNoPane := &Worker{
+		ID:        "worker_2_2000",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1001,
+		Prompt:    "orphaned task without pane",
+		Status:    "running",
+		StartedAt: now.Add(-3 * time.Hour),
+	}
+	// Fresh worker: still legitimately running, must survive the sweep.
+	fresh := &Worker{
+		ID:        "worker_3_3000",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1002,
+		Prompt:    "active task",
+		Status:    "running",
+		StartedAt: now.Add(-5 * time.Minute),
+	}
+	// Old but already finished: only 'running' workers are orphans.
+	done := &Worker{
+		ID:        "worker_4_4000",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1003,
+		Prompt:    "finished task",
+		Status:    "done",
+		Result:    "Complete",
+		StartedAt: now.Add(-2 * time.Hour),
+	}
+	for _, w := range []*Worker{staleWithPane, staleNoPane, fresh, done} {
+		if err := db.CreateWorker(ctx, w); err != nil {
+			t.Fatalf("CreateWorker %s: %v", w.ID, err)
+		}
+	}
+	if err := db.UpdateWorker(ctx, done.ID, "done", "Complete", ""); err != nil {
+		t.Fatalf("UpdateWorker done: %v", err)
+	}
+
+	tmuxState := setupTmuxTest(t)
+	sender := newIntegrationTestSender(t)
+	ptyMgr := NewPTYManager()
+	cleanup := NewSessionCleanup(db, sender, ptyMgr, 0, 0, false, 1*time.Hour)
+
+	cleanup.sweepStaleWorkers(ctx)
+
+	// Stale worker with pane: force-failed with the TTL error, finished_at set.
+	got, err := db.GetWorker(ctx, staleWithPane.ID)
+	if err != nil {
+		t.Fatalf("GetWorker %s: %v", staleWithPane.ID, err)
+	}
+	if got == nil {
+		t.Fatalf("worker %s record missing after sweep", staleWithPane.ID)
+	}
+	if got.Status != "failed" {
+		t.Errorf("stale worker status = %q, want failed", got.Status)
+	}
+	const wantErr = "Force-failed: exceeded worker TTL after bridge restart or crash"
+	if got.Error != wantErr {
+		t.Errorf("stale worker error = %q, want %q", got.Error, wantErr)
+	}
+	if got.Result != "" {
+		t.Errorf("stale worker result = %q, want empty", got.Result)
+	}
+	if got.FinishedAt == nil || got.FinishedAt.IsZero() {
+		t.Error("stale worker FinishedAt should be set after force-fail")
+	}
+
+	// Stale worker without a pane: still force-failed (pane already dead path).
+	got, err = db.GetWorker(ctx, staleNoPane.ID)
+	if err != nil {
+		t.Fatalf("GetWorker %s: %v", staleNoPane.ID, err)
+	}
+	if got == nil {
+		t.Fatalf("worker %s record missing after sweep", staleNoPane.ID)
+	}
+	if got.Status != "failed" {
+		t.Errorf("paneless stale worker status = %q, want failed", got.Status)
+	}
+	if got.FinishedAt == nil || got.FinishedAt.IsZero() {
+		t.Error("paneless stale worker FinishedAt should be set after force-fail")
+	}
+
+	// Fresh worker: still running, no finish timestamp.
+	got, err = db.GetWorker(ctx, fresh.ID)
+	if err != nil {
+		t.Fatalf("GetWorker %s: %v", fresh.ID, err)
+	}
+	if got == nil {
+		t.Fatalf("worker %s record missing after sweep", fresh.ID)
+	}
+	if got.Status != "running" {
+		t.Errorf("fresh worker status = %q, want running", got.Status)
+	}
+	if got.FinishedAt != nil {
+		t.Errorf("fresh worker FinishedAt = %v, want nil", got.FinishedAt)
+	}
+	if got.Error != "" {
+		t.Errorf("fresh worker error = %q, want empty", got.Error)
+	}
+
+	// Completed worker: untouched by the sweep.
+	got, err = db.GetWorker(ctx, done.ID)
+	if err != nil {
+		t.Fatalf("GetWorker %s: %v", done.ID, err)
+	}
+	if got == nil {
+		t.Fatalf("worker %s record missing after sweep", done.ID)
+	}
+	if got.Status != "done" {
+		t.Errorf("done worker status = %q, want done", got.Status)
+	}
+	if got.Error != "" {
+		t.Errorf("done worker error = %q, want empty", got.Error)
+	}
+
+	// Running counts reflect only the surviving fresh worker.
+	runningTopic, err := db.CountRunningWorkers(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("CountRunningWorkers: %v", err)
+	}
+	if runningTopic != 1 {
+		t.Errorf("topic running workers = %d, want 1 (fresh only)", runningTopic)
+	}
+	runningGlobal, err := db.CountRunningWorkersGlobal(ctx)
+	if err != nil {
+		t.Fatalf("CountRunningWorkersGlobal: %v", err)
+	}
+	if runningGlobal != 1 {
+		t.Errorf("global running workers = %d, want 1 (fresh only)", runningGlobal)
+	}
+
+	// The stale worker's pane was killed with the expected target.
+	calls := tmuxState.tmuxCalls(t)
+	killTarget := fmt.Sprintf("%s:w-worker_1-1234567890", tmuxSessionName)
+	killCount := 0
+	for _, call := range calls {
+		if strings.Contains(call, "kill-window") {
+			killCount++
+			if !strings.Contains(call, "-t "+killTarget) {
+				t.Errorf("kill-window call = %q, want target %q", call, killTarget)
+			}
+		}
+	}
+	if killCount != 1 {
+		t.Errorf("kill-window call count = %d, want 1 (stale worker's pane only)", killCount)
+	}
+
+	// Sweeping again must be a no-op: force-failed workers are no longer stale.
+	cleanup.sweepStaleWorkers(ctx)
+	callsAfter := tmuxState.tmuxCalls(t)
+	killCountAfter := 0
+	for _, call := range callsAfter {
+		if strings.Contains(call, "kill-window") {
+			killCountAfter++
+		}
+	}
+	if killCountAfter != killCount {
+		t.Errorf("kill-window call count after second sweep = %d, want %d (sweep should be idempotent)", killCountAfter, killCount)
+	}
+	runningAfter, err := db.CountRunningWorkers(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("CountRunningWorkers after second sweep: %v", err)
+	}
+	if runningAfter != 1 {
+		t.Errorf("running workers after second sweep = %d, want 1", runningAfter)
+	}
+}
+
+// TestSessionCleanup_sweepStaleWorkers_NoStaleWorkers verifies that a sweep
+// with no stale workers neither writes to the DB nor kills any pane.
+func TestSessionCleanup_sweepStaleWorkers_NoStaleWorkers(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	fresh := &Worker{
+		ID:        "worker-fresh-only",
+		ChatID:    100,
+		ThreadID:  10,
+		ParentMsg: 1000,
+		Prompt:    "active task",
+		Status:    "running",
+		StartedAt: now.Add(-1 * time.Minute),
+	}
+	if err := db.CreateWorker(ctx, fresh); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	tmuxState := setupTmuxTest(t)
+	sender := newIntegrationTestSender(t)
+	ptyMgr := NewPTYManager()
+	cleanup := NewSessionCleanup(db, sender, ptyMgr, 0, 0, false, 1*time.Hour)
+
+	cleanup.sweepStaleWorkers(ctx)
+
+	got, err := db.GetWorker(ctx, fresh.ID)
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+	if got == nil {
+		t.Fatal("worker record missing after sweep")
+	}
+	if got.Status != "running" {
+		t.Errorf("fresh worker status = %q, want running", got.Status)
+	}
+	for _, call := range tmuxState.tmuxCalls(t) {
+		if strings.Contains(call, "kill-window") {
+			t.Errorf("unexpected kill-window call with no stale workers: %q", call)
+		}
+	}
+}
+
 // ── WorkerPool Integration Tests ────────────────────────────────────────────────────
 
 // newIntegrationTestSender creates a real Sender with a temp DB for integration testing.
@@ -3129,19 +3524,65 @@ func TestWorkerPool_SpawnWorker_CreateWorkerError(t *testing.T) {
 
 	sender := newIntegrationTestSender(t)
 	sm := newTestSessionManagerWithTmux(t, db, sender)
-	wp := NewWorkerPool(db, sender, sm, 10)
+	// Global ceiling of 1 so a leaked slot would block the retry below.
+	wp := NewWorkerPool(db, sender, sm, 1)
 
 	inputJSON := json.RawMessage(`{"prompt":"test task"}`)
 
-	// Close DB before spawning (will fail at CreateWorker)
-	db.Close()
+	// Fail only worker INSERTs via a trigger; reads must keep working so
+	// SpawnWorker passes the running-worker count and fails at CreateWorker.
+	// (Closing the DB fails earlier, at CountRunningWorkers.)
+	if _, err := db.db.ExecContext(ctx,
+		`CREATE TRIGGER fail_worker_insert BEFORE INSERT ON workers
+		 BEGIN
+		     SELECT RAISE(ABORT, 'injected insert failure');
+		 END`); err != nil {
+		t.Fatalf("create fail-insert trigger: %v", err)
+	}
 
 	_, _, err := wp.SpawnWorker(ctx, 100, 10, 1000, group, inputJSON)
 	if err == nil {
-		t.Error("expected error when CreateWorker fails, got nil")
+		t.Fatal("expected error when CreateWorker fails, got nil")
 	}
-	if err != nil && !containsSubstring(err.Error(), "create worker record") {
+	if !containsSubstring(err.Error(), "create worker record") {
 		t.Errorf("error = %q, want substring 'create worker record'", err.Error())
+	}
+
+	// No half-created row: nothing counts as running for the topic.
+	running, err := db.CountRunningWorkers(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("CountRunningWorkers after failed create: %v", err)
+	}
+	if running != 0 {
+		t.Errorf("running workers after failed create = %d, want 0", running)
+	}
+
+	// Drop the trigger and spawn again. With a global ceiling of 1 this only
+	// succeeds if the failed spawn released its process-wide worker slot.
+	if _, err := db.db.ExecContext(ctx, `DROP TRIGGER fail_worker_insert`); err != nil {
+		t.Fatalf("drop fail-insert trigger: %v", err)
+	}
+	workerID, index, err := wp.SpawnWorker(ctx, 100, 10, 1001, group, inputJSON)
+	if err != nil {
+		t.Fatalf("SpawnWorker after create failure: %v (global worker slot was not released)", err)
+	}
+	if workerID == "" {
+		t.Error("workerID should not be empty on successful retry")
+	}
+	// The failed spawn consumed topic index 1 before CreateWorker ran.
+	if index != 2 {
+		t.Errorf("retry worker index = %d, want 2", index)
+	}
+
+	retry, err := db.GetWorker(ctx, workerID)
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+	if retry == nil {
+		t.Fatal("retry worker record not found in DB")
+	}
+	if retry.Status != "running" {
+		t.Errorf("retry worker status = %q, want running", retry.Status)
 	}
 }
 

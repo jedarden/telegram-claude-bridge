@@ -1657,10 +1657,13 @@ func (d *DB) CreateWorker(ctx context.Context, w *Worker) error {
 }
 
 // UpdateWorker updates status, result, error, session_id, and finished_at for a worker.
+// finished_at is written as RFC3339 UTC so it round-trips through scanWorker;
+// datetime('now') output ("2006-01-02 15:04:05") failed the RFC3339 parse and
+// read back as a zero time.
 func (d *DB) UpdateWorker(ctx context.Context, id, status, result, errorMsg string) error {
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE workers
-			 SET status = ?, result = ?, error = ?, finished_at = datetime('now')
+			 SET status = ?, result = ?, error = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 			 WHERE id = ?`,
 		status, nullableString(result), nullableString(errorMsg), id,
 	)
@@ -1768,6 +1771,18 @@ type workerScanner interface {
 	Scan(dest ...any) error
 }
 
+// parseDBTime parses a worker timestamp stored either as RFC3339 (the current
+// writer format) or as SQLite datetime('now') output ("2006-01-02 15:04:05",
+// UTC) written by older versions. Without the fallback, legacy rows parse to
+// the zero time.
+func parseDBTime(s string) time.Time {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t
+	}
+	t, _ := time.Parse("2006-01-02 15:04:05", s)
+	return t
+}
+
 func scanWorker(s workerScanner) (*Worker, error) {
 	var w Worker
 	var startedAt string
@@ -1788,9 +1803,9 @@ func scanWorker(s workerScanner) (*Worker, error) {
 	w.Model = model.String
 	w.Result = result.String
 	w.Error = errMsg.String
-	w.StartedAt, _ = time.Parse(time.RFC3339, startedAt)
+	w.StartedAt = parseDBTime(startedAt)
 	if finishedAt.Valid {
-		t, _ := time.Parse(time.RFC3339, finishedAt.String)
+		t := parseDBTime(finishedAt.String)
 		w.FinishedAt = &t
 	}
 	if w.Status == "" {
