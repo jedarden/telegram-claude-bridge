@@ -1921,7 +1921,9 @@ func TestSplitParallelPrompts_UnicodeContent(t *testing.T) {
 }
 
 func TestSplitParallelPrompts_LongPrompts(t *testing.T) {
-	// Create very long prompts (>1000 chars each)
+	// Create very long prompts (>1000 chars each). The repeat units end in a
+	// space, which the splitter's outer TrimSpace removes — expect the trimmed
+	// lengths, not the raw ones.
 	longPrompt1 := strings.Repeat("Analyze this complex scenario where ", 100)
 	longPrompt2 := strings.Repeat("Process this extended data set with ", 100)
 
@@ -1931,11 +1933,11 @@ func TestSplitParallelPrompts_LongPrompts(t *testing.T) {
 	if len(prompts) != 2 {
 		t.Fatalf("got %d prompts, want 2", len(prompts))
 	}
-	if len(prompts[0]) != len(longPrompt1) {
-		t.Errorf("prompt 0 length = %d, want %d (full prompt preserved)", len(prompts[0]), len(longPrompt1))
+	if want := strings.TrimSpace(longPrompt1); prompts[0] != want {
+		t.Errorf("prompt 0 length = %d, want %d (full prompt preserved)", len(prompts[0]), len(want))
 	}
-	if len(prompts[1]) != len(longPrompt2) {
-		t.Errorf("prompt 1 length = %d, want %d (full prompt preserved)", len(prompts[1]), len(longPrompt2))
+	if want := strings.TrimSpace(longPrompt2); prompts[1] != want {
+		t.Errorf("prompt 1 length = %d, want %d (full prompt preserved)", len(prompts[1]), len(want))
 	}
 }
 
@@ -3912,7 +3914,8 @@ func TestSplitParallelPrompts_UnicodeCharacters(t *testing.T) {
 }
 
 func TestSplitParallelPrompts_LongPrompt(t *testing.T) {
-	// Create a very long prompt (10KB)
+	// Create a very long prompt (10KB). The repeat unit ends in a space, which
+	// the splitter's outer TrimSpace removes — expect the trimmed prompt.
 	longPrompt := strings.Repeat("This is a long prompt line. ", 200)
 	input := longPrompt + "\n---\nShort prompt"
 	prompts := splitParallelPrompts(input)
@@ -3920,8 +3923,8 @@ func TestSplitParallelPrompts_LongPrompt(t *testing.T) {
 	if len(prompts) != 2 {
 		t.Fatalf("got %d prompts, want 2", len(prompts))
 	}
-	if len(prompts[0]) != len(longPrompt) {
-		t.Errorf("long prompt length = %d, want %d (preserved)", len(prompts[0]), len(longPrompt))
+	if want := strings.TrimSpace(longPrompt); prompts[0] != want {
+		t.Errorf("long prompt length = %d, want %d (preserved)", len(prompts[0]), len(want))
 	}
 	if prompts[1] != "Short prompt" {
 		t.Errorf("prompt 1 = %q, want 'Short prompt'", prompts[1])

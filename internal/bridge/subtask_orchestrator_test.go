@@ -10,64 +10,27 @@ import (
 )
 
 // TestSplitParallelPrompts_EmptyInputs tests empty and whitespace-only inputs.
-// Verifies fallback behavior: empty/whitespace inputs return 1 prompt (trimmed original) instead of 0.
+// Empty prompts are filtered out, so these inputs yield zero prompts; the
+// caller (cmdParallel) then reports "No prompts found". This matches the
+// line-based splitter landed in c0484ef and asserted in commands_test.go
+// ("empty input" → nil).
 func TestSplitParallelPrompts_EmptyInputs(t *testing.T) {
 	tests := []struct {
-		name        string
-		input       string
-		wantLen     int
-		wantPrompts []string
+		name  string
+		input string
 	}{
-		{
-			name:        "empty string returns empty prompt",
-			input:       "",
-			wantLen:     1,
-			wantPrompts: []string{""},
-		},
-		{
-			name:        "single newline returns empty prompt",
-			input:       "\n",
-			wantLen:     1,
-			wantPrompts: []string{""},
-		},
-		{
-			name:        "multiple newlines only returns empty prompt",
-			input:       "\n\n\n",
-			wantLen:     1,
-			wantPrompts: []string{""},
-		},
-		{
-			name:        "spaces only returns empty prompt",
-			input:       "     ",
-			wantLen:     1,
-			wantPrompts: []string{""},
-		},
-		{
-			name:        "tabs and spaces returns empty prompt",
-			input:       "\t\t  \t  ",
-			wantLen:     1,
-			wantPrompts: []string{""},
-		},
-		{
-			name:        "mixed whitespace returns empty prompt",
-			input:       "   \n  \t\n   ",
-			wantLen:     1,
-			wantPrompts: []string{""},
-		},
+		{name: "empty string returns no prompts", input: ""},
+		{name: "single newline returns no prompts", input: "\n"},
+		{name: "multiple newlines only returns no prompts", input: "\n\n\n"},
+		{name: "spaces only returns no prompts", input: "     "},
+		{name: "tabs and spaces returns no prompts", input: "\t\t  \t  "},
+		{name: "mixed whitespace returns no prompts", input: "   \n  \t\n   "},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			prompts := splitParallelPrompts(tt.input)
-			if len(prompts) != tt.wantLen {
-				t.Errorf("got %d prompts, want %d", len(prompts), tt.wantLen)
-			}
-			if tt.wantPrompts != nil && len(prompts) > 0 {
-				for i, want := range tt.wantPrompts {
-					if prompts[i] != want {
-						t.Errorf("prompt[%d] = %q, want %q", i, prompts[i], want)
-					}
-				}
+			if prompts := splitParallelPrompts(tt.input); len(prompts) != 0 {
+				t.Errorf("got %d prompts (%q), want 0", len(prompts), prompts)
 			}
 		})
 	}
@@ -426,7 +389,7 @@ func TestSplitParallelPrompts_LongInputs(t *testing.T) {
 	}{
 		{
 			name:         "single long prompt (10000 chars)",
-			input:        strings.Repeat("This is a very long prompt. ", 357), // ~10008 chars
+			input:        strings.Repeat("This is a very long prompt. ", 358), // 358 * 28 = 10024 chars
 			wantLen:      1,
 			minPromptLen: 10000,
 		},
@@ -867,6 +830,10 @@ func TestSplitParallelPrompts_VeryLongSinglePrompt(t *testing.T) {
 		minLength int
 	}{
 		{
+			name:      "100 character prompt",
+			minLength: 100,
+		},
+		{
 			name:      "1000 character prompt",
 			minLength: 1000,
 		},
@@ -878,18 +845,58 @@ func TestSplitParallelPrompts_VeryLongSinglePrompt(t *testing.T) {
 			name:      "100000 character prompt",
 			minLength: 100000,
 		},
+		{
+			name:      "1000000 character prompt",
+			minLength: 1000000,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Generate a long prompt without delimiters
-			longText := strings.Repeat("This is a test prompt with content. ", tt.minLength/40)
+			// Generate a long prompt without delimiters. The repeat unit is 36
+			// bytes, so a minLength/N divisor comes up short — use ceiling
+			// division to keep the generated length >= minLength.
+			const unit = "This is a test prompt with content. "
+			longText := strings.Repeat(unit, tt.minLength/len(unit)+1)
 			prompts := splitParallelPrompts(longText)
 			if len(prompts) != 1 {
-				t.Errorf("got %d prompts, want 1", len(prompts))
+				t.Fatalf("got %d prompts, want 1", len(prompts))
 			}
 			if len(prompts[0]) < tt.minLength {
 				t.Errorf("got prompt length %d, want >= %d", len(prompts[0]), tt.minLength)
+			}
+		})
+	}
+}
+
+// TestSplitParallelPrompts_ByteBoundaryLengths verifies that single prompts
+// whose length lands exactly on common power-of-two byte boundaries pass
+// through intact — no truncation, no rune corruption. The 4096 and 8192
+// boundaries matter because the Telegram sender splits at maxMessageLen
+// (4096); splitParallelPrompts itself must never pre-truncate.
+func TestSplitParallelPrompts_ByteBoundaryLengths(t *testing.T) {
+	tests := []struct {
+		name string
+		n    int
+	}{
+		{name: "exactly 256 bytes", n: 256},
+		{name: "exactly 512 bytes", n: 512},
+		{name: "exactly 1024 bytes", n: 1024},
+		{name: "exactly 4096 bytes (maxMessageLen)", n: 4096},
+		{name: "exactly 8192 bytes (2 * maxMessageLen)", n: 8192},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompts := splitParallelPrompts(strings.Repeat("a", tt.n))
+			if len(prompts) != 1 {
+				t.Fatalf("got %d prompts, want 1", len(prompts))
+			}
+			if len(prompts[0]) != tt.n {
+				t.Errorf("got prompt length %d, want exactly %d (no truncation)", len(prompts[0]), tt.n)
+			}
+			if !utf8.ValidString(prompts[0]) {
+				t.Errorf("prompt is not valid UTF-8")
 			}
 		})
 	}
@@ -2215,23 +2222,21 @@ func TestSplitParallelPrompts_LengthLimitBoundaries(t *testing.T) {
 		verify      func([]string) bool
 	}{
 		// ── Empty and zero-length inputs ─────────────────────────────────────────
+		// Empty prompts are filtered out; these inputs yield zero prompts.
 		{
-			name:        "empty string length 0",
-			input:       "",
-			wantLen:     1,
-			wantPrompts: []string{""},
+			name:    "empty string length 0",
+			input:   "",
+			wantLen: 0,
 		},
 		{
-			name:        "single newline",
-			input:       "\n",
-			wantLen:     1,
-			wantPrompts: []string{""},
+			name:    "single newline",
+			input:   "\n",
+			wantLen: 0,
 		},
 		{
-			name:        "multiple newlines only",
-			input:       "\n\n\n",
-			wantLen:     1,
-			wantPrompts: []string{""},
+			name:    "multiple newlines only",
+			input:   "\n\n\n",
+			wantLen: 0,
 		},
 		// ── Single character prompts ───────────────────────────────────────────────
 		{
@@ -2253,16 +2258,14 @@ func TestSplitParallelPrompts_LengthLimitBoundaries(t *testing.T) {
 			wantPrompts: []string{"?"},
 		},
 		{
-			name:        "single space",
-			input:       " ",
-			wantLen:     1,
-			wantPrompts: []string{""},
+			name:    "single space",
+			input:   " ",
+			wantLen: 0,
 		},
 		{
-			name:        "single tab",
-			input:       "\t",
-			wantLen:     1,
-			wantPrompts: []string{""},
+			name:    "single tab",
+			input:   "\t",
+			wantLen: 0,
 		},
 		{
 			name:        "two single-char prompts with delimiter",
