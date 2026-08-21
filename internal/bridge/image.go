@@ -16,9 +16,12 @@ import (
 
 const (
 	imageMaxDim     = 800
-	imageTempDir    = "/tmp/telegram-bridge"
 	imageJPEGQuality = 85
 )
+
+// imageTempDir stages downloaded media before it is sent to Claude.
+// It is a var so tests can redirect it to an isolated location.
+var imageTempDir = "/tmp/telegram-bridge"
 
 // processPhoto downloads, saves, and resizes a photo from a Telegram update.
 // Returns the local file path on success. The caller is responsible for

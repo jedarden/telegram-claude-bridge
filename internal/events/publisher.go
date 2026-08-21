@@ -5,6 +5,7 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -231,13 +232,7 @@ func (p *Publisher) monitorConnection(ctx context.Context) {
 				continue
 			}
 
-			// Try to peek at the connection — if it's dead, close it
-			oneByte := make([]byte, 1)
-			conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
-			_, err := conn.Read(oneByte)
-			conn.SetReadDeadline(time.Time{})
-
-			if err != nil {
+			if !probeConnAlive(conn) {
 				p.mu.Lock()
 				if p.conn == conn {
 					p.conn.Close()
@@ -248,6 +243,25 @@ func (p *Publisher) monitorConnection(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// probeConnAlive reports whether a connection still has a live peer. It peeks
+// with a short read deadline: a timeout means the peer is idle but alive, while
+// EOF, reset, or closed-pipe errors mean the peer is gone.
+func probeConnAlive(conn net.Conn) bool {
+	oneByte := make([]byte, 1)
+	conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+	_, err := conn.Read(oneByte)
+	conn.SetReadDeadline(time.Time{})
+
+	if err == nil {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true // idle, not dead
+	}
+	return false
 }
 
 // Publish writes an event to the socket if a listener is connected.

@@ -332,6 +332,27 @@ func TestPublisherUnixSocketIntegration(t *testing.T) {
 	}
 	defer conn.Close()
 
+	// Dial returns as soon as the kernel queues the connection, but the
+	// publisher's accept loop hasn't necessarily registered it yet — events
+	// published before registration are dropped by design. Wait for the
+	// connection to be registered before publishing.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		pub.mu.RLock()
+		registered := pub.conn != nil
+		pub.mu.RUnlock()
+		if registered {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Publisher did not register the client connection within 2s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Bound the read so a dropped event fails the test instead of hanging it
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
 	// Publish some events
 	pub.PublishMessageIn(-1001234567890, 42, "#trading-bot", "@jed", "test message")
 	pub.PublishMessageOutStreaming(-1001234567890, 42, "#trading-bot", 100, 500)
@@ -427,6 +448,30 @@ func TestPublisherNonBlockingDrops(t *testing.T) {
 	pub.PublishMessageOutComplete(-1001234567890, 42, "#test", 100, 0.01, 1000)
 
 	// If we got here without blocking or panicking, the test passes
+}
+
+// TestProbeConnAliveIdleKept verifies the health probe treats a timeout from
+// its own short deadline as "idle but alive" — the monitor used to close any
+// connection that was quiet at a 5s tick, disconnecting a healthy dashboard.
+func TestProbeConnAliveIdleKept(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	if !probeConnAlive(server) {
+		t.Error("probeConnAlive reported a healthy idle connection as dead")
+	}
+}
+
+// TestProbeConnAliveClosedDetected verifies the probe does flag connections
+// whose peer is gone (EOF / closed pipe), so dead listeners still get reaped.
+func TestProbeConnAliveClosedDetected(t *testing.T) {
+	client, server := net.Pipe()
+	client.Close()
+
+	if probeConnAlive(server) {
+		t.Error("probeConnAlive reported a closed connection as alive")
+	}
 }
 
 // testLogger is a minimal logger for testing.

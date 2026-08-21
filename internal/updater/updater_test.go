@@ -665,6 +665,14 @@ func (m *mockDB) ListGroups(ctx context.Context) ([]mockGroup, error) {
 
 func TestBuildNewBinary(t *testing.T) {
 	t.Run("fails when go binary not found", func(t *testing.T) {
+		// buildNewBinary falls back to absolute install locations that
+		// need neither PATH nor HOME. Where one of them exists — e.g. the
+		// official golang Docker image used by CI, with
+		// /usr/local/go/bin/go — the not-found path is unreachable.
+		if _, err := os.Stat("/usr/local/go/bin/go"); err == nil {
+			t.Skip("go installed at /usr/local/go/bin/go; fallback-exhaustion path cannot be triggered here")
+		}
+
 		tempDir := t.TempDir()
 		initTestRepo(t, tempDir)
 

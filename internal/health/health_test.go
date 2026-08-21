@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,19 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+// fakeClaudeInPATH prepends a directory containing a stub "claude" executable
+// to PATH so the claude_cli health check passes on any machine — CI
+// containers run the tests without the real CLI installed.
+func fakeClaudeInPATH(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "claude")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to write claude stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
 
 func TestNewChecker(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
@@ -104,6 +118,10 @@ func TestCheckerLogger(t *testing.T) {
 }
 
 func TestCheckerCheck(t *testing.T) {
+	// Several subtests assert overall health, which requires the claude_cli
+	// check to pass — stub it since CI has no real CLI installed.
+	fakeClaudeInPATH(t)
+
 	// Create a test database
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -438,6 +456,10 @@ func TestCheckerCheckClaudeCLI(t *testing.T) {
 }
 
 func TestGetTelegramPollingStatus(t *testing.T) {
+	// Subtests assert overall health, which requires the claude_cli check
+	// to pass — stub it since CI has no real CLI installed.
+	fakeClaudeInPATH(t)
+
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("sql.Open() error = %v", err)
@@ -662,6 +684,11 @@ func TestGetTelegramPollingStatus(t *testing.T) {
 }
 
 func TestServer(t *testing.T) {
+	// The "Server handles GET request" subtest asserts an overall-healthy
+	// /health response, which requires the claude_cli check to pass — stub
+	// it since CI has no real CLI installed.
+	fakeClaudeInPATH(t)
+
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("sql.Open() error = %v", err)

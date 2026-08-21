@@ -881,15 +881,15 @@ func TestProcessAudio_ErrorPaths(t *testing.T) {
 			MimeType: &mime,
 		}
 
-		// Make imageTempDir read-only to force mkdir failure
-		originalMode, err := os.Stat(imageTempDir)
-		require.NoError(t, err, "stat imageTempDir")
-
-		// Make imageTempDir read-only
-		os.Chmod(imageTempDir, 0o444)
-		t.Cleanup(func() {
-			os.Chmod(imageTempDir, originalMode.Mode()) // restore permissions
-		})
+		// Force the MkdirAll inside processAudio to fail by pointing
+		// imageTempDir at a regular file (ENOTDIR). Unlike chmod'ing the
+		// directory read-only, this works when running as root (CI
+		// containers) and doesn't depend on /tmp/telegram-bridge
+		// already existing.
+		originalDir := imageTempDir
+		imageTempDir = filepath.Join(t.TempDir(), "not-a-dir")
+		require.NoError(t, os.WriteFile(imageTempDir, []byte("x"), 0o644), "create blocking file")
+		t.Cleanup(func() { imageTempDir = originalDir })
 
 		_, cleanupPaths, err := sm.processAudio(ctx, chatID, messageID, content)
 
