@@ -976,14 +976,10 @@ func TestCmdConfig_SetMaxSubtasks_Invalid(t *testing.T) {
 	}{
 		{"negative", "-1"},
 		{"invalid", "abc"},
-		{"zero", "0"}, // 0 is actually valid
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.value == "0" {
-				t.Skip("0 is valid for max_subtasks")
-			}
 			update := makeUpdate(100, nil, 100, "/config max_subtasks "+tc.value, 12345)
 
 			reply, err := h.cmdConfig(ctx, update, group, "max_subtasks "+tc.value)
@@ -1041,6 +1037,22 @@ func TestCmdConfig_SetMaxSubtasks_Success(t *testing.T) {
 	}
 	if updated.MaxSubtasks != 10 {
 		t.Errorf("MaxSubtasks in DB = %d, want 10", updated.MaxSubtasks)
+	}
+
+	// 0 is valid (disables the subtask limit)
+	reply, err = h.cmdConfig(ctx, update, group, "max_subtasks 0")
+	if err != nil {
+		t.Fatalf("cmdConfig: %v", err)
+	}
+	if !strings.Contains(reply, "Max subtasks set to: 0") {
+		t.Errorf("should accept 0, got: %s", reply)
+	}
+	updated, err = db.GetGroup(ctx, 100)
+	if err != nil {
+		t.Fatalf("get group: %v", err)
+	}
+	if updated.MaxSubtasks != 0 {
+		t.Errorf("MaxSubtasks in DB = %d, want 0", updated.MaxSubtasks)
 	}
 }
 
