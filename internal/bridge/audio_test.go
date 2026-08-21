@@ -1295,6 +1295,90 @@ func TestProcessAudio_TranscriptionParsing(t *testing.T) {
 	}
 }
 
+// TestProcessAudio_NilMimeType covers the content.MimeType == nil branch in
+// processAudio: with no mime hint the extension falls back to the content-type
+// default (ogg for voice, mp3 for audio). The mock is registered under the
+// exact command key built from the expected extension, so a different extension
+// would leave the whisper mock unmatched and the test failing.
+func TestProcessAudio_NilMimeType(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		wantExt     string
+	}{
+		{
+			name:        "voice with nil mime defaults to ogg",
+			contentType: contract.ContentTypeVoice,
+			wantExt:     "ogg",
+		},
+		{
+			name:        "audio with nil mime defaults to mp3",
+			contentType: contract.ContentTypeAudio,
+			wantExt:     "mp3",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openTestDB(t)
+			defer db.Close()
+
+			chatID := int64(12345)
+			messageID := int64(67890)
+			fileID := "voice_nil_mime"
+			stem := fmt.Sprintf("%d", messageID)
+
+			// Create the directory that processAudio will use
+			testChatDir := filepath.Join(imageTempDir, fmt.Sprintf("%d", chatID))
+			require.NoError(t, os.MkdirAll(testChatDir, 0o755), "create chat directory")
+			t.Cleanup(func() { os.RemoveAll(testChatDir) })
+
+			// Register the mock under the key built from the expected
+			// extension so the choice of extension is itself verified.
+			mockExec := newMockCommandExec()
+			audioPath := filepath.Join(testChatDir, stem+"."+tt.wantExt)
+			mockExec.addCommand(
+				commandKey("whisper", audioPath, "--model", "turbo", "--output_format", "txt", "--output_dir", testChatDir),
+				createMockWhisperSuccess(t, testChatDir, stem, "Transcribed without a mime hint."),
+			)
+
+			// Create test HTTP server to handle file downloads
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/file/") {
+					w.WriteHeader(http.StatusOK)
+					w.Write([]byte("fake audio data"))
+				}
+			}))
+			defer server.Close()
+
+			sender, err := NewSender(server.URL, filepath.Join(t.TempDir(), "sender.db"))
+			require.NoError(t, err, "failed to create sender")
+			t.Cleanup(func() { sender.Close() })
+
+			sm := &SessionManager{
+				db:          db,
+				sender:      sender,
+				proxyURL:    server.URL,
+				commandExec: mockExec,
+			}
+
+			// No MimeType set — processAudio must take the nil branch.
+			content := &contract.Content{
+				Type:   tt.contentType,
+				FileID: &fileID,
+			}
+
+			transcription, cleanupPaths, err := sm.processAudio(ctx, chatID, messageID, content)
+
+			require.NoError(t, err, "processAudio should succeed without a mime hint")
+			assert.Equal(t, "Transcribed without a mime hint.", transcription, "transcription should match")
+			require.Len(t, cleanupPaths, 2, "should track 2 cleanup paths")
+			assert.Equal(t, audioPath, cleanupPaths[0], "audio cleanup path should use the default extension")
+		})
+	}
+}
+
 // ── startTyping Goroutine Tests ────────────────────────────────────────────
 
 func TestStartTyping(t *testing.T) {
