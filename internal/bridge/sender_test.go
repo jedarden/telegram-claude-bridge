@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -625,5 +627,233 @@ func TestSender_SendPhoto_ErrorResponse(t *testing.T) {
 	}
 	if apiErr.Description != "Bad Request" {
 		t.Errorf("description = %s, want 'Bad Request'", apiErr.Description)
+	}
+}
+
+// ---- postWithRetry backoff / rate-limit tests ----
+//
+// The retry constants (senderBackoffMin=1s, doubling up to senderBackoffMax=30s,
+// senderMaxRetries=5) are package-level and not injectable, so these tests bound
+// every wait with a context deadline and assert on the attempt counts observed
+// within that window. Handlers run on the httptest server goroutine, so all
+// counters are atomic.
+
+func TestSender_NonRetryableAPIError_NoRetry(t *testing.T) {
+	// A 400 from the proxy is a definitive API error — postWithRetry must
+	// return it immediately without burning any retries.
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(contract.ErrorResponse{
+			ErrorCode:   contract.ErrCodeBadRequest,
+			Description: "chat not found",
+		})
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, srv.URL)
+	start := time.Now()
+	err := s.EditMessage(context.Background(), -100, 1, "text")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("non-retryable error should return immediately, took %s", elapsed)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("expected exactly 1 call (no retries), got %d", got)
+	}
+	apiErr, ok := err.(*contract.ErrorResponse)
+	if !ok {
+		t.Fatalf("expected *contract.ErrorResponse, got %T: %v", err, err)
+	}
+	if apiErr.ErrorCode != contract.ErrCodeBadRequest {
+		t.Errorf("error code = %d, want %d", apiErr.ErrorCode, contract.ErrCodeBadRequest)
+	}
+	if apiErr.Description != "chat not found" {
+		t.Errorf("description = %q, want %q", apiErr.Description, "chat not found")
+	}
+}
+
+func TestSender_RateLimit_WaitsForRetryAfter(t *testing.T) {
+	// 429 with retry_after=60: postWithRetry must wait the full 60s unless the
+	// context expires first. A 300ms deadline means exactly one attempt.
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		retryAfter := 60
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(contract.ErrorResponse{
+			ErrorCode:  contract.ErrCodeRateLimit,
+			RetryAfter: &retryAfter,
+		})
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	err := s.EditMessage(ctx, -100, 1, "text")
+	if err == nil {
+		t.Fatal("expected deadline error while waiting out retry_after")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("expected exactly 1 call before deadline, got %d", got)
+	}
+}
+
+func TestSender_RateLimit_DefaultBackoffWithoutRetryAfter(t *testing.T) {
+	// A 429 whose body carries no retry_after must fall back to
+	// senderBackoffMin (1s), not retry instantly. A 400ms deadline bounds the
+	// wait; if the default were zero we'd see several calls in that window.
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		// Empty body: decode leaves RetryAfter nil.
+		fmt.Fprint(w, "")
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	err := s.EditMessage(ctx, -100, 1, "text")
+	if err == nil {
+		t.Fatal("expected deadline error while waiting out default backoff")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("expected exactly 1 call before deadline, got %d", got)
+	}
+}
+
+func TestSender_RateLimit_DoesNotConsumeRetryBudget(t *testing.T) {
+	// Eight consecutive 429s (retry_after=0, so each wait is instant) followed
+	// by success. senderMaxRetries is 5, so succeeding on the 9th attempt is
+	// only possible if rate limits don't charge a retry slot (attempt--).
+	const rateLimits = 8
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if int(n) <= rateLimits {
+			retryAfter := 0
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(contract.ErrorResponse{
+				ErrorCode:  contract.ErrCodeRateLimit,
+				RetryAfter: &retryAfter,
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(contract.OKResponse{OK: true})
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, srv.URL)
+	err := s.EditMessage(context.Background(), -100, 1, "text")
+	if err != nil {
+		t.Fatalf("expected success after %d rate limits, got: %v", rateLimits, err)
+	}
+	if got := calls.Load(); got != rateLimits+1 {
+		t.Errorf("expected %d calls total, got %d", rateLimits+1, got)
+	}
+}
+
+func TestSender_ExponentialBackoff_ConnectionErrors(t *testing.T) {
+	// Aborting the handler mid-request gives an instant, countable transport
+	// error (postJSON returns a plain error, not *contract.ErrorResponse), so
+	// postWithRetry takes the exponential-backoff branch: 1s, then 2s, then 4s…
+	//
+	// With a 2.9s deadline the attempts land at t≈0 and t≈1.0s; the third
+	// would be at t≈3.0s (after the doubled 2s backoff), so exactly 2 calls
+	// proves the backoff doubles — a fixed 1s backoff would fit a third call
+	// at t≈2.0s.
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 2900*time.Millisecond)
+	defer cancel()
+
+	err := s.EditMessage(ctx, -100, 1, "text")
+	if err == nil {
+		t.Fatal("expected deadline error during backoff")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("expected exactly 2 attempts in 2.9s window (backoff 1s then 2s), got %d", got)
+	}
+}
+
+func TestSender_CancelledContext_ReturnsCtxErr(t *testing.T) {
+	// A pre-cancelled context fails the transport call itself; the backoff
+	// select must notice ctx.Done() and return ctx.Err() instead of retrying.
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, srv.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := s.EditMessage(ctx, -100, 1, "text")
+	if err == nil {
+		t.Fatal("expected context.Canceled")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Errorf("expected no server calls with pre-cancelled context, got %d", got)
+	}
+}
+
+func TestSender_CancelDuringRateLimitWait_ReturnsCtxErr(t *testing.T) {
+	// 429 with no retry_after → default 1s wait. Cancelling the context 100ms
+	// in must interrupt the wait and surface context.Canceled (not
+	// DeadlineExceeded, which would indicate a timeout was used instead).
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, "")
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, srv.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+
+	err := s.EditMessage(ctx, -100, 1, "text")
+	if err == nil {
+		t.Fatal("expected context.Canceled")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("expected exactly 1 call, got %d", got)
 	}
 }

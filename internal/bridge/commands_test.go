@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -3677,4 +3678,1293 @@ func (m *mockUpdaterImpl) ManualUpdate(ctx context.Context, args string) string 
 		return "No updates to apply"
 	}
 	return "Invalid arguments"
+}
+
+// ── /new Topic Creation Tests ─────────────────────────────────────────────────────────
+
+func TestCmdNew_Validation(t *testing.T) {
+	tests := []struct {
+		name      string
+		setupDB   func(t *testing.T, db *DB)
+		group     func(t *testing.T, db *DB) *Group
+		args      string
+		wantReply string
+	}{
+		{
+			name:      "usage without args",
+			args:      "",
+			wantReply: "Usage: /new <topic name>",
+		},
+		{
+			name:      "unregistered group",
+			args:      "fix auth",
+			wantReply: "This group is not registered. Use /cwd <path> to register it.",
+		},
+		{
+			name: "topic name too long",
+			group: func(t *testing.T, db *DB) *Group {
+				t.Helper()
+				group := &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}
+				if err := db.UpsertGroup(context.Background(), group); err != nil {
+					t.Fatalf("upsert group: %v", err)
+				}
+				return group
+			},
+			args:      strings.Repeat("x", 129),
+			wantReply: "Topic name too long (max 128 characters).",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			ctx := context.Background()
+			if tc.setupDB != nil {
+				tc.setupDB(t, db)
+			}
+			group := (*Group)(nil)
+			if tc.group != nil {
+				group = tc.group(t, db)
+			}
+
+			h := newTestCommandHandler(t, db)
+			reply, err := h.cmdNew(ctx, makeUpdate(100, nil, 5, "/new "+tc.args, 42), group, tc.args)
+			if err != nil {
+				t.Fatalf("cmdNew: %v", err)
+			}
+			if !strings.Contains(reply, tc.wantReply) {
+				t.Errorf("reply = %q, want it to contain %q", reply, tc.wantReply)
+			}
+		})
+	}
+}
+
+func TestCmdNew_Success(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	cwd := t.TempDir()
+	group := &Group{ChatID: 100, CWD: cwd, DefaultModel: "claude-sonnet-4-6", CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	var mu sync.Mutex
+	var gotCreateReq contract.CreateTopicRequest
+	var gotPinReq contract.PinMessageRequest
+	var sendReqs []contract.SendRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/create_topic":
+			mu.Lock()
+			defer mu.Unlock()
+			if err := json.NewDecoder(r.Body).Decode(&gotCreateReq); err != nil {
+				t.Errorf("decode create_topic: %v", err)
+			}
+			json.NewEncoder(w).Encode(contract.CreateTopicResponse{OK: true, ThreadID: 777, Name: gotCreateReq.Name})
+		case "/send":
+			mu.Lock()
+			defer mu.Unlock()
+			var req contract.SendRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode send: %v", err)
+			}
+			sendReqs = append(sendReqs, req)
+			json.NewEncoder(w).Encode(contract.SendResponse{OK: true, MessageID: 555})
+		case "/pin_message":
+			mu.Lock()
+			defer mu.Unlock()
+			if err := json.NewDecoder(r.Body).Decode(&gotPinReq); err != nil {
+				t.Errorf("decode pin_message: %v", err)
+			}
+			json.NewEncoder(w).Encode(contract.OKResponse{OK: true})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	sender, err := NewSender(srv.URL, t.TempDir()+"/sender.db")
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer sender.Close()
+
+	h := NewCommandHandler(db, sender, srv.URL, nil, nil, "1.0.0", "abc123", "2024-01-01")
+	reply, err := h.cmdNew(ctx, makeUpdate(100, nil, 5, "/new fix auth middleware", 42), group, "fix auth middleware")
+	if err != nil {
+		t.Fatalf("cmdNew: %v", err)
+	}
+	if want := "Created topic: fix auth middleware (thread_id: 777)"; reply != want {
+		t.Errorf("reply = %q, want %q", reply, want)
+	}
+
+	// Session record: created against the thread the proxy returned.
+	session, err := db.GetSession(ctx, 100, 777)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if session == nil {
+		t.Fatal("expected session for thread 777")
+	}
+	if session.TopicName != "fix auth middleware" {
+		t.Errorf("TopicName = %q, want %q", session.TopicName, "fix auth middleware")
+	}
+	if session.Status != "active" {
+		t.Errorf("Status = %q, want active", session.Status)
+	}
+	if session.CWD != cwd {
+		t.Errorf("CWD = %q, want %q", session.CWD, cwd)
+	}
+	if session.Model != "claude-sonnet-4-6" {
+		t.Errorf("Model = %q, want claude-sonnet-4-6 (group default)", session.Model)
+	}
+	if session.PinnedMessageID != 555 {
+		t.Errorf("PinnedMessageID = %d, want 555", session.PinnedMessageID)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotCreateReq.ChatID != 100 {
+		t.Errorf("create_topic chat_id = %d, want 100", gotCreateReq.ChatID)
+	}
+	if gotCreateReq.IconColor == nil || *gotCreateReq.IconColor != contract.IconColorLightBlue {
+		t.Errorf("create_topic icon_color = %v, want IconColorLightBlue", gotCreateReq.IconColor)
+	}
+	if gotPinReq.MessageID != 555 {
+		t.Errorf("pin_message message_id = %d, want 555", gotPinReq.MessageID)
+	}
+	if len(sendReqs) != 1 {
+		t.Fatalf("expected 1 metadata send, got %d", len(sendReqs))
+	}
+	if sendReqs[0].ThreadID == nil || *sendReqs[0].ThreadID != 777 {
+		t.Errorf("metadata send thread_id = %v, want 777", sendReqs[0].ThreadID)
+	}
+	if !strings.Contains(sendReqs[0].Text, "Project: "+cwd) {
+		t.Errorf("metadata text should mention project cwd, got: %q", sendReqs[0].Text)
+	}
+}
+
+func TestCmdNew_CreateTopicProxyError(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(contract.ErrorResponse{ErrorCode: 400, Description: "Bad Request: chat is not a forum"})
+	}))
+	defer srv.Close()
+
+	h := NewCommandHandler(db, nil, srv.URL, nil, nil, "1.0.0", "abc123", "2024-01-01")
+	reply, err := h.cmdNew(ctx, makeUpdate(100, nil, 5, "/new topic", 42), group, "topic")
+	if err == nil {
+		t.Fatalf("expected error, got reply %q", reply)
+	}
+	if !strings.Contains(err.Error(), "create topic") {
+		t.Errorf("error = %v, want it to mention create topic", err)
+	}
+	if reply != "" {
+		t.Errorf("reply = %q, want empty on error", reply)
+	}
+}
+
+// ── /close Success Path ───────────────────────────────────────────────────────────────
+
+func TestCmdClose_SuccessWithoutSessionManager(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+	threadID := int64(10)
+	session := &Session{
+		ChatID:    100,
+		ThreadID:  10,
+		SessionID: "sess-1",
+		CWD:       group.CWD,
+		Status:    "active",
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// No session manager wired: generateSessionSummary fails, which cmdClose
+	// must tolerate and close the session anyway.
+	h := newTestCommandHandler(t, db)
+	reply, err := h.cmdClose(ctx, makeUpdate(100, &threadID, 50, "/close 10", 42), group, "10")
+	if err != nil {
+		t.Fatalf("cmdClose: %v", err)
+	}
+	if want := "Session closed and marked complete (thread 10)."; reply != want {
+		t.Errorf("reply = %q, want %q", reply, want)
+	}
+
+	closed, err := db.GetSession(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if closed.Status != "closed" {
+		t.Errorf("Status = %q, want closed", closed.Status)
+	}
+	if closed.IconColor != ColorComplete {
+		t.Errorf("IconColor = %d, want %d (ColorComplete)", closed.IconColor, ColorComplete)
+	}
+	if closed.Summary != "" {
+		t.Errorf("Summary = %q, want empty when summary generation is unavailable", closed.Summary)
+	}
+}
+
+// ── User Management Tests (/adduser /removeuser /users) ──────────────────────────────
+
+func TestCmdAddUser(t *testing.T) {
+	tests := []struct {
+		name      string
+		threadID  *int64 // nil = General topic
+		senderID  int64
+		args      string
+		wantReply string
+		checkDB   func(t *testing.T, db *DB)
+	}{
+		{
+			name:      "rejected outside general topic",
+			threadID:  int64Ptr(5),
+			senderID:  42,
+			args:      "200",
+			wantReply: "User management commands only work in the General topic.",
+		},
+		{
+			name:      "non-admin denied",
+			senderID:  43,
+			args:      "200",
+			wantReply: "Permission denied. Only admins can add users.",
+		},
+		{
+			name:      "usage without args",
+			senderID:  42,
+			wantReply: "Usage: /adduser <telegram_user_id> [role]",
+		},
+		{
+			name:      "invalid user id",
+			senderID:  42,
+			args:      "abc",
+			wantReply: `Invalid user ID "abc". User ID must be a number.`,
+		},
+		{
+			name:      "invalid role",
+			senderID:  42,
+			args:      "200 boss",
+			wantReply: `Invalid role "boss". Role must be 'admin' or 'user'.`,
+		},
+		{
+			name:      "success with default role",
+			senderID:  42,
+			args:      "200",
+			wantReply: "Added user 200 with role: user",
+			checkDB: func(t *testing.T, db *DB) {
+				user, err := db.GetAllowedUser(context.Background(), 200)
+				if err != nil {
+					t.Fatalf("GetAllowedUser: %v", err)
+				}
+				if user == nil {
+					t.Fatal("expected user 200 in allowed_users")
+				}
+				if user.Role != "user" {
+					t.Errorf("role = %q, want user", user.Role)
+				}
+			},
+		},
+		{
+			name:      "success with admin role",
+			senderID:  42,
+			args:      "201 admin",
+			wantReply: "Added user 201 with role: admin",
+			checkDB: func(t *testing.T, db *DB) {
+				user, err := db.GetAllowedUser(context.Background(), 201)
+				if err != nil {
+					t.Fatalf("GetAllowedUser: %v", err)
+				}
+				if user == nil {
+					t.Fatal("expected user 201 in allowed_users")
+				}
+				if user.Role != "admin" {
+					t.Errorf("role = %q, want admin", user.Role)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			ctx := context.Background()
+			if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 42, Role: "admin", AddedAt: time.Now().UTC()}); err != nil {
+				t.Fatalf("seed admin: %v", err)
+			}
+
+			h := newTestCommandHandler(t, db)
+			reply, err := h.cmdAddUser(ctx, makeUpdate(100, tc.threadID, 1, "/adduser "+tc.args, tc.senderID), tc.args)
+			if err != nil {
+				t.Fatalf("cmdAddUser: %v", err)
+			}
+			if !strings.Contains(reply, tc.wantReply) {
+				t.Errorf("reply = %q, want it to contain %q", reply, tc.wantReply)
+			}
+			if tc.checkDB != nil {
+				tc.checkDB(t, db)
+			}
+		})
+	}
+}
+
+func TestCmdRemoveUser(t *testing.T) {
+	seedUsers := func(t *testing.T, db *DB) {
+		t.Helper()
+		ctx := context.Background()
+		for _, u := range []AllowedUser{
+			{UserID: 42, Role: "admin", AddedAt: time.Now().UTC()},
+			{UserID: 200, Role: "user", AddedAt: time.Now().UTC()},
+		} {
+			if err := db.UpsertAllowedUser(ctx, &u); err != nil {
+				t.Fatalf("seed user %d: %v", u.UserID, err)
+			}
+		}
+	}
+
+	tests := []struct {
+		name      string
+		threadID  *int64
+		senderID  int64
+		args      string
+		wantReply string
+		wantGone  int64 // user ID that must no longer exist afterwards (0 = none)
+	}{
+		{
+			name:      "rejected outside general topic",
+			threadID:  int64Ptr(5),
+			senderID:  42,
+			args:      "200",
+			wantReply: "User management commands only work in the General topic.",
+		},
+		{
+			name:      "non-admin denied",
+			senderID:  200,
+			args:      "201",
+			wantReply: "Permission denied. Only admins can remove users.",
+		},
+		{
+			name:      "usage without args",
+			senderID:  42,
+			wantReply: "Usage: /removeuser <telegram_user_id>",
+		},
+		{
+			name:      "invalid user id",
+			senderID:  42,
+			args:      "not-a-number",
+			wantReply: `Invalid user ID "not-a-number". User ID must be a number.`,
+		},
+		{
+			name:      "cannot remove self",
+			senderID:  42,
+			args:      "42",
+			wantReply: "You cannot remove yourself from the allowed users list.",
+		},
+		{
+			name:      "success",
+			senderID:  42,
+			args:      "200",
+			wantReply: "Removed user 200 from the allowed users list.",
+			wantGone:  200,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			ctx := context.Background()
+			seedUsers(t, db)
+
+			h := newTestCommandHandler(t, db)
+			reply, err := h.cmdRemoveUser(ctx, makeUpdate(100, tc.threadID, 1, "/removeuser "+tc.args, tc.senderID), tc.args)
+			if err != nil {
+				t.Fatalf("cmdRemoveUser: %v", err)
+			}
+			if !strings.Contains(reply, tc.wantReply) {
+				t.Errorf("reply = %q, want it to contain %q", reply, tc.wantReply)
+			}
+			if tc.wantGone != 0 {
+				user, err := db.GetAllowedUser(ctx, tc.wantGone)
+				if err != nil {
+					t.Fatalf("GetAllowedUser: %v", err)
+				}
+				if user != nil {
+					t.Errorf("user %d should have been removed", tc.wantGone)
+				}
+			}
+		})
+	}
+}
+
+func TestCmdUsers(t *testing.T) {
+	tests := []struct {
+		name      string
+		threadID  *int64
+		senderID  int64
+		wantReply string
+		notWant   string
+	}{
+		{
+			name:      "rejected outside general topic",
+			threadID:  int64Ptr(5),
+			senderID:  42,
+			wantReply: "User management commands only work in the General topic.",
+		},
+		{
+			name:      "non-admin denied",
+			senderID:  43,
+			wantReply: "Permission denied. Only admins can list users.",
+		},
+		{
+			name:      "lists all users with roles",
+			senderID:  42,
+			wantReply: "Allowed users (2):",
+			notWant:   "", // placeholder, checked below with multiple contains
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			ctx := context.Background()
+			for _, u := range []AllowedUser{
+				{UserID: 42, Role: "admin", AddedAt: time.Now().UTC()},
+				{UserID: 43, Role: "user", AddedAt: time.Now().UTC()},
+			} {
+				if err := db.UpsertAllowedUser(ctx, &u); err != nil {
+					t.Fatalf("seed user %d: %v", u.UserID, err)
+				}
+			}
+
+			h := newTestCommandHandler(t, db)
+			reply, err := h.cmdUsers(ctx, makeUpdate(100, tc.threadID, 1, "/users", tc.senderID))
+			if err != nil {
+				t.Fatalf("cmdUsers: %v", err)
+			}
+			if !strings.Contains(reply, tc.wantReply) {
+				t.Errorf("reply = %q, want it to contain %q", reply, tc.wantReply)
+			}
+			if tc.name == "lists all users with roles" {
+				for _, want := range []string{"User ID: 42", "User ID: 43", "Role: admin", "Role: user"} {
+					if !strings.Contains(reply, want) {
+						t.Errorf("reply = %q, want it to contain %q", reply, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+// ── /usage Admin Cost Report Tests ────────────────────────────────────────────────────
+
+func TestCmdUsage(t *testing.T) {
+	// seedCosts records events: user 42 → $0.02 across thread 10,
+	// user 43 → $0.01 on thread 11.
+	seedCosts := func(t *testing.T, db *DB) {
+		t.Helper()
+		ctx := context.Background()
+		events := []CostEvent{
+			{ChatID: 100, ThreadID: 10, CostUSD: 0.01, Model: "claude-haiku-4-5", FromUserID: 42, CreatedAt: time.Now().UTC()},
+			{ChatID: 100, ThreadID: 10, CostUSD: 0.01, Model: "claude-sonnet-4-6", FromUserID: 42, CreatedAt: time.Now().UTC()},
+			{ChatID: 100, ThreadID: 11, CostUSD: 0.01, Model: "claude-haiku-4-5", FromUserID: 43, CreatedAt: time.Now().UTC()},
+		}
+		for i := range events {
+			if err := db.RecordCostEvent(ctx, &events[i]); err != nil {
+				t.Fatalf("record cost event: %v", err)
+			}
+		}
+	}
+
+	seedUsers := func(t *testing.T, db *DB) {
+		t.Helper()
+		ctx := context.Background()
+		for _, u := range []AllowedUser{
+			{UserID: 42, Role: "admin", AddedAt: time.Now().UTC()},
+			{UserID: 43, Role: "user", AddedAt: time.Now().UTC()},
+		} {
+			if err := db.UpsertAllowedUser(ctx, &u); err != nil {
+				t.Fatalf("seed user %d: %v", u.UserID, err)
+			}
+		}
+	}
+
+	tests := []struct {
+		name      string
+		senderID  int64
+		args      string
+		withCosts bool
+		want      []string
+	}{
+		{
+			name:     "non-admin denied",
+			senderID: 43,
+			args:     "",
+			want:     []string{"Permission denied. Only admins can view usage statistics."},
+		},
+		{
+			name:     "invalid user id argument",
+			senderID: 42,
+			args:     "abc",
+			want:     []string{`Invalid user ID "abc"`, "numeric user ID"},
+		},
+		{
+			name:     "no usage data",
+			senderID: 42,
+			args:     "",
+			want:     []string{"No usage data found for any users."},
+		},
+		{
+			name:     "all users summary sorted by cost",
+			senderID: 42,
+			args:     "",
+			withCosts: true,
+			want: []string{
+				"Usage Report — All Users",
+				"Total Cost: $0.0300",
+				"User 42 [admin]: $0.0200 (66.7%)",
+				"User 43 [user]: $0.0100 (33.3%)",
+			},
+		},
+		{
+			name:     "per-user detail",
+			senderID: 42,
+			args:     "42",
+			withCosts: true,
+			want: []string{
+				"Usage Report — User 42",
+				"Role: admin",
+				"Total Cost: $0.0200",
+				"chat 100/thread 10",
+			},
+		},
+		{
+			name:     "unknown user detail",
+			senderID: 42,
+			args:     "999",
+			want:     []string{"User 999 not found in allowed users list."},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			ctx := context.Background()
+			seedUsers(t, db)
+			if tc.withCosts {
+				seedCosts(t, db)
+			}
+
+			h := newTestCommandHandler(t, db)
+			reply, err := h.cmdUsage(ctx, makeUpdate(100, nil, 1, "/usage "+tc.args, tc.senderID), nil, tc.args)
+			if err != nil {
+				t.Fatalf("cmdUsage: %v", err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(reply, want) {
+					t.Errorf("reply missing %q\nreply: %s", want, reply)
+				}
+			}
+		})
+	}
+}
+
+// ── /cost Report Tests ────────────────────────────────────────────────────────────────
+
+func TestCmdCost_GroupLevelReport(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+	events := []CostEvent{
+		{ChatID: 100, ThreadID: 10, CostUSD: 0.01, Model: "claude-haiku-4-5", FromUserID: 42, CreatedAt: time.Now().UTC()},
+		{ChatID: 100, ThreadID: 10, CostUSD: 0.01, Model: "claude-sonnet-4-6", FromUserID: 43, CreatedAt: time.Now().UTC()},
+		{ChatID: 100, ThreadID: 11, CostUSD: 0.01, Model: "claude-haiku-4-5", FromUserID: 42, CreatedAt: time.Now().UTC()},
+	}
+	for i := range events {
+		if err := db.RecordCostEvent(ctx, &events[i]); err != nil {
+			t.Fatalf("record cost event: %v", err)
+		}
+	}
+
+	h := newTestCommandHandler(t, db)
+	// General topic (no thread) → group-level breakdown.
+	reply, err := h.cmdCost(ctx, makeUpdate(100, nil, 1, "/cost", 42), group)
+	if err != nil {
+		t.Fatalf("cmdCost: %v", err)
+	}
+	for _, want := range []string{
+		"Group Cost Report",
+		"Total Cost: $0.0300",
+		"Thread 10: $0.0200 (2 events)",
+		"Thread 11: $0.0100 (1 events)",
+		"User 42: $0.0200 (2 events)",
+		"User 43: $0.0100 (1 events)",
+	} {
+		if !strings.Contains(reply, want) {
+			t.Errorf("reply missing %q\nreply: %s", want, reply)
+		}
+	}
+	if !strings.Contains(reply, "Daily trend") {
+		t.Errorf("reply should include daily trend section, got: %s", reply)
+	}
+}
+
+func TestCmdCost_TopicLevelReport(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+	threadID := int64(10)
+	session := &Session{ChatID: 100, ThreadID: 10, SessionID: "sess-10", CWD: group.CWD, Status: "active"}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	events := []CostEvent{
+		{ChatID: 100, ThreadID: 10, CostUSD: 0.01, Model: "claude-haiku-4-5", FromUserID: 42, CreatedAt: time.Now().UTC()},
+		{ChatID: 100, ThreadID: 10, CostUSD: 0.01, Model: "claude-sonnet-4-6", FromUserID: 43, CreatedAt: time.Now().UTC()},
+		// Noise: another thread's cost must not appear.
+		{ChatID: 100, ThreadID: 11, CostUSD: 0.05, Model: "claude-opus-4-6", FromUserID: 42, CreatedAt: time.Now().UTC()},
+	}
+	for i := range events {
+		if err := db.RecordCostEvent(ctx, &events[i]); err != nil {
+			t.Fatalf("record cost event: %v", err)
+		}
+	}
+
+	h := newTestCommandHandler(t, db)
+	reply, err := h.cmdCost(ctx, makeUpdate(100, &threadID, 1, "/cost", 42), group)
+	if err != nil {
+		t.Fatalf("cmdCost: %v", err)
+	}
+	for _, want := range []string{
+		"Topic Cost: $0.0200",
+		"Session: sess-10",
+		"User 42: $0.0100 (1 events)",
+		"User 43: $0.0100 (1 events)",
+	} {
+		if !strings.Contains(reply, want) {
+			t.Errorf("reply missing %q\nreply: %s", want, reply)
+		}
+	}
+	if strings.Contains(reply, "Thread 11") {
+		t.Errorf("topic-level report must not include other threads' costs, got: %s", reply)
+	}
+}
+
+func TestCmdCost_BudgetWarning(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{ChatID: 100, CWD: t.TempDir(), MaxBudget: 1.0, CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+	event := CostEvent{ChatID: 100, ThreadID: 10, CostUSD: 0.9, Model: "claude-haiku-4-5", FromUserID: 42, CreatedAt: time.Now().UTC()}
+	if err := db.RecordCostEvent(ctx, &event); err != nil {
+		t.Fatalf("record cost event: %v", err)
+	}
+
+	h := newTestCommandHandler(t, db)
+	reply, err := h.cmdCost(ctx, makeUpdate(100, nil, 1, "/cost", 42), group)
+	if err != nil {
+		t.Fatalf("cmdCost: %v", err)
+	}
+	if !strings.Contains(reply, "$1.00 budget (90.0% used)") {
+		t.Errorf("reply should show budget usage percentage, got: %s", reply)
+	}
+	if !strings.Contains(reply, "Approaching budget limit (80%)") {
+		t.Errorf("reply should warn at 90%% of budget, got: %s", reply)
+	}
+}
+
+// ── /parallel Subtask Orchestration Tests ─────────────────────────────────────────────
+
+func TestCmdParallel_Validation(t *testing.T) {
+	tests := []struct {
+		name      string
+		setup     func(t *testing.T, h *CommandHandler, db *DB) (*Group, contract.Update)
+		args      string
+		wantReply string
+	}{
+		{
+			name:      "usage without args",
+			args:      "",
+			wantReply: "Usage: /parallel <prompt1>",
+		},
+		{
+			name: "requires topic session",
+			setup: func(t *testing.T, h *CommandHandler, db *DB) (*Group, contract.Update) {
+				return nil, makeUpdate(100, nil, 1, "/parallel p1", 42)
+			},
+			args:      "p1",
+			wantReply: "Parallel commands only work within a topic session",
+		},
+		{
+			name: "unregistered group",
+			setup: func(t *testing.T, h *CommandHandler, db *DB) (*Group, contract.Update) {
+				return nil, makeUpdate(100, int64Ptr(10), 1, "/parallel p1", 42)
+			},
+			args:      "p1",
+			wantReply: "This group is not registered. Use /cwd <path> to register it.",
+		},
+		{
+			name: "no orchestrator wired",
+			setup: func(t *testing.T, h *CommandHandler, db *DB) (*Group, contract.Update) {
+				group := &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}
+				if err := db.UpsertGroup(context.Background(), group); err != nil {
+					t.Fatalf("upsert group: %v", err)
+				}
+				return group, makeUpdate(100, int64Ptr(10), 1, "/parallel p1", 42)
+			},
+			args:      "p1",
+			wantReply: "Subtask orchestrator not available.",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			ctx := context.Background()
+			h := newTestCommandHandler(t, db)
+
+			var group *Group
+			update := makeUpdate(100, int64Ptr(10), 1, "/parallel "+tc.args, 42)
+			if tc.setup != nil {
+				group, update = tc.setup(t, h, db)
+			}
+
+			reply, err := h.cmdParallel(ctx, update, group, tc.args)
+			if err != nil {
+				t.Fatalf("cmdParallel: %v", err)
+			}
+			if !strings.Contains(reply, tc.wantReply) {
+				t.Errorf("reply = %q, want it to contain %q", reply, tc.wantReply)
+			}
+		})
+	}
+}
+
+func TestCmdParallel_TooManyPrompts(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	group := &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	h := newTestCommandHandler(t, db)
+	h.SetSubtaskOrchestrator(NewSubtaskOrchestrator(db, nil, nil))
+
+	args := "1\n---\n2\n---\n3\n---\n4\n---\n5\n---\n6"
+	reply, err := h.cmdParallel(ctx, makeUpdate(100, int64Ptr(10), 1, "/parallel ...", 42), group, args)
+	if err != nil {
+		t.Fatalf("cmdParallel: %v", err)
+	}
+	if !strings.Contains(reply, "Maximum 5 prompts allowed.") {
+		t.Errorf("reply = %q, want maximum-prompts rejection", reply)
+	}
+
+	// No subtask rows should have been created for the rejected batch.
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 0 {
+		t.Errorf("expected no subtasks created, got %d", len(subtasks))
+	}
+}
+
+func TestCmdParallel_OrchestratorRejectsOverGroupLimit(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Group-level cap of 1 subtask; the request has 2 prompts. The
+	// orchestrator rejects it synchronously, before any worker spawn.
+	group := &Group{ChatID: 100, CWD: t.TempDir(), MaxSubtasks: 1, CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	h := newTestCommandHandler(t, db)
+	h.SetSubtaskOrchestrator(NewSubtaskOrchestrator(db, nil, nil))
+
+	args := "first prompt\n---\nsecond prompt"
+	reply, err := h.cmdParallel(ctx, makeUpdate(100, int64Ptr(10), 1, "/parallel ...", 42), group, args)
+	if err == nil {
+		t.Fatalf("expected orchestrator rejection, got reply %q", reply)
+	}
+	if !strings.Contains(err.Error(), "start parallel tasks") ||
+		!strings.Contains(err.Error(), "group max_subtasks is 1") {
+		t.Errorf("error = %v, want start parallel tasks / max_subtasks rejection", err)
+	}
+
+	subtasks, err := db.ListSubtasks(ctx, 100, 10)
+	if err != nil {
+		t.Fatalf("ListSubtasks: %v", err)
+	}
+	if len(subtasks) != 0 {
+		t.Errorf("expected no subtasks created, got %d", len(subtasks))
+	}
+}
+
+// ── /bg /jobs /kill Background Job Tests ──────────────────────────────────────────────
+
+func TestCmdBG_Validation(t *testing.T) {
+	tests := []struct {
+		name      string
+		withMgr   bool
+		group     *Group
+		args      string
+		wantReply string
+	}{
+		{
+			name:      "usage without args",
+			args:      "",
+			wantReply: "Usage: /bg <command>",
+		},
+		{
+			name:      "unregistered group",
+			args:      "echo hi",
+			wantReply: "This group is not registered. Use /cwd <path> to register it.",
+		},
+		{
+			name:      "no background job manager wired",
+			withMgr:   false,
+			group:     &Group{ChatID: 100, CWD: ".", CreatedAt: time.Now().UTC()},
+			args:      "echo hi",
+			wantReply: "Background job manager not available.",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			ctx := context.Background()
+			h := newTestCommandHandler(t, db)
+			if tc.withMgr {
+				h.SetBackgroundJobManager(NewBackgroundJobManager(db, nil))
+			}
+
+			reply, err := h.cmdBG(ctx, makeUpdate(100, nil, 1, "/bg "+tc.args, 42), tc.group, tc.args)
+			if err != nil {
+				t.Fatalf("cmdBG: %v", err)
+			}
+			if !strings.Contains(reply, tc.wantReply) {
+				t.Errorf("reply = %q, want it to contain %q", reply, tc.wantReply)
+			}
+		})
+	}
+}
+
+func TestCmdBG_JobLifecycle(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	cwd := t.TempDir()
+	group := &Group{ChatID: 100, CWD: cwd, CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+	threadID := int64(10)
+
+	// The job's streaming messages are sent asynchronously by the job manager
+	// goroutine, so the mock proxy's state is mutex-guarded.
+	var mu sync.Mutex
+	var sends int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		sends++
+		mu.Unlock()
+		json.NewEncoder(w).Encode(contract.SendResponse{OK: true, MessageID: 900})
+	}))
+	defer srv.Close()
+
+	sender, err := NewSender(srv.URL, t.TempDir()+"/sender.db")
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer sender.Close()
+
+	h := NewCommandHandler(db, sender, srv.URL, nil, nil, "1.0.0", "abc123", "2024-01-01")
+	mgr := NewBackgroundJobManager(db, sender)
+	h.SetBackgroundJobManager(mgr)
+
+	// The real `sleep` binary is available: TestMain only poisons tmux/claude.
+	update := makeUpdate(100, &threadID, 1, "/bg sleep 5", 42)
+	reply, err := h.cmdBG(ctx, update, group, "sleep 5")
+	if err != nil {
+		t.Fatalf("cmdBG: %v", err)
+	}
+	// Reply format: "Background job started: `sleep 5`\nJob ID: `<id>`"
+	parts := strings.Split(reply, "`")
+	if len(parts) != 5 { // trailing backtick leaves a final empty segment
+		t.Fatalf("reply = %q, want job-started format with 2 backtick-quoted fields", reply)
+	}
+	jobID := parts[3]
+	if !strings.Contains(reply, "Background job started: `sleep 5`") {
+		t.Errorf("reply = %q, want it to confirm the command", reply)
+	}
+
+	// /jobs lists the running job.
+	jobsReply, err := h.cmdJobs(ctx, update, group)
+	if err != nil {
+		t.Fatalf("cmdJobs: %v", err)
+	}
+	if !strings.Contains(jobsReply, "Background jobs (1):") {
+		t.Errorf("jobs reply should list 1 job, got: %s", jobsReply)
+	}
+	if !strings.Contains(jobsReply, "`"+jobID+"`] sleep 5") {
+		t.Errorf("jobs reply should include job %s running sleep 5, got: %s", jobID, jobsReply)
+	}
+	if !strings.Contains(jobsReply, "▶") {
+		t.Errorf("running job should use the ▶ icon, got: %s", jobsReply)
+	}
+
+	// Kill a bogus job ID.
+	bogusReply, err := h.cmdKill(ctx, update, "deadbeef")
+	if err != nil {
+		t.Fatalf("cmdKill: %v", err)
+	}
+	if !strings.Contains(bogusReply, "Failed to kill job") {
+		t.Errorf("bogus kill reply = %q, want failure", bogusReply)
+	}
+
+	// Kill the live job. The manager registers the process shortly after
+	// cmdBG returns, so retry briefly until the kill lands.
+	var killReply string
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		killReply, err = h.cmdKill(ctx, update, jobID)
+		if err != nil {
+			t.Fatalf("cmdKill: %v", err)
+		}
+		if strings.Contains(killReply, "killed.") || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(killReply, "Job `"+jobID+"` killed.") {
+		t.Fatalf("kill reply = %q, want confirmation for job %s", killReply, jobID)
+	}
+
+	// A second kill of the same job must fail: it is no longer tracked.
+	secondReply, err := h.cmdKill(ctx, update, jobID)
+	if err != nil {
+		t.Fatalf("cmdKill: %v", err)
+	}
+	if !strings.Contains(secondReply, "Failed to kill job") {
+		t.Errorf("second kill reply = %q, want failure (job no longer running)", secondReply)
+	}
+
+	// The finished job remains listed (history) with a non-running icon.
+	finalReply, err := h.cmdJobs(ctx, update, group)
+	if err != nil {
+		t.Fatalf("cmdJobs: %v", err)
+	}
+	if !strings.Contains(finalReply, "Background jobs (1):") {
+		t.Errorf("final jobs reply should still list the job, got: %s", finalReply)
+	}
+	if !strings.Contains(finalReply, "■") {
+		t.Errorf("killed job should use the ■ icon, got: %s", finalReply)
+	}
+}
+
+func TestCmdJobs_Validation(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	h := newTestCommandHandler(t, db)
+
+	// Unregistered group.
+	reply, err := h.cmdJobs(ctx, makeUpdate(100, nil, 1, "/jobs", 42), nil)
+	if err != nil {
+		t.Fatalf("cmdJobs: %v", err)
+	}
+	if !strings.Contains(reply, "This group is not registered.") {
+		t.Errorf("reply = %q, want unregistered-group message", reply)
+	}
+
+	// No manager wired.
+	group := &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}
+	reply, err = h.cmdJobs(ctx, makeUpdate(100, nil, 1, "/jobs", 42), group)
+	if err != nil {
+		t.Fatalf("cmdJobs: %v", err)
+	}
+	if !strings.Contains(reply, "Background job manager not available.") {
+		t.Errorf("reply = %q, want no-manager message", reply)
+	}
+
+	// Registered group + manager + no jobs.
+	h.SetBackgroundJobManager(NewBackgroundJobManager(db, nil))
+	reply, err = h.cmdJobs(ctx, makeUpdate(100, nil, 1, "/jobs", 42), group)
+	if err != nil {
+		t.Fatalf("cmdJobs: %v", err)
+	}
+	if !strings.Contains(reply, "No background jobs for this topic.") {
+		t.Errorf("reply = %q, want empty-list message", reply)
+	}
+}
+
+func TestCmdKill_Validation(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	h := newTestCommandHandler(t, db)
+	update := makeUpdate(100, nil, 1, "/kill", 42)
+
+	// Usage without args.
+	reply, err := h.cmdKill(ctx, update, "")
+	if err != nil {
+		t.Fatalf("cmdKill: %v", err)
+	}
+	if !strings.Contains(reply, "Usage: /kill <job_id>") {
+		t.Errorf("reply = %q, want usage message", reply)
+	}
+
+	// No manager wired.
+	reply, err = h.cmdKill(ctx, update, "abc123")
+	if err != nil {
+		t.Fatalf("cmdKill: %v", err)
+	}
+	if !strings.Contains(reply, "Background job manager not available.") {
+		t.Errorf("reply = %q, want no-manager message", reply)
+	}
+}
+
+// ── Handle() Routing for Model Shortcuts and Admin Commands ──────────────────────────
+
+func makeThreadCommandUpdate(chatID, threadID, messageID int64, text string, userID int64) contract.Update {
+	command := strings.Fields(text)[0]
+	return contract.Update{
+		Type:      "message",
+		ChatID:    chatID,
+		ThreadID:  &threadID,
+		MessageID: messageID,
+		FromUser:  contract.FromUser{ID: userID},
+		Content: &contract.Content{
+			Type:     contract.ContentTypeText,
+			Text:     &text,
+			Entities: []contract.Entity{{Type: "bot_command", Offset: 0, Length: len([]rune(command))}},
+		},
+	}
+}
+
+func TestCommandHandler_Handle_ModelShortcutsAndAdminCommands(t *testing.T) {
+	seedAdminAndGroup := func(t *testing.T, db *DB) {
+		t.Helper()
+		ctx := context.Background()
+		if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 42, Role: "admin", AddedAt: time.Now().UTC()}); err != nil {
+			t.Fatalf("upsert admin: %v", err)
+		}
+		if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 200, Role: "user", AddedAt: time.Now().UTC()}); err != nil {
+			t.Fatalf("upsert user: %v", err)
+		}
+		if err := db.UpsertGroup(ctx, &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}); err != nil {
+			t.Fatalf("upsert group: %v", err)
+		}
+	}
+	seedSession := func(t *testing.T, db *DB) {
+		t.Helper()
+		if err := db.CreateSession(context.Background(), &Session{
+			ChatID: 100, ThreadID: 10, SessionID: "sess-10", CWD: "/test", Status: "active",
+		}); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+	}
+
+	tests := []struct {
+		name      string
+		setup     func(t *testing.T, db *DB)
+		text      string
+		wantReply string
+	}{
+		{
+			name:  "haiku shortcut sets model",
+			setup: func(t *testing.T, db *DB) { seedAdminAndGroup(t, db); seedSession(t, db) },
+			text:  "/haiku",
+			wantReply: "Model set to: claude-haiku-4-5",
+		},
+		{
+			name:  "sonnet shortcut sets model",
+			setup: func(t *testing.T, db *DB) { seedAdminAndGroup(t, db); seedSession(t, db) },
+			text:  "/sonnet",
+			wantReply: "Model set to: claude-sonnet-4-6",
+		},
+		{
+			name:  "opus shortcut sets model",
+			setup: func(t *testing.T, db *DB) { seedAdminAndGroup(t, db); seedSession(t, db) },
+			// Note: Handle routes /opus to "claude-opus-4-6" directly, so the
+			// cmdModel alias table (which expands "opus" to claude-opus-4-7)
+			// does not apply on this path.
+			text:      "/opus",
+			wantReply: "Model set to: claude-opus-4-6",
+		},
+		{
+			name:      "adduser routes and parses args",
+			setup:     seedAdminAndGroup,
+			text:      "/adduser 300 admin",
+			wantReply: "Added user 300 with role: admin",
+		},
+		{
+			name:      "removeuser routes and parses args",
+			setup:     seedAdminAndGroup,
+			text:      "/removeuser 200",
+			wantReply: "Removed user 200 from the allowed users list.",
+		},
+		{
+			name:      "users routes",
+			setup:     seedAdminAndGroup,
+			text:      "/users",
+			wantReply: "Allowed users (2):",
+		},
+		{
+			name:      "usage routes with no data",
+			setup:     seedAdminAndGroup,
+			text:      "/usage",
+			wantReply: "No usage data found for any users.",
+		},
+		{
+			name:      "usage routes with user id arg",
+			setup:     seedAdminAndGroup,
+			text:      "/usage 42",
+			wantReply: "Usage Report — User 42",
+		},
+		{
+			name:  "new routes without registration",
+			text:  "/new some topic",
+			wantReply: "This group is not registered. Use /cwd <path> to register it.",
+		},
+		{
+			name:  "close routes with args",
+			setup: seedAdminAndGroup,
+			text:  "/close notanumber",
+			wantReply: `Invalid thread_id "notanumber"`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			if tc.setup != nil {
+				tc.setup(t, db)
+			}
+
+			var mu sync.Mutex
+			var replies []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/send" {
+					http.NotFound(w, r)
+					return
+				}
+				var req contract.SendRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Errorf("decode send request: %v", err)
+					return
+				}
+				mu.Lock()
+				replies = append(replies, req.Text)
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(contract.SendResponse{OK: true, MessageID: 900})
+			}))
+			defer srv.Close()
+
+			sender, err := NewSender(srv.URL, t.TempDir()+"/sender.db")
+			if err != nil {
+				t.Fatalf("NewSender: %v", err)
+			}
+			defer sender.Close()
+
+			h := NewCommandHandler(db, sender, srv.URL, nil, nil, "1.0.0", "abc123", "2024-01-01")
+			// Model shortcuts and /close need a thread; user-management
+			// commands need the General topic. Both use thread 10 only when a
+			// session was seeded; otherwise the update has no thread.
+			var update contract.Update
+			if strings.HasPrefix(tc.text, "/haiku") || strings.HasPrefix(tc.text, "/sonnet") ||
+				strings.HasPrefix(tc.text, "/opus") || strings.HasPrefix(tc.text, "/close") {
+				update = makeThreadCommandUpdate(100, 10, 12, tc.text, 42)
+			} else {
+				update = makeCommandUpdate(100, 12, tc.text, 42)
+			}
+			group, _ := db.GetGroup(context.Background(), 100)
+			h.Handle(context.Background(), update, group)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if len(replies) != 1 {
+				t.Fatalf("expected 1 reply sent, got %d", len(replies))
+			}
+			if !strings.Contains(replies[0], tc.wantReply) {
+				t.Errorf("reply = %q, want it to contain %q", replies[0], tc.wantReply)
+			}
+		})
+	}
+}
+
+func TestCommandHandler_Handle_WrapsHandlerErrors(t *testing.T) {
+	db := openTestDB(t)
+
+	var mu sync.Mutex
+	var replies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			// Abort the connection so cmdPing's health check fails at the
+			// transport layer while /send keeps working.
+			panic(http.ErrAbortHandler)
+		case "/send":
+			var req contract.SendRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode send request: %v", err)
+				return
+			}
+			mu.Lock()
+			replies = append(replies, req.Text)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(contract.SendResponse{OK: true, MessageID: 900})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	sender, err := NewSender(srv.URL, t.TempDir()+"/sender.db")
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer sender.Close()
+
+	h := NewCommandHandler(db, sender, srv.URL, nil, nil, "1.0.0", "abc123", "2024-01-01")
+	h.Handle(context.Background(), makeCommandUpdate(100, 12, "/ping", 42), nil)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(replies) != 1 {
+		t.Fatalf("expected 1 reply sent, got %d", len(replies))
+	}
+	if !strings.Contains(replies[0], "Error: health check failed") {
+		t.Errorf("reply = %q, want wrapped error mentioning health check", replies[0])
+	}
 }

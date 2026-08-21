@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1180,5 +1181,162 @@ func TestSender_NewSender(t *testing.T) {
 	}
 	if sender.downloadClient.Timeout != 0 {
 		t.Error("downloadClient should have no timeout (context controls deadline)")
+	}
+}
+
+// ── Response Decode Failure Tests ─────────────────────────────────────────────
+
+func TestSender_NonJSONBody_DecodeFailure(t *testing.T) {
+	srv, sender := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		// 200 with a non-JSON body — the call itself succeeded but the
+		// envelope cannot be decoded.
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, "not json at all")
+	})
+	defer srv.Close()
+
+	_, apiErr := sender.SendMessage(context.Background(), contract.SendRequest{
+		ChatID: 100,
+		Text:   "test",
+	})
+	if apiErr == nil {
+		t.Fatal("expected error for non-JSON response body")
+	}
+	if apiErr.ErrorCode != contract.ErrCodeTelegramUnreachable {
+		t.Errorf("error code = %d, want %d (ErrCodeTelegramUnreachable)", apiErr.ErrorCode, contract.ErrCodeTelegramUnreachable)
+	}
+	if !strings.Contains(apiErr.Description, "decode response") {
+		t.Errorf("description = %q, want it to mention decode failure", apiErr.Description)
+	}
+}
+
+func TestSender_MissingResult_BadResponse(t *testing.T) {
+	srv, sender := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		// ok:true but no result payload — unmarshalling the empty result
+		// must surface as "bad response from Telegram", not a panic.
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true}`)
+	})
+	defer srv.Close()
+
+	_, apiErr := sender.SendMessage(context.Background(), contract.SendRequest{
+		ChatID: 100,
+		Text:   "test",
+	})
+	if apiErr == nil {
+		t.Fatal("expected error for missing result payload")
+	}
+	if apiErr.ErrorCode != contract.ErrCodeTelegramUnreachable {
+		t.Errorf("error code = %d, want %d (ErrCodeTelegramUnreachable)", apiErr.ErrorCode, contract.ErrCodeTelegramUnreachable)
+	}
+	if !strings.Contains(apiErr.Description, "bad response from Telegram") {
+		t.Errorf("description = %q, want 'bad response from Telegram'", apiErr.Description)
+	}
+}
+
+func TestSender_GetFile_BadResultPayload(t *testing.T) {
+	srv, sender := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true,"result":"a string is not a file object"}`)
+	})
+	defer srv.Close()
+
+	f, apiErr := sender.GetFile(context.Background(), "file-id-1")
+	if f != nil {
+		t.Errorf("expected nil file, got %+v", f)
+	}
+	if apiErr == nil {
+		t.Fatal("expected error for non-object result payload")
+	}
+	if apiErr.ErrorCode != contract.ErrCodeTelegramUnreachable {
+		t.Errorf("error code = %d, want %d (ErrCodeTelegramUnreachable)", apiErr.ErrorCode, contract.ErrCodeTelegramUnreachable)
+	}
+	if !strings.Contains(apiErr.Description, "bad response from Telegram") {
+		t.Errorf("description = %q, want 'bad response from Telegram'", apiErr.Description)
+	}
+}
+
+func TestSender_MultipartRateLimit(t *testing.T) {
+	// callMultipart (photo/document/audio/video uploads) goes through a
+	// separate code path than the JSON call() — verify a 429 with
+	// parameters.retry_after propagates as ErrCodeRateLimit + RetryAfter.
+	retryAfter := 42
+	srv, sender := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]any{
+			"ok":          false,
+			"error_code":  429,
+			"description": "Too Many Requests: retry after 42",
+			"parameters":  map[string]any{"retry_after": retryAfter},
+		})
+	})
+	defer srv.Close()
+
+	_, apiErr := sender.SendPhoto(context.Background(), contract.SendPhotoRequest{
+		ChatID: 100,
+	}, []byte("fake photo"), "photo.jpg")
+	if apiErr == nil {
+		t.Fatal("expected rate limit error")
+	}
+	if apiErr.ErrorCode != contract.ErrCodeRateLimit {
+		t.Errorf("error code = %d, want %d (ErrCodeRateLimit)", apiErr.ErrorCode, contract.ErrCodeRateLimit)
+	}
+	if apiErr.RetryAfter == nil || *apiErr.RetryAfter != retryAfter {
+		t.Errorf("retry_after = %v, want %d", apiErr.RetryAfter, retryAfter)
+	}
+}
+
+func TestRedactToken(t *testing.T) {
+	tests := []struct {
+		name  string
+		s     string
+		token string
+		want  string
+	}{
+		{
+			name:  "token in URL is redacted",
+			s:     "Telegram unreachable: POST http://api.telegram.org/botSECRET/sendMessage: connection refused",
+			token: "SECRET",
+			want:  "Telegram unreachable: POST http://api.telegram.org/bot<REDACTED>/sendMessage: connection refused",
+		},
+		{
+			name:  "all occurrences are redacted",
+			s:     "botT/x and again botT/y",
+			token: "T",
+			want:  "bot<REDACTED>/x and again bot<REDACTED>/y",
+		},
+		{
+			name:  "token without bot prefix and trailing slash is untouched",
+			s:     "the SECRET leaked",
+			token: "SECRET",
+			want:  "the SECRET leaked",
+		},
+		{
+			name:  "bot prefix without trailing slash is untouched",
+			s:     "botSECRET at end",
+			token: "SECRET",
+			want:  "botSECRET at end",
+		},
+		{
+			name:  "empty token leaves string unchanged",
+			s:     "bot/token/sendMessage",
+			token: "",
+			want:  "bot/token/sendMessage",
+		},
+		{
+			name:  "empty string stays empty",
+			s:     "",
+			token: "SECRET",
+			want:  "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := redactToken(tc.s, tc.token); got != tc.want {
+				t.Errorf("redactToken(%q, %q) = %q, want %q", tc.s, tc.token, got, tc.want)
+			}
+		})
 	}
 }
