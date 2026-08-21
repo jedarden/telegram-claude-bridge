@@ -221,6 +221,11 @@ func TestProcessAudio_Args(t *testing.T) {
 		fileID        string
 		transcription string
 		wantCmdName   string
+		// tempDirSuffix, when set, replaces the last component of imageTempDir
+		// for this case, injecting its characters (spaces, @, brackets, ...)
+		// into every path processAudio builds. chatID and messageID render as
+		// digits only, so this is the only way to vary path characters.
+		tempDirSuffix string
 	}{
 		{
 			name:          "whisper with ogg voice message",
@@ -393,6 +398,17 @@ func TestProcessAudio_Args(t *testing.T) {
 			wantCmdName:   "whisper",
 		},
 		{
+			name:          "whisper with special characters in directory path",
+			chatID:        424242,
+			messageID:     777,
+			contentType:   contract.ContentTypeVoice,
+			mimeType:      "audio/ogg",
+			fileID:        "voice_special_dir",
+			transcription: "Special characters in directory path transcription test.",
+			wantCmdName:   "whisper",
+			tempDirSuffix: "special @dir-[chars] (1)",
+		},
+		{
 			name:          "whisper with minimal IDs resulting in /tmp/telegram-bridge/0/1.ogg",
 			chatID:        0,
 			messageID:     1,
@@ -414,6 +430,15 @@ func TestProcessAudio_Args(t *testing.T) {
 			var capturedCmd struct {
 				name string
 				args []string
+			}
+
+			// Cases with tempDirSuffix point imageTempDir at a directory whose
+			// name carries special characters, so every path built from it —
+			// and every whisper argument derived from that path — contains them.
+			if tt.tempDirSuffix != "" {
+				originalDir := imageTempDir
+				imageTempDir = filepath.Join(t.TempDir(), tt.tempDirSuffix)
+				t.Cleanup(func() { imageTempDir = originalDir })
 			}
 
 			// Create the actual directory that processAudio will use (it uses the imageTempDir constant)
@@ -500,6 +525,14 @@ func TestProcessAudio_Args(t *testing.T) {
 			expectedAudioPath := filepath.Join(expectedChatDir, fmt.Sprintf("%d.%s", tt.messageID, expectedExt))
 			assert.Equal(t, expectedAudioPath, capturedCmd.args[0], "audio file path should be correct")
 			assert.Equal(t, expectedChatDir, capturedCmd.args[6], "output_dir should be correct")
+
+			// Special-character cases: the whisper args must carry the
+			// characters verbatim — exec.Command passes arguments directly
+			// (no shell), so nothing may escape or mangle them.
+			if tt.tempDirSuffix != "" {
+				assert.Contains(t, capturedCmd.args[0], tt.tempDirSuffix, "audio path arg should keep special characters intact")
+				assert.Contains(t, capturedCmd.args[6], tt.tempDirSuffix, "output_dir arg should keep special characters intact")
+			}
 		})
 	}
 }
