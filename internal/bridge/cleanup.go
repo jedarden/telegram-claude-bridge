@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -12,6 +13,12 @@ import (
 // DefaultWorkerTTL is the ceiling after which a worker still in 'running'
 // status is force-failed by the stale worker sweep (sweepStaleWorkers).
 const DefaultWorkerTTL = 10 * time.Minute
+
+// orphanPaneGracePeriod is deliberately much shorter than DefaultWorkerTTL.
+// It covers the brief interval between tmux creating a persistent pane and
+// the corresponding SQLite INSERT committing, without letting a crashed
+// bridge retain an untracked pane for the worker timeout.
+const orphanPaneGracePeriod = 30 * time.Second
 
 // SessionCleanup manages periodic cleanup of stale sessions and workers.
 // It marks inactive sessions, optionally closes their Telegram topics,
@@ -24,8 +31,12 @@ type SessionCleanup struct {
 	ttl         time.Duration
 	closeTopics bool
 	workerTTL   time.Duration // Force-fail workers running longer than this
-	cancel      context.CancelFunc
-	done        chan struct{}
+	// orphanPaneFirstSeen tracks pane names that do not encode their creation
+	// time (regular session panes). A pane must remain unmatched for this grace
+	// period before cleanup can reap it.
+	orphanPaneFirstSeen map[string]time.Time
+	cancel              context.CancelFunc
+	done                chan struct{}
 }
 
 // NewSessionCleanup creates a new SessionCleanup instance.
@@ -35,14 +46,15 @@ type SessionCleanup struct {
 // workerTTL is the time after which a running worker is force-failed (e.g., 10 minutes).
 func NewSessionCleanup(db *DB, sender *Sender, ptyMgr *PTYManager, interval, ttl time.Duration, closeTopics bool, workerTTL time.Duration) *SessionCleanup {
 	return &SessionCleanup{
-		db:          db,
-		sender:      sender,
-		ptyMgr:      ptyMgr,
-		interval:    interval,
-		ttl:         ttl,
-		closeTopics: closeTopics,
-		workerTTL:   workerTTL,
-		done:        make(chan struct{}),
+		db:                  db,
+		sender:              sender,
+		ptyMgr:              ptyMgr,
+		interval:            interval,
+		ttl:                 ttl,
+		closeTopics:         closeTopics,
+		workerTTL:           workerTTL,
+		orphanPaneFirstSeen: make(map[string]time.Time),
+		done:                make(chan struct{}),
 	}
 }
 
@@ -121,7 +133,11 @@ func (sc *SessionCleanup) sweepStaleWorkers(ctx context.Context) {
 	for _, worker := range workers {
 		// Worker panes are named: "w-{workerID[:8]}-{timestamp}"
 		// We need to find a pane that starts with "w-{workerID[:8]}-"
-		workerPrefix := fmt.Sprintf("w-%s-", worker.ID[:8])
+		workerPrefix := workerPanePrefix(worker.ID)
+		if workerPrefix == "" {
+			log.Printf("[cleanup] worker %q has no usable pane prefix", worker.ID)
+			continue
+		}
 
 		var matchedPane string
 		for paneName := range paneSet {
@@ -153,6 +169,153 @@ func (sc *SessionCleanup) sweepStaleWorkers(ctx context.Context) {
 	}
 }
 
+// sweepOrphanedPanes reconciles tmux panes back to their live DB records. This
+// is intentionally the reverse direction of sweepStaleWorkers: windows are
+// listed even when no stale (or even no) worker rows exist.
+//
+// A transient pane has no persistent DB record, but is protected while this
+// bridge process owns it. After a restart, untracked transient panes are
+// reaped just like worker or session panes once the registration grace expires.
+func (sc *SessionCleanup) sweepOrphanedPanes(ctx context.Context) {
+	workers, err := sc.db.ListRunningWorkers(ctx)
+	if err != nil {
+		log.Printf("[cleanup] failed to list running workers for orphan-pane sweep: %v", err)
+		return
+	}
+	sessions, err := sc.db.ListActiveSessions(ctx)
+	if err != nil {
+		log.Printf("[cleanup] failed to list active sessions for orphan-pane sweep: %v", err)
+		return
+	}
+
+	liveWorkerPrefixes := make(map[string]struct{}, len(workers))
+	for _, worker := range workers {
+		if prefix := workerPanePrefix(worker.ID); prefix != "" {
+			liveWorkerPrefixes[prefix] = struct{}{}
+		}
+	}
+	liveSessionPanes := make(map[string]struct{}, len(sessions))
+	for _, session := range sessions {
+		liveSessionPanes[sessionPaneName(session.ChatID, session.ThreadID)] = struct{}{}
+	}
+
+	cmd := exec.Command("tmux", "list-windows", "-t", tmuxSessionName, "-F", "#{window_name}")
+	out, err := cmd.Output()
+	if err != nil {
+		// A missing tmux session is normal when the bridge has no active panes.
+		log.Printf("[cleanup] failed to list tmux windows for orphan-pane sweep: %v", err)
+		return
+	}
+
+	now := time.Now()
+	present := make(map[string]struct{})
+	for _, paneName := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if paneName == "" {
+			continue
+		}
+		present[paneName] = struct{}{}
+
+		paneTarget := fmt.Sprintf("%s:%s", tmuxSessionName, paneName)
+		reason := orphanPaneReason(paneName, liveWorkerPrefixes, liveSessionPanes)
+		if reason == "" || sc.ptyMgr.PaneManaged(paneTarget) {
+			delete(sc.orphanPaneFirstSeen, paneName)
+			continue
+		}
+
+		if !sc.orphanPanePastGrace(paneName, now) {
+			continue
+		}
+
+		if err := sc.ptyMgr.KillPane(paneTarget); err != nil {
+			log.Printf("[cleanup] failed to reap orphan tmux window %q: %s: %v", paneName, reason, err)
+			continue
+		}
+		log.Printf("[cleanup] reaped orphan tmux window %q: %s", paneName, reason)
+		delete(sc.orphanPaneFirstSeen, paneName)
+	}
+
+	// Do not retain entries for panes that disappeared between cleanup cycles.
+	for paneName := range sc.orphanPaneFirstSeen {
+		if _, ok := present[paneName]; !ok {
+			delete(sc.orphanPaneFirstSeen, paneName)
+		}
+	}
+}
+
+// workerPanePrefix returns the stable portion of a worker window name.
+func workerPanePrefix(workerID string) string {
+	if workerID == "" {
+		return ""
+	}
+	if len(workerID) > 8 {
+		workerID = workerID[:8]
+	}
+	return fmt.Sprintf("w-%s-", workerID)
+}
+
+// sessionPaneName returns the stable tmux name for a Telegram topic session.
+func sessionPaneName(chatID, threadID int64) string {
+	if chatID < 0 {
+		chatID = -chatID
+	}
+	return fmt.Sprintf("t%d-%d", chatID, threadID)
+}
+
+// orphanPaneReason reports why paneName is not backed by a live DB record.
+// An empty reason means a running worker or active session owns the pane.
+func orphanPaneReason(paneName string, liveWorkerPrefixes, liveSessionPanes map[string]struct{}) string {
+	if strings.HasPrefix(paneName, "w-") {
+		for prefix := range liveWorkerPrefixes {
+			if strings.HasPrefix(paneName, prefix) {
+				return ""
+			}
+		}
+		return "no running worker record"
+	}
+	if strings.HasPrefix(paneName, "t") {
+		if _, ok := liveSessionPanes[paneName]; ok {
+			return ""
+		}
+		return "no active session record"
+	}
+	return "no running worker or active session record"
+}
+
+// orphanPanePastGrace verifies that an unmatched pane is old enough to be
+// reaped. Worker pane names include their Unix-nanosecond creation timestamp,
+// so an old leaked worker is reclaimed on the first cleanup after restart.
+// Session pane names have no timestamp, so their grace begins when this bridge
+// process first observes them.
+func (sc *SessionCleanup) orphanPanePastGrace(paneName string, now time.Time) bool {
+	if createdAt, ok := workerPaneCreatedAt(paneName); ok {
+		return !createdAt.Add(orphanPaneGracePeriod).After(now)
+	}
+	firstSeen, ok := sc.orphanPaneFirstSeen[paneName]
+	if !ok {
+		sc.orphanPaneFirstSeen[paneName] = now
+		return false
+	}
+	return !firstSeen.Add(orphanPaneGracePeriod).After(now)
+}
+
+// workerPaneCreatedAt extracts the Unix-nanosecond suffix added by
+// WorkerPool.runWorker. It deliberately rejects non-worker panes so session
+// panes fall back to the first-seen grace path above.
+func workerPaneCreatedAt(paneName string) (time.Time, bool) {
+	if !strings.HasPrefix(paneName, "w-") {
+		return time.Time{}, false
+	}
+	separator := strings.LastIndex(paneName, "-")
+	if separator == -1 || separator == len(paneName)-1 {
+		return time.Time{}, false
+	}
+	nanoseconds, err := strconv.ParseInt(paneName[separator+1:], 10, 64)
+	if err != nil || nanoseconds <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(0, nanoseconds), true
+}
+
 // MarkInactive marks a session as inactive and kills its associated tmux pane.
 // This is performed within a database transaction to ensure atomicity.
 func (sc *SessionCleanup) MarkInactive(ctx context.Context, sess *Session) error {
@@ -170,14 +333,8 @@ func (sc *SessionCleanup) MarkInactive(ctx context.Context, sess *Session) error
 		return fmt.Errorf("failed to update session status: %w", err)
 	}
 
-	// Calculate absolute chat ID for pane naming (Telegram uses negative IDs for groups)
-	absChatID := sess.ChatID
-	if absChatID < 0 {
-		absChatID = -absChatID
-	}
-
-	// Kill the corresponding tmux pane
-	paneName := fmt.Sprintf("t%d-%d", absChatID, sess.ThreadID)
+	// Kill the corresponding tmux pane.
+	paneName := sessionPaneName(sess.ChatID, sess.ThreadID)
 	paneTarget := fmt.Sprintf("%s:%s", tmuxSessionName, paneName)
 	if err := sc.ptyMgr.KillPane(paneTarget); err != nil {
 		// Log but don't fail the transaction - the pane may already be dead
@@ -198,6 +355,11 @@ func (sc *SessionCleanup) MarkInactive(ctx context.Context, sess *Session) error
 
 // runCleanup executes a single cleanup cycle.
 func (sc *SessionCleanup) runCleanup(ctx context.Context) {
+	// Reconcile tmux -> DB on every cycle, including when worker TTL cleanup is
+	// disabled or no worker rows exist. This catches panes leaked by a crashed
+	// bridge or a process that used a different database.
+	sc.sweepOrphanedPanes(ctx)
+
 	// First, sweep stale workers (independent of session TTL)
 	if sc.workerTTL > 0 {
 		sc.sweepStaleWorkers(ctx)
@@ -258,11 +420,7 @@ func (sc *SessionCleanup) runCleanup(ctx context.Context) {
 		}
 
 		// Kill the corresponding tmux pane
-		absChatID := sess.ChatID
-		if absChatID < 0 {
-			absChatID = -absChatID
-		}
-		paneName := fmt.Sprintf("t%d-%d", absChatID, sess.ThreadID)
+		paneName := sessionPaneName(sess.ChatID, sess.ThreadID)
 		paneTarget := fmt.Sprintf("%s:%s", tmuxSessionName, paneName)
 		if err := sc.ptyMgr.KillPane(paneTarget); err != nil {
 			// Log but don't fail the transaction - the pane may already be dead

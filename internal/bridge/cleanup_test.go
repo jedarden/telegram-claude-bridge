@@ -283,6 +283,122 @@ func TestSessionCleanupZeroValues(t *testing.T) {
 	}
 }
 
+func TestSessionCleanupRunCleanupReapsOldWorkerPaneWithoutDBRecords(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	tmux := setupTmuxTest(t)
+
+	// This is the failure mode from the production leak: the tmux window was
+	// created by a process using another DB, so this DB has no worker rows at
+	// all. Its timestamp is older than the short registration grace period.
+	paneName := fmt.Sprintf("w-orphaned-%d", time.Now().Add(-2*orphanPaneGracePeriod).UnixNano())
+	mockTmuxCommand(t, "list-windows", paneName+"\n")
+
+	var logs bytes.Buffer
+	previousLogWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousLogWriter) })
+
+	cleanup := NewSessionCleanup(db, &Sender{}, NewPTYManager(), 0, 24*time.Hour, false, 0)
+	cleanup.runCleanup(ctx)
+
+	wantKill := "kill-window -t " + tmuxSessionName + ":" + paneName
+	var found bool
+	for _, call := range tmux.tmuxCalls(t) {
+		if call == wantKill {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("tmux calls = %v, want orphan-pane reap %q", tmux.tmuxCalls(t), wantKill)
+	}
+	if !strings.Contains(logs.String(), "reaped orphan tmux window \""+paneName+"\": no running worker record") {
+		t.Errorf("orphan reap log = %q, want window name and reason", logs.String())
+	}
+}
+
+func TestSessionCleanupSweepOrphanedPanesPreservesLiveRecordsAndGracePeriod(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	tmux := setupTmuxTest(t)
+
+	for _, chatID := range []int64{100, 101} {
+		if err := db.UpsertGroup(ctx, &Group{ChatID: chatID, CWD: "/tmp"}); err != nil {
+			t.Fatalf("UpsertGroup(%d): %v", chatID, err)
+		}
+	}
+	if err := db.CreateSession(ctx, &Session{ChatID: 100, ThreadID: 10, SessionID: "active", CWD: "/tmp", Status: "active"}); err != nil {
+		t.Fatalf("CreateSession active: %v", err)
+	}
+	if err := db.CreateSession(ctx, &Session{ChatID: 101, ThreadID: 11, SessionID: "inactive", CWD: "/tmp", Status: "inactive"}); err != nil {
+		t.Fatalf("CreateSession inactive: %v", err)
+	}
+
+	liveWorker := &Worker{ID: "worker_live_1000", ChatID: 100, ThreadID: 10, ParentMsg: 1, Prompt: "live", Status: "running"}
+	doneWorker := &Worker{ID: "worker_done_2000", ChatID: 100, ThreadID: 10, ParentMsg: 2, Prompt: "done", Status: "done"}
+	for _, worker := range []*Worker{liveWorker, doneWorker} {
+		if err := db.CreateWorker(ctx, worker); err != nil {
+			t.Fatalf("CreateWorker(%s): %v", worker.ID, err)
+		}
+	}
+
+	oldTimestamp := time.Now().Add(-2 * orphanPaneGracePeriod).UnixNano()
+	freshPane := fmt.Sprintf("w-worker_n-%d", time.Now().UnixNano())
+	orphanWorkerPane := fmt.Sprintf("w-worker_o-%d", oldTimestamp)
+	doneWorkerPane := fmt.Sprintf("w-worker_d-%d", oldTimestamp)
+	liveWorkerPane := fmt.Sprintf("%s%d", workerPanePrefix(liveWorker.ID), oldTimestamp)
+	mockTmuxCommand(t, "list-windows", strings.Join([]string{
+		"t100-10", // Backed by the active session above.
+		"t101-11", // Inactive session is not a live record.
+		liveWorkerPane,
+		doneWorkerPane,
+		orphanWorkerPane,
+		freshPane,
+		"sum-transient", // Protected while its in-process owner is active.
+		"untracked-pane",
+	}, "\n")+"\n")
+
+	var logs bytes.Buffer
+	previousLogWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousLogWriter) })
+
+	ptyMgr := NewPTYManager()
+	ptyMgr.trackPane(tmuxSessionName + ":sum-transient")
+	cleanup := NewSessionCleanup(db, &Sender{}, ptyMgr, 0, 24*time.Hour, false, 0)
+	// Session window names do not carry a creation timestamp, so this models a
+	// window observed by an earlier cleanup cycle after its grace elapsed.
+	cleanup.orphanPaneFirstSeen["t101-11"] = time.Now().Add(-orphanPaneGracePeriod)
+	cleanup.orphanPaneFirstSeen["untracked-pane"] = time.Now().Add(-orphanPaneGracePeriod)
+	cleanup.sweepOrphanedPanes(ctx)
+
+	killed := make(map[string]bool)
+	for _, call := range tmux.tmuxCalls(t) {
+		const targetPrefix = "kill-window -t " + tmuxSessionName + ":"
+		if strings.HasPrefix(call, targetPrefix) {
+			killed[strings.TrimPrefix(call, targetPrefix)] = true
+		}
+	}
+	for _, paneName := range []string{orphanWorkerPane, doneWorkerPane, "t101-11", "untracked-pane"} {
+		if !killed[paneName] {
+			t.Errorf("pane %q was not reaped; kills = %v", paneName, killed)
+		}
+	}
+	for _, paneName := range []string{"t100-10", liveWorkerPane, freshPane, "sum-transient"} {
+		if killed[paneName] {
+			t.Errorf("pane %q was unexpectedly reaped; kills = %v", paneName, killed)
+		}
+	}
+	for _, want := range []string{
+		"reaped orphan tmux window \"" + orphanWorkerPane + "\": no running worker record",
+		"reaped orphan tmux window \"t101-11\": no active session record",
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("orphan reap log missing %q: %s", want, logs.String())
+		}
+	}
+}
+
 func TestSessionCleanupMarkInactiveKillPaneErrorIsNonFatal(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

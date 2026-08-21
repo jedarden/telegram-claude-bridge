@@ -539,6 +539,8 @@ func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 	return err
 }
 
+
+
 // ListGroups returns all configured groups.
 func (d *DB) ListGroups(ctx context.Context) ([]*Group, error) {
 	rows, err := d.db.QueryContext(ctx,
@@ -788,6 +790,33 @@ func (d *DB) ListAllSessions(ctx context.Context) ([]*Session, error) {
 		        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec, COALESCE(dispatcher_mode,-1),
 		        COALESCE(topic_name,''), COALESCE(last_from_user_id,0)
 			 FROM sessions ORDER BY last_active DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []*Session
+	for rows.Next() {
+		s, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, s)
+	}
+	return sessions, rows.Err()
+}
+
+// ListActiveSessions returns every session whose pane is expected to be live.
+// Cleanup uses this to reconcile tmux windows back to the database.
+func (d *DB) ListActiveSessions(ctx context.Context) ([]*Session, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
+		        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
+		        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec, COALESCE(dispatcher_mode,-1),
+		        COALESCE(topic_name,''), COALESCE(last_from_user_id,0)
+		 FROM sessions
+		 WHERE status = 'active'
+		 ORDER BY last_active DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1707,6 +1736,31 @@ func (d *DB) CountRunningWorkersGlobal(ctx context.Context) (int, error) {
 	return count, err
 }
 
+// ListRunningWorkers returns every worker whose pane is expected to be live.
+// Cleanup uses this to reconcile tmux windows back to the database.
+func (d *DB) ListRunningWorkers(ctx context.Context) ([]*Worker, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT id, chat_id, thread_id, parent_msg, prompt, session_id, model,
+		        status, result, error, started_at, finished_at
+		 FROM workers
+		 WHERE status = 'running'
+		 ORDER BY started_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var workers []*Worker
+	for rows.Next() {
+		w, err := scanWorker(rows)
+		if err != nil {
+			return nil, err
+		}
+		workers = append(workers, w)
+	}
+	return workers, rows.Err()
+}
+
 // ListWorkersForTopic returns all workers for a topic, ordered by started_at descending.
 func (d *DB) ListWorkersForTopic(ctx context.Context, chatID, threadID int64) ([]*Worker, error) {
 	rows, err := d.db.QueryContext(ctx,
@@ -2023,4 +2077,3 @@ func (d *DB) MarkUpdateFailuresResolved(ctx context.Context) error {
 	)
 	return err
 }
-

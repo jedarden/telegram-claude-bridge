@@ -60,8 +60,9 @@ const (
 // One pane per active topic; panes are culled after idleTTL of inactivity
 // and relaunched with --resume on the next message.
 type PTYManager struct {
-	mu         sync.Mutex
-	idleTimers map[string]*time.Timer // paneTarget → idle kill timer
+	mu           sync.Mutex
+	idleTimers   map[string]*time.Timer // paneTarget → idle kill timer
+	managedPanes map[string]struct{}    // panes intentionally owned by this bridge process
 }
 
 // ResponseSource identifies which extraction path supplied a completed
@@ -78,7 +79,8 @@ const (
 // NewPTYManager creates a new PTYManager.
 func NewPTYManager() *PTYManager {
 	return &PTYManager{
-		idleTimers: make(map[string]*time.Timer),
+		idleTimers:   make(map[string]*time.Timer),
+		managedPanes: make(map[string]struct{}),
 	}
 }
 
@@ -137,6 +139,7 @@ func (p *PTYManager) SpawnPane(paneName, cwd string, claudeArgs []string) (strin
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("spawn pane %s: %w: %s", paneName, err, out)
 	}
+	p.trackPane(paneTarget)
 	return paneTarget, nil
 }
 
@@ -163,9 +166,38 @@ func (p *PTYManager) PaneAlive(paneTarget string) bool {
 	return exec.Command("tmux", "has-session", "-t", paneTarget).Run() == nil
 }
 
+// PaneManaged reports whether this bridge process currently owns paneTarget.
+// Transient panes do not have a persistent DB row, but remain protected from
+// cleanup while their spawning operation is still active.
+func (p *PTYManager) PaneManaged(paneTarget string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.managedPanes[paneTarget]
+	return ok
+}
+
+func (p *PTYManager) trackPane(paneTarget string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.managedPanes == nil {
+		p.managedPanes = make(map[string]struct{})
+	}
+	p.managedPanes[paneTarget] = struct{}{}
+}
+
+func (p *PTYManager) untrackPane(paneTarget string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.managedPanes, paneTarget)
+}
+
 // KillPane kills the tmux window for a pane.
 func (p *PTYManager) KillPane(paneTarget string) error {
 	out, err := exec.Command("tmux", "kill-window", "-t", paneTarget).CombinedOutput()
+	// The caller has decided this pane is no longer live, even if tmux reports
+	// it died before the kill reached it. Let a later orphan sweep retry any
+	// window that remains after a failed kill.
+	p.untrackPane(paneTarget)
 	if err != nil {
 		return fmt.Errorf("kill pane %s: %w: %s", paneTarget, err, out)
 	}
