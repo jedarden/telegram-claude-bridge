@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+// DefaultWorkerTTL is the ceiling after which a worker still in 'running'
+// status is force-failed by the stale worker sweep (sweepStaleWorkers).
+const DefaultWorkerTTL = 10 * time.Minute
+
 // SessionCleanup manages periodic cleanup of stale sessions and workers.
 // It marks inactive sessions, optionally closes their Telegram topics,
 // kills orphaned tmux panes, and force-fails stale workers.
