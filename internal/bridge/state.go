@@ -863,7 +863,8 @@ func (d *DB) ListStaleSessions(ctx context.Context, ttl time.Duration) ([]*Sessi
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 			        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
-			        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec, COALESCE(dispatcher_mode,-1)
+			        COALESCE(summary,''), COALESCE(notification_mode,'live'), timeout_sec, COALESCE(dispatcher_mode,-1),
+			        COALESCE(topic_name,''), COALESCE(last_from_user_id,0)
 			 FROM sessions
 			 WHERE status = 'active'
 			   AND datetime(last_active) < datetime('now', '-' || ? || ' seconds')
