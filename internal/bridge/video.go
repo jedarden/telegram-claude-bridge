@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -53,7 +52,7 @@ func (m *SessionManager) processVideo(
 	cleanupPaths := []string{videoPath}
 
 	// Extract keyframes.
-	keyframePaths, err := extractKeyframes(ctx, videoPath, dir, stem)
+	keyframePaths, err := m.extractKeyframes(ctx, videoPath, dir, stem)
 	if err != nil {
 		return nil, cleanupPaths, fmt.Errorf("extract keyframes: %w", err)
 	}
@@ -61,13 +60,13 @@ func (m *SessionManager) processVideo(
 
 	// Extract audio track for transcription.
 	audioPath := filepath.Join(dir, stem+"_audio.wav")
-	if err := extractAudio(ctx, videoPath, audioPath); err != nil {
+	if err := m.extractAudio(ctx, videoPath, audioPath); err != nil {
 		return nil, cleanupPaths, fmt.Errorf("extract audio: %w", err)
 	}
 	cleanupPaths = append(cleanupPaths, audioPath)
 
 	// Transcribe audio using Whisper.
-	transcription, err := transcribeAudio(ctx, audioPath, dir, stem)
+	transcription, err := m.transcribeAudio(ctx, audioPath, dir, stem)
 	if err != nil {
 		return nil, cleanupPaths, fmt.Errorf("transcribe audio: %w", err)
 	}
@@ -78,17 +77,24 @@ func (m *SessionManager) processVideo(
 	}, cleanupPaths, nil
 }
 
+// keyframeFilter builds the ffmpeg -vf argument for keyframe extraction: sample
+// at videoKeyframeFPS and scale to videoKeyframeWidth pixels wide with the
+// height computed by ffmpeg (-1) to preserve aspect ratio.
+func keyframeFilter() string {
+	return fmt.Sprintf("fps=%s,scale=%d:-1", videoKeyframeFPS, videoKeyframeWidth)
+}
+
 // extractKeyframes extracts keyframes from a video file using ffmpeg.
 // Returns paths to the extracted frame images.
-func extractKeyframes(ctx context.Context, videoPath, dir, stem string) ([]string, error) {
+func (m *SessionManager) extractKeyframes(ctx context.Context, videoPath, dir, stem string) ([]string, error) {
 	// Use ffmpeg to extract frames at the specified FPS, scaling to the target width.
 	// -vf "fps=0.5,scale=800:-1" means: extract one frame every 2 seconds, scale to 800px width.
 	// Frame pattern: {stem}_frame_0001.jpg, {stem}_frame_0002.jpg, etc.
 	framePattern := filepath.Join(dir, stem+"_frame_%04d.jpg")
 
-	cmd := exec.CommandContext(ctx, "ffmpeg",
+	cmd := m.commandExec.CommandContext(ctx, "ffmpeg",
 		"-i", videoPath,
-		"-vf", fmt.Sprintf("fps=%s,scale=%d:-1", videoKeyframeFPS, videoKeyframeWidth),
+		"-vf", keyframeFilter(),
 		"-frames:v", fmt.Sprintf("%d", maxKeyframes),
 		"-y", // overwrite existing files
 		framePattern,
@@ -98,11 +104,22 @@ func extractKeyframes(ctx context.Context, videoPath, dir, stem string) ([]strin
 		return nil, fmt.Errorf("ffmpeg: %w\noutput: %s", err, strings.TrimSpace(string(output)))
 	}
 
-	// Find all extracted frames matching the pattern.
-	pattern := filepath.Join(dir, stem+"_frame_*.jpg")
-	matches, err := filepath.Glob(pattern)
+	// Find all extracted frames matching the naming scheme. ReadDir is used
+	// instead of filepath.Glob because Glob treats metacharacters in dir
+	// ([], *, ?) as patterns, which would hide frames written into such a
+	// directory. ReadDir also returns entries sorted by name, so frame order
+	// (zero-padded) is numeric.
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("glob frames: %w", err)
+		return nil, fmt.Errorf("read frames dir: %w", err)
+	}
+	prefix := stem + "_frame_"
+	var matches []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), prefix) || !strings.HasSuffix(e.Name(), ".jpg") {
+			continue
+		}
+		matches = append(matches, filepath.Join(dir, e.Name()))
 	}
 	if len(matches) == 0 {
 		// Video may be too short or have no visual content.
@@ -113,8 +130,8 @@ func extractKeyframes(ctx context.Context, videoPath, dir, stem string) ([]strin
 }
 
 // extractAudio extracts the audio track from a video file using ffmpeg.
-func extractAudio(ctx context.Context, videoPath, audioPath string) error {
-	cmd := exec.CommandContext(ctx, "ffmpeg",
+func (m *SessionManager) extractAudio(ctx context.Context, videoPath, audioPath string) error {
+	cmd := m.commandExec.CommandContext(ctx, "ffmpeg",
 		"-i", videoPath,
 		"-vn",               // no video
 		"-acodec", "pcm_s16le", // 16-bit little-endian PCM (WAV compatible)
@@ -129,11 +146,11 @@ func extractAudio(ctx context.Context, videoPath, audioPath string) error {
 }
 
 // transcribeAudio transcribes an audio file using Whisper CLI.
-func transcribeAudio(ctx context.Context, audioPath, dir, stem string) (string, error) {
+func (m *SessionManager) transcribeAudio(ctx context.Context, audioPath, dir, stem string) (string, error) {
 	// Whisper outputs {stem}.txt in the output_dir when --output_format txt is set.
 	txtPath := filepath.Join(dir, stem+"_audio.txt")
 
-	cmd := exec.CommandContext(ctx, "whisper",
+	cmd := m.commandExec.CommandContext(ctx, "whisper",
 		audioPath,
 		"--model", "turbo",
 		"--output_format", "txt",
