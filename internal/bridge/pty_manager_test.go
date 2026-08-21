@@ -154,7 +154,18 @@ func teardownTmuxTest(t *testing.T, state *tmuxTestState) {
 	if err != nil {
 		t.Errorf("restore %s after tmux test: %v", tmuxMockFixtureDirEnv, err)
 	}
-	if err := os.RemoveAll(state.fixtureDir); err != nil {
+	// Worker goroutines leaked by spawn_worker tests may still be writing to
+	// the fixture directory (the mock appends every invocation to its calls
+	// log) when this cleanup runs; retry briefly until they drain instead of
+	// racing them and failing with "directory not empty".
+	for attempt := 0; ; attempt++ {
+		err = os.RemoveAll(state.fixtureDir)
+		if err == nil || attempt >= 9 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err != nil {
 		t.Errorf("remove tmux fixture directory: %v", err)
 	}
 }

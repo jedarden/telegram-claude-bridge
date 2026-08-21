@@ -1457,6 +1457,16 @@ func TestCmdSessions_WithSessions(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
+	// Sessions have a foreign key on groups(chat_id)
+	group := &Group{
+		ChatID:    100,
+		CWD:       "/test",
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
 	// Create sessions in different states
 	for i, status := range []string{"active", "closed", "active"} {
 		session := &Session{
@@ -1595,18 +1605,6 @@ func TestCmdColor_SetColor_Invalid(t *testing.T) {
 }
 
 func TestCmdColor_ColorAliases(t *testing.T) {
-	db := openTestDB(t)
-	ctx := context.Background()
-
-	group := &Group{
-		ChatID:    100,
-		CWD:       "/test",
-		CreatedAt: time.Now().UTC(),
-	}
-	if err := db.UpsertGroup(ctx, group); err != nil {
-		t.Fatalf("upsert group: %v", err)
-	}
-
 	tests := []struct {
 		input       string
 		expectedCol int
@@ -1629,6 +1627,18 @@ func TestCmdColor_ColorAliases(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.input, func(t *testing.T) {
+			db := openTestDB(t)
+			ctx := context.Background()
+
+			group := &Group{
+				ChatID:    100,
+				CWD:       "/test",
+				CreatedAt: time.Now().UTC(),
+			}
+			if err := db.UpsertGroup(ctx, group); err != nil {
+				t.Fatalf("upsert group: %v", err)
+			}
+
 			threadID := int64(10)
 			session := &Session{
 				ChatID:    100,
@@ -1662,12 +1672,6 @@ func TestCmdColor_ColorAliases(t *testing.T) {
 			if updated.IconColor != tc.expectedCol {
 				t.Errorf("IconColor for %s = %d, want %d", tc.input, updated.IconColor, tc.expectedCol)
 			}
-
-			// Clean up for next test
-			db.Close()
-			db = openTestDB(t)
-			group.ChatID = 100
-			db.UpsertGroup(ctx, group)
 		})
 	}
 }
@@ -2004,18 +2008,6 @@ func TestCmdModel_ShowCurrent(t *testing.T) {
 }
 
 func TestCmdModel_SetModel_Shortcuts(t *testing.T) {
-	db := openTestDB(t)
-	ctx := context.Background()
-
-	group := &Group{
-		ChatID:    100,
-		CWD:       "/test",
-		CreatedAt: time.Now().UTC(),
-	}
-	if err := db.UpsertGroup(ctx, group); err != nil {
-		t.Fatalf("upsert group: %v", err)
-	}
-
 	tests := []struct {
 		input    string
 		expected string
@@ -2027,6 +2019,18 @@ func TestCmdModel_SetModel_Shortcuts(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.input, func(t *testing.T) {
+			db := openTestDB(t)
+			ctx := context.Background()
+
+			group := &Group{
+				ChatID:    100,
+				CWD:       "/test",
+				CreatedAt: time.Now().UTC(),
+			}
+			if err := db.UpsertGroup(ctx, group); err != nil {
+				t.Fatalf("upsert group: %v", err)
+			}
+
 			threadID := int64(10)
 			session := &Session{
 				ChatID:    100,
@@ -2060,12 +2064,6 @@ func TestCmdModel_SetModel_Shortcuts(t *testing.T) {
 			if updated.Model != tc.expected {
 				t.Errorf("Model in DB = %q, want %s", updated.Model, tc.expected)
 			}
-
-			// Clean up for next test
-			db.Close()
-			db = openTestDB(t)
-			group.ChatID = 100
-			db.UpsertGroup(ctx, group)
 		})
 	}
 }

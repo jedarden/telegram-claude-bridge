@@ -370,11 +370,20 @@ func (h *CommandHandler) cmdConfig(ctx context.Context, update contract.Update, 
 
 	// Parse setting name and value
 	parts := strings.Fields(args)
-	if len(parts) < 2 {
+	if len(parts) == 0 {
 		return "Usage: /config <setting> <value>\n\nSettings: permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers, progress_interval_sec\n\nExamples:\n  /config permission_mode dontAsk\n  /config allowed_tools [\"Read\",\"Grep\",\"Glob\"]\n  /config disallowed_tools [\"Bash\",\"Edit\"]\n  /config max_subtasks 10\n  /config max_workers 3\n  /config progress_interval_sec 60", nil
 	}
 
 	setting := strings.ToLower(parts[0])
+
+	// Tool lists can be cleared by naming the setting without a value; every
+	// other setting requires one.
+	clearable := setting == "allowed_tools" || setting == "allowed-tools" || setting == "allowedtools" ||
+		setting == "disallowed_tools" || setting == "disallowed-tools" || setting == "disallowedtools"
+	if len(parts) < 2 && !clearable {
+		return "Usage: /config <setting> <value>\n\nSettings: permission_mode, allowed_tools, disallowed_tools, max_subtasks, max_workers, progress_interval_sec\n\nExamples:\n  /config permission_mode dontAsk\n  /config allowed_tools [\"Read\",\"Grep\",\"Glob\"]\n  /config disallowed_tools [\"Bash\",\"Edit\"]\n  /config max_subtasks 10\n  /config max_workers 3\n  /config progress_interval_sec 60", nil
+	}
+
 	value := strings.Join(parts[1:], " ")
 
 	// Check admin access for setting values
@@ -1806,14 +1815,13 @@ func (h *CommandHandler) cmdSnippet(ctx context.Context, update contract.Update,
 		return "This group is not registered. Use /cwd <path> to register it.", nil
 	}
 
-	args = strings.TrimSpace(args)
-	if args == "" {
+	if strings.TrimSpace(args) == "" {
 		return "Usage: /snippet <name> <content>\n       /snippet delete <name>\n\nCreates, updates, or deletes context snippets for this chat.\n\nExamples:\n  /snippet api-key sk-12345\n  /snippet project-root /home/user/project\n  /snippet delete old-key", nil
 	}
 
 	// Check if this is a delete command
-	if strings.HasPrefix(strings.ToLower(args), "delete ") {
-		name := strings.TrimSpace(args[7:])
+	if trimmed := strings.TrimLeft(args, " "); strings.HasPrefix(strings.ToLower(trimmed), "delete ") {
+		name := strings.TrimSpace(trimmed[7:])
 		if name == "" {
 			return "Usage: /snippet delete <name>", nil
 		}
