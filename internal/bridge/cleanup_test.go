@@ -3,8 +3,16 @@ package bridge
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -388,5 +396,281 @@ func TestSessionCleanupMarkInactiveKillsPaneAndCommits(t *testing.T) {
 				t.Errorf("tmux calls = %v, want [%q]", calls, wantCall)
 			}
 		})
+	}
+}
+
+// ── MarkInactive against a real tmux server ─────────────────────────────────
+//
+// The tests above exercise MarkInactive against the fixture-backed tmux mock;
+// they prove a kill-window was issued but not that anything terminated. The
+// two below verify the orphan-prevention contract end to end against a real
+// tmux server: after MarkInactive the named window is gone, the process that
+// ran inside it is dead, and the session row is inactive.
+//
+// TestMain poisons PATH so tests cannot reach the real tmux by accident (the
+// EX44 leak incident). These tests opt in deliberately, but never touch the
+// default tmux server — the one hosting the live bridge and operator
+// sessions. Every "tmux" invocation from production code is routed through a
+// shim pinned to a private socket (-L), giving the test its own server that
+// kill-server tears down in cleanup, orphaned windows included.
+
+var realTmuxSocketSeq atomic.Int64
+
+// realTmuxBinary locates a functional tmux executable on PATH, skipping the
+// poisoned stub directory installed by TestMain. The test is skipped when
+// none is available — CI containers ship without tmux.
+func realTmuxBinary(t *testing.T) string {
+	t.Helper()
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" || strings.Contains(filepath.Base(dir), "telegram-bridge-poisoned-") {
+			continue
+		}
+		candidate := filepath.Join(dir, "tmux")
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+			continue
+		}
+		out, err := exec.Command(candidate, "-V").Output()
+		if err != nil || !strings.HasPrefix(string(out), "tmux ") {
+			continue
+		}
+		return candidate
+	}
+	t.Skip("no functional tmux on PATH; skipping real-tmux integration test")
+	return ""
+}
+
+// setupRealTmuxTest installs a PATH shim that routes every tmux invocation to
+// a dedicated server on a private socket. The server is killed on test
+// cleanup, which also terminates any pane the test failed to clean up.
+func setupRealTmuxTest(t *testing.T) {
+	t.Helper()
+	realTmux := realTmuxBinary(t)
+
+	socket := fmt.Sprintf("telegram-bridge-test-%d-%d", os.Getpid(), realTmuxSocketSeq.Add(1))
+	shimDir := t.TempDir()
+	shim := filepath.Join(shimDir, "tmux")
+	script := fmt.Sprintf("#!/bin/sh\nexec %s -L %s \"$@\"\n", shellQuote(realTmux), shellQuote(socket))
+	if err := os.WriteFile(shim, []byte(script), 0o755); err != nil {
+		t.Fatalf("write tmux shim: %v", err)
+	}
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// The cleanup uses the real binary by absolute path so it runs regardless
+	// of the PATH restore t.Setenv performs first; errors are ignored so a
+	// server that is already gone cannot fail cleanup.
+	t.Cleanup(func() {
+		_ = exec.Command(realTmux, "-L", socket, "kill-server").Run()
+	})
+}
+
+// createRealPaneWindow opens a live window named paneName in the
+// telegram-bridge session of the test server and returns the PID of the
+// process running inside it. SpawnPane cannot be used here: it hardcodes the
+// claude command, which the poisoned PATH deliberately blocks.
+func createRealPaneWindow(t *testing.T, paneName string) int {
+	t.Helper()
+	args := []string{
+		"new-window",
+		"-t", tmuxSessionName,
+		"-n", paneName,
+		"-c", t.TempDir(),
+		"sleep", "600",
+	}
+	if out, err := exec.Command("tmux", args...).CombinedOutput(); err != nil {
+		t.Fatalf("new-window %s: %v: %s", paneName, err, out)
+	}
+
+	out, err := exec.Command("tmux", "display-message", "-p", "-t",
+		tmuxSessionName+":"+paneName, "#{pane_pid}").Output()
+	if err != nil {
+		t.Fatalf("read pane_pid for %s: %v: %s", paneName, err, out)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		t.Fatalf("parse pane_pid %q for %s: %v", out, paneName, err)
+	}
+	return pid
+}
+
+// realWindowNames returns the window names currently present in the test
+// server's telegram-bridge session. An absent session means no windows.
+func realWindowNames(t *testing.T) map[string]bool {
+	t.Helper()
+	names := make(map[string]bool)
+	out, err := exec.Command("tmux", "list-windows", "-t", tmuxSessionName, "-F", "#{window_name}").Output()
+	if err != nil {
+		return names
+	}
+	for _, name := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if name != "" {
+			names[name] = true
+		}
+	}
+	return names
+}
+
+// waitForPaneProcessDeath polls until pid no longer exists, returning false
+// if it is still alive when the timeout expires. kill-window signals the pane
+// process asynchronously, so the death check must tolerate a short delay.
+func waitForPaneProcessDeath(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestSessionCleanupMarkInactiveNoOrphanedPanesRealTmux verifies against a
+// real tmux server that MarkInactive leaves no orphaned pane behind: the
+// session's window disappears, the process that ran inside it dies, the
+// production liveness probe reports the pane dead, and the DB row is marked
+// inactive.
+func TestSessionCleanupMarkInactiveNoOrphanedPanesRealTmux(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping real-tmux integration test in short mode")
+	}
+	setupRealTmuxTest(t)
+
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const (
+		chatID   int64 = -987654321
+		threadID int64 = 12345
+	)
+	// MarkInactive derives the pane name from the absolute chat ID.
+	paneName := fmt.Sprintf("t%d-%d", -chatID, threadID)
+
+	sess := &Session{
+		ChatID:    chatID,
+		ThreadID:  threadID,
+		SessionID: "cleanup-real-tmux-live",
+		CWD:       "/tmp",
+	}
+	if err := db.UpsertGroup(ctx, &Group{ChatID: chatID, CWD: "/tmp"}); err != nil {
+		t.Fatalf("UpsertGroup: %v", err)
+	}
+	if err := db.CreateSession(ctx, sess); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	ptyMgr := NewPTYManager()
+	if err := ptyMgr.EnsureSession(); err != nil {
+		t.Fatalf("EnsureSession: %v", err)
+	}
+	panePID := createRealPaneWindow(t, paneName)
+	if !realWindowNames(t)[paneName] {
+		t.Fatalf("pane window %q not present before MarkInactive", paneName)
+	}
+
+	sc := NewSessionCleanup(db, &Sender{}, ptyMgr, 0, 0, false, 0)
+	if err := sc.MarkInactive(ctx, sess); err != nil {
+		t.Fatalf("MarkInactive: %v", err)
+	}
+
+	stored, err := db.GetSession(ctx, chatID, threadID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("GetSession returned nil")
+	}
+	if stored.Status != "inactive" {
+		t.Errorf("session status = %q, want inactive", stored.Status)
+	}
+
+	if realWindowNames(t)[paneName] {
+		t.Errorf("pane window %q still listed after MarkInactive: orphaned pane", paneName)
+	}
+	if !waitForPaneProcessDeath(panePID, 5*time.Second) {
+		t.Errorf("pane process %d still alive after MarkInactive: orphaned pane", panePID)
+	}
+	if ptyMgr.PaneAlive(tmuxSessionName + ":" + paneName) {
+		t.Errorf("PaneAlive(%q) = true after MarkInactive", tmuxSessionName+":"+paneName)
+	}
+}
+
+// TestSessionCleanupMarkInactivePaneAlreadyDeadRealTmux verifies the
+// already-dead path against real tmux: when the pane window is gone before
+// MarkInactive runs, the real kill-window failure ("can't find window") is
+// logged as non-fatal and the session is still marked inactive.
+func TestSessionCleanupMarkInactivePaneAlreadyDeadRealTmux(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping real-tmux integration test in short mode")
+	}
+	setupRealTmuxTest(t)
+
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const (
+		chatID   int64 = -987654322
+		threadID int64 = 12346
+	)
+	paneName := fmt.Sprintf("t%d-%d", -chatID, threadID)
+
+	sess := &Session{
+		ChatID:    chatID,
+		ThreadID:  threadID,
+		SessionID: "cleanup-real-tmux-dead",
+		CWD:       "/tmp",
+	}
+	if err := db.UpsertGroup(ctx, &Group{ChatID: chatID, CWD: "/tmp"}); err != nil {
+		t.Fatalf("UpsertGroup: %v", err)
+	}
+	if err := db.CreateSession(ctx, sess); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	ptyMgr := NewPTYManager()
+	if err := ptyMgr.EnsureSession(); err != nil {
+		t.Fatalf("EnsureSession: %v", err)
+	}
+	panePID := createRealPaneWindow(t, paneName)
+
+	// Kill the pane through the production path first; MarkInactive then hits
+	// a window real tmux reports as missing.
+	if err := ptyMgr.KillPane(tmuxSessionName + ":" + paneName); err != nil {
+		t.Fatalf("KillPane before MarkInactive: %v", err)
+	}
+	if !waitForPaneProcessDeath(panePID, 5*time.Second) {
+		t.Fatalf("pane process %d survived KillPane", panePID)
+	}
+
+	var logs bytes.Buffer
+	previousLogWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousLogWriter) })
+
+	sc := NewSessionCleanup(db, &Sender{}, ptyMgr, 0, 0, false, 0)
+	if err := sc.MarkInactive(ctx, sess); err != nil {
+		t.Fatalf("MarkInactive with already-dead pane: %v", err)
+	}
+
+	stored, err := db.GetSession(ctx, chatID, threadID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("GetSession returned nil")
+	}
+	if stored.Status != "inactive" {
+		t.Errorf("session status = %q, want inactive", stored.Status)
+	}
+	if realWindowNames(t)[paneName] {
+		t.Errorf("pane window %q listed after MarkInactive on dead pane", paneName)
+	}
+
+	logOutput := logs.String()
+	for _, want := range []string{"non-fatal", "failed to kill pane"} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("cleanup log does not contain %q: %s", want, logOutput)
+		}
 	}
 }
