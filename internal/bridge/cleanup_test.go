@@ -559,7 +559,27 @@ func realTmuxBinary(t *testing.T) string {
 // setupRealTmuxTest installs a PATH shim that routes every tmux invocation to
 // a dedicated server on a private socket. The server is killed on test
 // cleanup, which also terminates any pane the test failed to clean up.
-func setupRealTmuxTest(t *testing.T) {
+func setupRealTmuxTest(t *testing.T) realTmuxEnv {
+	t.Helper()
+	return setupRealTmuxShim(t, "")
+}
+
+// realTmuxEnv describes the private tmux server a test opted into: the real
+// binary by absolute path, the private socket, and the session name windows
+// actually land in (tmuxSessionName unless a dedicated name was requested).
+type realTmuxEnv struct {
+	realTmux string
+	socket   string
+	session  string
+}
+
+// setupRealTmuxShim is setupRealTmuxTest with an optional session rename.
+// When sessionOverride is non-empty, the shim additionally rewrites the
+// production session token in every argument to sessionOverride, so code that
+// hardcodes tmuxSessionName operates on a session no running bridge owns: the
+// live bridge lists and reaps "telegram-bridge" on the default server and can
+// never see this private server's differently-named session.
+func setupRealTmuxShim(t *testing.T, sessionOverride string) realTmuxEnv {
 	t.Helper()
 	realTmux := realTmuxBinary(t)
 
@@ -567,10 +587,34 @@ func setupRealTmuxTest(t *testing.T) {
 	shimDir := t.TempDir()
 	shim := filepath.Join(shimDir, "tmux")
 	script := fmt.Sprintf("#!/bin/sh\nexec %s -L %s \"$@\"\n", shellQuote(realTmux), shellQuote(socket))
+	if sessionOverride != "" {
+		// Built by concatenation, not Sprintf: the script is full of % signs.
+		// Each argument is single-quoted for the eval rebuild (with embedded
+		// quotes escaped), so arguments containing spaces or quotes survive
+		// the rewrite untouched.
+		script = "#!/bin/sh\n" +
+			"set -eu\n" +
+			"quoted=\n" +
+			"for arg in \"$@\"; do\n" +
+			"	case $arg in\n" +
+			"	*" + tmuxSessionName + "*)\n" +
+			"		arg=$(printf '%s' \"$arg\" | sed 's/" + tmuxSessionName + "/" + sessionOverride + "/g')\n" +
+			"		;;\n" +
+			"	esac\n" +
+			"	quoted=\"$quoted '$(printf '%s' \"$arg\" | sed \"s/'/'\\\\''/g\")'\"\n" +
+			"done\n" +
+			"eval \"set -- $quoted\"\n" +
+			"exec " + shellQuote(realTmux) + " -L " + shellQuote(socket) + " \"$@\"\n"
+	}
 	if err := os.WriteFile(shim, []byte(script), 0o755); err != nil {
 		t.Fatalf("write tmux shim: %v", err)
 	}
 	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	session := tmuxSessionName
+	if sessionOverride != "" {
+		session = sessionOverride
+	}
 
 	// The cleanup uses the real binary by absolute path so it runs regardless
 	// of the PATH restore t.Setenv performs first; errors are ignored so a
@@ -578,6 +622,7 @@ func setupRealTmuxTest(t *testing.T) {
 	t.Cleanup(func() {
 		_ = exec.Command(realTmux, "-L", socket, "kill-server").Run()
 	})
+	return realTmuxEnv{realTmux: realTmux, socket: socket, session: session}
 }
 
 // createRealPaneWindow opens a live window named paneName in the
@@ -788,6 +833,103 @@ func TestSessionCleanupMarkInactivePaneAlreadyDeadRealTmux(t *testing.T) {
 		if !strings.Contains(logOutput, want) {
 			t.Errorf("cleanup log does not contain %q: %s", want, logOutput)
 		}
+	}
+}
+
+// TestSessionCleanupOrphanReaperRealTmux verifies the no-DB-record reaper
+// against a real tmux server: a worker-named window with no workers row is
+// killed once past the registration grace, while a window backed by a live
+// 'running' worker row and a window still inside its registration grace (the
+// window exists, the DB INSERT has not landed yet) both survive a full
+// cleanup pass.
+//
+// Unlike the MarkInactive tests above — which kill the pane of a session the
+// bridge knows about — this covers the production leak shape: the tmux window
+// exists with no DB record at all. Fixtures live in a session dedicated to
+// the test (the shim renames the production session token on a private
+// server), so the test can neither reap the running bridge's real workers nor
+// have its fixtures reaped by the running bridge, which never sees this
+// server.
+func TestSessionCleanupOrphanReaperRealTmux(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping real-tmux integration test in short mode")
+	}
+	env := setupRealTmuxShim(t, fmt.Sprintf("bridge-reaper-%d-%d", os.Getpid(), realTmuxSocketSeq.Add(1)))
+
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	ptyMgr := NewPTYManager()
+	if err := ptyMgr.EnsureSession(); err != nil {
+		t.Fatalf("EnsureSession: %v", err)
+	}
+
+	// The private server holds exactly the dedicated session, proving the shim
+	// renamed every target and nothing here touches the production
+	// telegram-bridge session.
+	sessions, err := exec.Command(env.realTmux, "-L", env.socket,
+		"list-sessions", "-F", "#{session_name}").Output()
+	if err != nil {
+		t.Fatalf("list-sessions on test server: %v", err)
+	}
+	if got, want := strings.TrimSpace(string(sessions)), env.session; got != want {
+		t.Fatalf("sessions on test server = %q, want only dedicated session %q", got, want)
+	}
+
+	// Healthy worker row: 'running' and well inside DefaultWorkerTTL, so
+	// neither the orphan reaper nor the stale-worker sweep may touch it.
+	liveWorker := &Worker{
+		ID: "reaper_live_1", ChatID: 100, ThreadID: 10, ParentMsg: 1,
+		Prompt: "healthy worker", Status: "running", StartedAt: time.Now().UTC(),
+	}
+	if err := db.CreateWorker(ctx, liveWorker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	// Worker window names are "w-{workerID[:8]}-{UnixNano}". The leaked pane
+	// predates the grace period; the live worker's window is old too (age
+	// alone does not spare a pane, a live row does); the in-flight pane was
+	// just created, modeling the gap between tmux new-window and the DB
+	// INSERT committing.
+	oldStamp := time.Now().Add(-2 * orphanPaneGracePeriod).UnixNano()
+	orphanPane := fmt.Sprintf("w-reaporph-%d", oldStamp)
+	livePane := fmt.Sprintf("%s%d", workerPanePrefix(liveWorker.ID), oldStamp)
+	freshPane := fmt.Sprintf("w-reapinfl-%d", time.Now().UnixNano())
+
+	orphanPID := createRealPaneWindow(t, orphanPane)
+	livePID := createRealPaneWindow(t, livePane)
+	freshPID := createRealPaneWindow(t, freshPane)
+
+	var logs bytes.Buffer
+	previousLogWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousLogWriter) })
+
+	cleanup := NewSessionCleanup(db, &Sender{}, ptyMgr, 0, 24*time.Hour, false, DefaultWorkerTTL)
+	cleanup.runCleanup(ctx)
+
+	windows := realWindowNames(t)
+	if windows[orphanPane] {
+		t.Errorf("worker-named window %q with no DB record survived the reaper", orphanPane)
+	}
+	if !windows[livePane] {
+		t.Errorf("window %q of a live running worker was reaped", livePane)
+	}
+	if !windows[freshPane] {
+		t.Errorf("window %q inside the registration grace was reaped mid-spawn", freshPane)
+	}
+
+	if !waitForPaneProcessDeath(orphanPID, 5*time.Second) {
+		t.Errorf("orphan pane process %d survived the reap", orphanPID)
+	}
+	for _, pid := range []int{livePID, freshPID} {
+		if err := syscall.Kill(pid, 0); err != nil {
+			t.Errorf("spared pane process %d is not alive: %v", pid, err)
+		}
+	}
+
+	if want := "reaped orphan tmux window \"" + orphanPane + "\""; !strings.Contains(logs.String(), want) {
+		t.Errorf("reap log missing window name: want %q in %s", want, logs.String())
 	}
 }
 
