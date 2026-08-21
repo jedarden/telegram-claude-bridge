@@ -3,8 +3,10 @@ package updater
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1282,56 +1284,355 @@ func TestCheckAndUpdate(t *testing.T) {
 }
 
 func TestCheckStartupHealth(t *testing.T) {
+	// stubExec replaces execBinary/exitProcess for the test and returns a
+	// callback restoring the originals plus a record of exec calls. The real
+	// functions replace/terminate the process, which must not happen in tests.
+	stubExec := func(t *testing.T, execErr error) *[]execCall {
+		t.Helper()
+		calls := &[]execCall{}
+		origExec, origExit := execBinary, exitProcess
+		execBinary = func(path string, argv []string, env []string) error {
+			*calls = append(*calls, execCall{Path: path, Argv: argv, Env: env})
+			return execErr
+		}
+		exitProcess = func(int) {}
+		t.Cleanup(func() {
+			execBinary, exitProcess = origExec, origExit
+		})
+		return calls
+	}
+
+	// shortHealthCheck tightens the verification timing so unhealthy-path
+	// tests fail fast instead of waiting out the production 30s timeout.
+	shortHealthCheck := func(t *testing.T) {
+		t.Helper()
+		origTimeout, origInterval := healthCheckTimeout, healthCheckInterval
+		healthCheckTimeout, healthCheckInterval = 500*time.Millisecond, 50*time.Millisecond
+		t.Cleanup(func() {
+			healthCheckTimeout, healthCheckInterval = origTimeout, origInterval
+		})
+	}
+
+	// serveLiveness points the liveness check at a test HTTP server and returns
+	// a flag the test can toggle to simulate the process coming up or not.
+	serveLiveness := func(t *testing.T, live *bool) {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/livez" && *live {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("OK"))
+				return
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		t.Cleanup(srv.Close)
+		origURL := livenessCheckURL
+		livenessCheckURL = srv.URL + "/livez"
+		t.Cleanup(func() { livenessCheckURL = origURL })
+	}
+
 	t.Run("returns nil when not updating", func(t *testing.T) {
 		tempDir := t.TempDir()
 		initTestRepo(t, tempDir)
 
-		// Make sure BRIDGE_UPDATED_FROM_COMMIT is not set
-		os.Unsetenv("BRIDGE_UPDATED_FROM_COMMIT")
+		os.Unsetenv(envUpdatedFromCommit)
 
-		err := CheckStartupHealth(tempDir, "bridge")
-		if err != nil {
+		if err := CheckStartupHealth(tempDir, "bridge"); err != nil {
 			t.Errorf("CheckStartupHealth() should return nil when not updating, got: %v", err)
 		}
 	})
 
-	t.Run("returns nil when no backup exists", func(t *testing.T) {
+	t.Run("returns nil and clears marker when no backup exists", func(t *testing.T) {
 		tempDir := t.TempDir()
 		initTestRepo(t, tempDir)
+		os.Unsetenv(envUpdatedFromCommit)
 
-		// Set the environment variable to simulate an update
-		os.Setenv("BRIDGE_UPDATED_FROM_COMMIT", "abc123")
-		defer os.Unsetenv("BRIDGE_UPDATED_FROM_COMMIT")
+		binaryPath := filepath.Join(tempDir, "bridge")
+		if err := writePendingUpdateMarker(binaryPath, &pendingUpdate{FromCommit: "old", ToCommit: "new"}); err != nil {
+			t.Fatalf("failed to write marker: %v", err)
+		}
 
-		err := CheckStartupHealth(tempDir, "bridge")
-		if err != nil {
+		if err := CheckStartupHealth(tempDir, "bridge"); err != nil {
 			t.Errorf("CheckStartupHealth() should return nil when no backup exists, got: %v", err)
 		}
+
+		if _, err := os.Stat(binaryPath + pendingUpdateSuffix); !os.IsNotExist(err) {
+			t.Error("pending marker should be removed when no backup exists")
+		}
 	})
 
-	t.Run("waits for health check when backup exists", func(t *testing.T) {
+	t.Run("healthy update removes marker and backup", func(t *testing.T) {
+		tempDir := t.TempDir()
+		initTestRepo(t, tempDir)
+		os.Unsetenv(envUpdatedFromCommit)
+
+		binaryPath := filepath.Join(tempDir, "bridge")
+		backupPath := binaryPath + backupBinarySuffix
+		if err := os.WriteFile(binaryPath, []byte("new binary"), 0755); err != nil {
+			t.Fatalf("failed to write binary: %v", err)
+		}
+		if err := os.WriteFile(backupPath, []byte("old binary"), 0755); err != nil {
+			t.Fatalf("failed to write backup: %v", err)
+		}
+		if err := writePendingUpdateMarker(binaryPath, &pendingUpdate{FromCommit: "oldsha", ToCommit: "newsha"}); err != nil {
+			t.Fatalf("failed to write marker: %v", err)
+		}
+		if err := writeFailedUpdateMarker(binaryPath, "stale-failed-sha"); err != nil {
+			t.Fatalf("failed to write stale failed marker: %v", err)
+		}
+
+		calls := stubExec(t, nil)
+		live := true
+		serveLiveness(t, &live)
+
+		if err := CheckStartupHealth(tempDir, "bridge"); err != nil {
+			t.Fatalf("CheckStartupHealth() should return nil on healthy update, got: %v", err)
+		}
+
+		if content, err := os.ReadFile(binaryPath); err != nil || string(content) != "new binary" {
+			t.Error("binary should be untouched on healthy update")
+		}
+		if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
+			t.Error("backup should be removed on healthy update")
+		}
+		if _, err := os.Stat(binaryPath + pendingUpdateSuffix); !os.IsNotExist(err) {
+			t.Error("pending marker should be removed on healthy update")
+		}
+		if _, err := os.Stat(binaryPath + failedUpdateSuffix); !os.IsNotExist(err) {
+			t.Error("stale failed-update marker should be removed on healthy update")
+		}
+		if len(*calls) != 0 {
+			t.Errorf("exec should not be called on healthy update, got %d calls", len(*calls))
+		}
+	})
+
+	t.Run("unhealthy update rolls back to previous binary", func(t *testing.T) {
+		tempDir := t.TempDir()
+		initTestRepo(t, tempDir)
+		os.Unsetenv(envUpdatedFromCommit)
+
+		binaryPath := filepath.Join(tempDir, "bridge")
+		backupPath := binaryPath + backupBinarySuffix
+		if err := os.WriteFile(binaryPath, []byte("bad new binary"), 0755); err != nil {
+			t.Fatalf("failed to write binary: %v", err)
+		}
+		if err := os.WriteFile(backupPath, []byte("good old binary"), 0755); err != nil {
+			t.Fatalf("failed to write backup: %v", err)
+		}
+		if err := writePendingUpdateMarker(binaryPath, &pendingUpdate{FromCommit: "oldsha", ToCommit: "newsha"}); err != nil {
+			t.Fatalf("failed to write marker: %v", err)
+		}
+
+		calls := stubExec(t, nil)
+		live := false // the new binary never comes up
+		serveLiveness(t, &live)
+		shortHealthCheck(t)
+
+		if err := CheckStartupHealth(tempDir, "bridge"); err != nil {
+			t.Fatalf("CheckStartupHealth() should succeed via rollback, got: %v", err)
+		}
+
+		if content, err := os.ReadFile(binaryPath); err != nil || string(content) != "good old binary" {
+			t.Error("backup should be restored over the failing binary")
+		}
+		if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
+			t.Error("backup should be consumed by rollback")
+		}
+		if _, err := os.Stat(binaryPath + pendingUpdateSuffix); !os.IsNotExist(err) {
+			t.Error("pending marker should be removed by rollback")
+		}
+		if got := readFailedUpdateMarker(binaryPath); got != "newsha" {
+			t.Errorf("failed-update marker = %q, want newsha", got)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("exec should be called once during rollback, got %d calls", len(*calls))
+		}
+		if (*calls)[0].Path != binaryPath {
+			t.Errorf("exec path = %q, want %q", (*calls)[0].Path, binaryPath)
+		}
+		if !envContains((*calls)[0].Env, envRollbackMode+"=1") {
+			t.Error("rollback exec env should set BRIDGE_ROLLBACK_MODE=1")
+		}
+	})
+
+	t.Run("rollback exec failure returns error but still restores", func(t *testing.T) {
+		tempDir := t.TempDir()
+		initTestRepo(t, tempDir)
+		os.Unsetenv(envUpdatedFromCommit)
+
+		binaryPath := filepath.Join(tempDir, "bridge")
+		if err := os.WriteFile(binaryPath, []byte("bad new binary"), 0755); err != nil {
+			t.Fatalf("failed to write binary: %v", err)
+		}
+		if err := os.WriteFile(binaryPath+backupBinarySuffix, []byte("good old binary"), 0755); err != nil {
+			t.Fatalf("failed to write backup: %v", err)
+		}
+		if err := writePendingUpdateMarker(binaryPath, &pendingUpdate{FromCommit: "oldsha", ToCommit: "newsha"}); err != nil {
+			t.Fatalf("failed to write marker: %v", err)
+		}
+
+		calls := stubExec(t, fmt.Errorf("exec format error"))
+		live := false
+		serveLiveness(t, &live)
+		shortHealthCheck(t)
+
+		if err := CheckStartupHealth(tempDir, "bridge"); err == nil {
+			t.Fatal("CheckStartupHealth() should return error when rollback exec fails")
+		}
+
+		if content, err := os.ReadFile(binaryPath); err != nil || string(content) != "good old binary" {
+			t.Error("backup should be restored even when exec fails")
+		}
+		if got := readFailedUpdateMarker(binaryPath); got != "newsha" {
+			t.Errorf("failed-update marker = %q, want newsha", got)
+		}
+		if len(*calls) != 1 {
+			t.Errorf("exec should have been attempted once, got %d calls", len(*calls))
+		}
+	})
+
+	t.Run("legacy env var without marker rolls back and records HEAD", func(t *testing.T) {
 		tempDir := t.TempDir()
 		initTestRepo(t, tempDir)
 
-		// Create a mock backup file
-		binaryPath := "bridge"
-		backupPath := filepath.Join(tempDir, binaryPath+backupBinarySuffix)
-		if err := os.WriteFile(backupPath, []byte("backup"), 0755); err != nil {
-			t.Fatalf("failed to create backup: %v", err)
+		head := headCommit(tempDir)
+		if head == "" {
+			t.Fatal("test repo should have a HEAD commit")
 		}
 
-		// Set the environment variable to simulate an update
-		os.Setenv("BRIDGE_UPDATED_FROM_COMMIT", "abc123")
-		defer os.Unsetenv("BRIDGE_UPDATED_FROM_COMMIT")
+		binaryPath := filepath.Join(tempDir, "bridge")
+		if err := os.WriteFile(binaryPath, []byte("bad new binary"), 0755); err != nil {
+			t.Fatalf("failed to write binary: %v", err)
+		}
+		if err := os.WriteFile(binaryPath+backupBinarySuffix, []byte("good old binary"), 0755); err != nil {
+			t.Fatalf("failed to write backup: %v", err)
+		}
 
-		// The function will timeout waiting for health check
-		// This is expected behavior when no health server is running
-		err := CheckStartupHealth(tempDir, binaryPath)
-		// Should error due to timeout/failed health check
-		if err == nil {
-			t.Error("CheckStartupHealth() should error when health check fails")
+		os.Setenv(envUpdatedFromCommit, "oldsha")
+		defer os.Unsetenv(envUpdatedFromCommit)
+
+		calls := stubExec(t, nil)
+		live := false
+		serveLiveness(t, &live)
+		shortHealthCheck(t)
+
+		if err := CheckStartupHealth(tempDir, "bridge"); err != nil {
+			t.Fatalf("CheckStartupHealth() should succeed via rollback, got: %v", err)
+		}
+
+		if got := readFailedUpdateMarker(binaryPath); got != head {
+			t.Errorf("failed-update marker = %q, want HEAD %q", got, head)
+		}
+		if envContains((*calls)[0].Env, envUpdatedFromCommit+"=oldsha") {
+			t.Error("rollback exec env should strip BRIDGE_UPDATED_FROM_COMMIT")
 		}
 	})
+}
+
+// execCall records one invocation of the execBinary stub.
+type execCall struct {
+	Path string
+	Argv []string
+	Env  []string
+}
+
+// envContains reports whether env holds the exact key=value entry.
+func envContains(env []string, kv string) bool {
+	for _, e := range env {
+		if e == kv {
+			return true
+		}
+	}
+	return false
+}
+
+func TestPendingUpdateMarkerRoundTrip(t *testing.T) {
+	t.Run("write and read back", func(t *testing.T) {
+		binaryPath := filepath.Join(t.TempDir(), "bridge")
+		appliedAt := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+
+		if err := writePendingUpdateMarker(binaryPath, &pendingUpdate{
+			FromCommit: "oldsha",
+			ToCommit:   "newsha",
+			AppliedAt:  appliedAt,
+		}); err != nil {
+			t.Fatalf("writePendingUpdateMarker() failed: %v", err)
+		}
+
+		p, ok := readPendingUpdateMarker(binaryPath)
+		if !ok {
+			t.Fatal("readPendingUpdateMarker() should find the marker")
+		}
+		if p.FromCommit != "oldsha" || p.ToCommit != "newsha" {
+			t.Errorf("round trip = %+v, want from=oldsha to=newsha", p)
+		}
+		if !p.AppliedAt.Equal(appliedAt) {
+			t.Errorf("AppliedAt = %v, want %v", p.AppliedAt, appliedAt)
+		}
+	})
+
+	t.Run("missing marker returns false", func(t *testing.T) {
+		if _, ok := readPendingUpdateMarker(filepath.Join(t.TempDir(), "bridge")); ok {
+			t.Error("readPendingUpdateMarker() should return false for missing marker")
+		}
+	})
+
+	t.Run("corrupt marker returns false", func(t *testing.T) {
+		binaryPath := filepath.Join(t.TempDir(), "bridge")
+		if err := os.WriteFile(binaryPath+pendingUpdateSuffix, []byte("not json"), 0644); err != nil {
+			t.Fatalf("failed to write corrupt marker: %v", err)
+		}
+		if _, ok := readPendingUpdateMarker(binaryPath); ok {
+			t.Error("readPendingUpdateMarker() should return false for corrupt marker")
+		}
+	})
+}
+
+func TestFailedUpdateMarkerRoundTrip(t *testing.T) {
+	binaryPath := filepath.Join(t.TempDir(), "bridge")
+
+	if got := readFailedUpdateMarker(binaryPath); got != "" {
+		t.Errorf("readFailedUpdateMarker() = %q, want empty for missing marker", got)
+	}
+
+	if err := writeFailedUpdateMarker(binaryPath, "abc123def"); err != nil {
+		t.Fatalf("writeFailedUpdateMarker() failed: %v", err)
+	}
+	if got := readFailedUpdateMarker(binaryPath); got != "abc123def" {
+		t.Errorf("readFailedUpdateMarker() = %q, want abc123def", got)
+	}
+}
+
+func TestHeadCommit(t *testing.T) {
+	t.Run("returns HEAD for a git repo", func(t *testing.T) {
+		tempDir := t.TempDir()
+		initTestRepo(t, tempDir)
+
+		if got := headCommit(tempDir); got == "" {
+			t.Error("headCommit() should return a commit for a git repo")
+		}
+	})
+
+	t.Run("returns empty for a non-repo", func(t *testing.T) {
+		if got := headCommit(t.TempDir()); got != "" {
+			t.Errorf("headCommit() = %q, want empty for non-repo", got)
+		}
+	})
+}
+
+func TestFilterEnv(t *testing.T) {
+	env := []string{"A=1", "BRIDGE_UPDATED_FROM_COMMIT=x", "B=2"}
+	filtered := filterEnv(env, "BRIDGE_UPDATED_FROM_COMMIT")
+
+	want := []string{"A=1", "B=2"}
+	if len(filtered) != len(want) {
+		t.Fatalf("filterEnv() = %v, want %v", filtered, want)
+	}
+	for i := range want {
+		if filtered[i] != want[i] {
+			t.Errorf("filterEnv()[%d] = %q, want %q", i, filtered[i], want[i])
+		}
+	}
 }
 
 func TestCopyFile(t *testing.T) {
@@ -1386,15 +1687,44 @@ func TestCopyFile(t *testing.T) {
 	})
 }
 
-func TestCheckIsHealthy(t *testing.T) {
+func TestCheckIsLive(t *testing.T) {
+	t.Run("returns true on 200 OK", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("OK"))
+		}))
+		defer srv.Close()
+
+		origURL := livenessCheckURL
+		livenessCheckURL = srv.URL + "/livez"
+		defer func() { livenessCheckURL = origURL }()
+
+		if !checkIsLive(context.Background(), srv.Client()) {
+			t.Error("checkIsLive() should return true on 200 OK")
+		}
+	})
+
+	t.Run("returns false on non-200", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer srv.Close()
+
+		origURL := livenessCheckURL
+		livenessCheckURL = srv.URL + "/livez"
+		defer func() { livenessCheckURL = origURL }()
+
+		if checkIsLive(context.Background(), srv.Client()) {
+			t.Error("checkIsLive() should return false on non-200")
+		}
+	})
+
 	t.Run("returns false on connection error", func(t *testing.T) {
-		ctx := context.Background()
 		client := &http.Client{Timeout: 100 * time.Millisecond}
 
 		// No server running, should return false
-		healthy := checkIsHealthy(ctx, client)
-		if healthy {
-			t.Error("checkIsHealthy() should return false when no server running")
+		if checkIsLive(context.Background(), client) {
+			t.Error("checkIsLive() should return false when no server running")
 		}
 	})
 }
@@ -1406,9 +1736,9 @@ func TestBackupBinarySuffix(t *testing.T) {
 }
 
 func TestHealthCheckConstants(t *testing.T) {
-	t.Run("health check URL is localhost:9091/health", func(t *testing.T) {
-		if healthCheckURL != "http://localhost:9091/health" {
-			t.Errorf("healthCheckURL = %v, want http://localhost:9091/health", healthCheckURL)
+	t.Run("liveness check URL is localhost:9091/livez", func(t *testing.T) {
+		if livenessCheckURL != "http://localhost:9091/livez" {
+			t.Errorf("livenessCheckURL = %v, want http://localhost:9091/livez", livenessCheckURL)
 		}
 	})
 
@@ -1422,5 +1752,190 @@ func TestHealthCheckConstants(t *testing.T) {
 		if healthCheckInterval != 500*time.Millisecond {
 			t.Errorf("healthCheckInterval = %v, want 500ms", healthCheckInterval)
 		}
+	})
+}
+
+func TestReplaceAndRestartWritesMarkers(t *testing.T) {
+	t.Run("backs up, swaps, writes pending marker, execs", func(t *testing.T) {
+		tempDir := t.TempDir()
+		initTestRepo(t, tempDir)
+
+		// Keep updateSystemdUnit's writes out of the real HOME.
+		origHome := os.Getenv("HOME")
+		os.Setenv("HOME", tempDir)
+		defer os.Setenv("HOME", origHome)
+
+		binaryPath := filepath.Join(tempDir, "bridge")
+		if err := os.WriteFile(binaryPath, []byte("old binary"), 0755); err != nil {
+			t.Fatalf("failed to write binary: %v", err)
+		}
+		if err := os.WriteFile(binaryPath+newBinarySuffix, []byte("new binary"), 0755); err != nil {
+			t.Fatalf("failed to write new binary: %v", err)
+		}
+
+		var calls []execCall
+		origExec, origExit := execBinary, exitProcess
+		execBinary = func(path string, argv []string, env []string) error {
+			calls = append(calls, execCall{Path: path, Argv: argv, Env: env})
+			return nil
+		}
+		exitProcess = func(int) {}
+		defer func() {
+			execBinary, exitProcess = origExec, origExit
+		}()
+
+		cfg := &Config{
+			RepoPath:      tempDir,
+			BinaryPath:    "bridge",
+			CheckInterval: 1 * time.Hour,
+			RunningCommit: "oldsha",
+		}
+		u := New(cfg)
+		u.replaceAndRestart("newsha")
+
+		if content, err := os.ReadFile(binaryPath); err != nil || string(content) != "new binary" {
+			t.Error("new binary should be renamed into place")
+		}
+		if content, err := os.ReadFile(binaryPath + backupBinarySuffix); err != nil || string(content) != "old binary" {
+			t.Error("old binary should be backed up")
+		}
+		p, ok := readPendingUpdateMarker(binaryPath)
+		if !ok {
+			t.Fatal("pending-update marker should be written before exec")
+		}
+		if p.FromCommit != "oldsha" || p.ToCommit != "newsha" {
+			t.Errorf("pending marker = %+v, want from=oldsha to=newsha", p)
+		}
+		if len(calls) != 1 {
+			t.Fatalf("exec should be called once, got %d calls", len(calls))
+		}
+		if !envContains(calls[0].Env, envUpdatedFromCommit+"=oldsha") {
+			t.Error("exec env should carry BRIDGE_UPDATED_FROM_COMMIT")
+		}
+	})
+}
+
+func TestRolledBackCommitGuard(t *testing.T) {
+	setup := func(t *testing.T) (*Updater, string) {
+		t.Helper()
+		tempDir := t.TempDir()
+		initTestRepoWithRemote(t, tempDir)
+
+		head := headCommit(tempDir)
+		if head == "" {
+			t.Fatal("test repo should have a HEAD commit")
+		}
+
+		// Record HEAD as a rolled-back commit; with RunningCommit mismatching,
+		// fetchAndCompare will propose exactly this commit as the update.
+		if err := writeFailedUpdateMarker(filepath.Join(tempDir, "bridge"), head); err != nil {
+			t.Fatalf("failed to write failed-update marker: %v", err)
+		}
+
+		cfg := &Config{
+			RepoPath:      tempDir,
+			BinaryPath:    "bridge",
+			CheckInterval: 1 * time.Hour,
+			RunningCommit: "different",
+		}
+		return New(cfg), head
+	}
+
+	t.Run("isRolledBackCommit blocks the failed commit only", func(t *testing.T) {
+		u, head := setup(t)
+
+		if !u.isRolledBackCommit(head) {
+			t.Error("isRolledBackCommit() should block the recorded commit")
+		}
+		if u.isRolledBackCommit("someothercommit") {
+			t.Error("isRolledBackCommit() should not block a different commit")
+		}
+	})
+
+	t.Run("ManualUpdate refuses to retry a rolled-back commit", func(t *testing.T) {
+		u, _ := setup(t)
+
+		result := u.ManualUpdate(context.Background(), "")
+
+		if !strings.Contains(result, "rolled back") {
+			t.Errorf("ManualUpdate() should refuse with a rolled-back message, got: %s", result)
+		}
+		if strings.Contains(result, "Updating to") {
+			t.Errorf("ManualUpdate() should not start an update, got: %s", result)
+		}
+	})
+
+	t.Run("checkAndUpdate skips a rolled-back commit without building", func(t *testing.T) {
+		u, _ := setup(t)
+
+		// Must return without attempting a build: the repo has no Go module,
+		// so a build attempt would fail loudly — silence here proves the guard
+		// fired before buildNewBinary.
+		u.checkAndUpdate()
+
+		if u.rollbackSkipNotified != true {
+			t.Error("checkAndUpdate() should mark rollbackSkipNotified when skipping")
+		}
+		if _, err := os.Stat(filepath.Join(u.repoPath, u.binaryPath) + newBinarySuffix); !os.IsNotExist(err) {
+			t.Error("checkAndUpdate() should not have built a new binary")
+		}
+	})
+}
+
+func TestSendRollbackNotification(t *testing.T) {
+	t.Run("sends payload to the proxy send endpoint", func(t *testing.T) {
+		var gotBody map[string]interface{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/send" {
+				http.NotFound(w, r)
+				return
+			}
+			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		os.Setenv("PROXY_URL", srv.URL)
+		os.Setenv("ADMIN_CHAT_ID", "-1001234")
+		defer func() {
+			os.Unsetenv("PROXY_URL")
+			os.Unsetenv("ADMIN_CHAT_ID")
+		}()
+
+		sendRollbackNotification(&pendingUpdate{FromCommit: "oldsha", ToCommit: "newsha"})
+
+		if gotBody == nil {
+			t.Fatal("notification should have been posted to /send")
+		}
+		if gotBody["chat_id"] != float64(-1001234) {
+			t.Errorf("chat_id = %v, want -1001234", gotBody["chat_id"])
+		}
+		text, _ := gotBody["text"].(string)
+		if !strings.Contains(text, "newsha") || !strings.Contains(text, "rolled back") {
+			t.Errorf("text should mention the failed commit and the rollback, got: %q", text)
+		}
+	})
+
+	t.Run("skips without proxy or admin chat", func(t *testing.T) {
+		os.Unsetenv("PROXY_URL")
+		os.Unsetenv("ADMIN_CHAT_ID")
+
+		// Must be a no-op, not a panic.
+		sendRollbackNotification(&pendingUpdate{FromCommit: "oldsha", ToCommit: "newsha"})
+	})
+
+	t.Run("skips on malformed admin chat id", func(t *testing.T) {
+		os.Setenv("PROXY_URL", "http://127.0.0.1:1")
+		os.Setenv("ADMIN_CHAT_ID", "not-a-number")
+		defer func() {
+			os.Unsetenv("PROXY_URL")
+			os.Unsetenv("ADMIN_CHAT_ID")
+		}()
+
+		// Must be a no-op, not a panic (the old mustParseInt panicked here).
+		sendRollbackNotification(&pendingUpdate{FromCommit: "oldsha", ToCommit: "newsha"})
 	})
 }

@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,17 +33,42 @@ const (
 	// Suffix for the previous binary backup during update
 	backupBinarySuffix = ".prev"
 
-	// Health check URL for the bridge's HTTP health endpoint
-	healthCheckURL = "http://localhost:9091/health"
+	// Suffix for the marker recording an update that has been applied but not
+	// yet verified healthy (see pendingUpdate)
+	pendingUpdateSuffix = ".update-pending"
 
-	// Maximum time to wait for health check after restart
-	healthCheckTimeout = 30 * time.Second
+	// Suffix for the marker recording the commit of an update that was rolled
+	// back; the updater refuses to automatically retry that commit
+	failedUpdateSuffix = ".failed-update"
 
-	// Interval between health check polls
-	healthCheckInterval = 500 * time.Millisecond
+	// Environment variable set when exec-ing a freshly updated binary
+	envUpdatedFromCommit = "BRIDGE_UPDATED_FROM_COMMIT"
 
 	// Environment variable set when running in rollback mode
 	envRollbackMode = "BRIDGE_ROLLBACK_MODE"
+)
+
+// Liveness endpoint of the bridge's own HTTP server. Deliberately /livez, not
+// /health: /health aggregates downstream dependencies (proxy, DB, claude CLI),
+// and a transient proxy blip must not trigger a binary rollback. /livez
+// answers as soon as the new binary's HTTP server is up, which is exactly the
+// "did the new build boot" signal the rollback decision hinges on.
+var livenessCheckURL = "http://localhost:9091/livez"
+
+// Post-restart verification timing. Vars (not consts) so tests can shorten them.
+var (
+	// Maximum time to wait for the liveness endpoint after restart
+	healthCheckTimeout = 30 * time.Second
+
+	// Interval between liveness polls
+	healthCheckInterval = 500 * time.Millisecond
+)
+
+// execBinary and exitProcess are indirected for testability: the real
+// functions replace/terminate the process, which must not happen in tests.
+var (
+	execBinary  = syscall.Exec
+	exitProcess = os.Exit
 )
 
 // Updater handles periodic self-update checks and binary replacement.
@@ -62,6 +89,85 @@ type Updater struct {
 	stopCh chan struct{}
 	// doneCh is closed when the updater goroutine exits
 	doneCh chan struct{}
+
+	// rollbackSkipNotified guards against re-recording the same rolled-back
+	// update failure on every check cycle
+	rollbackSkipNotified bool
+}
+
+// pendingUpdate is the on-disk record that an update has been applied but not
+// yet verified healthy. It lives next to the binary (e.g. bin/bridge.update-pending).
+//
+// The BRIDGE_UPDATED_FROM_COMMIT env var only survives the initial exec from
+// the old binary; this marker additionally survives systemd restarts, so a
+// binary that crashes before finishing verification is still rolled back on a
+// later boot — and scripts/bridge-crash-alert.sh restores the backup once
+// systemd gives up restarting.
+type pendingUpdate struct {
+	FromCommit string    `json:"from_commit"`
+	ToCommit   string    `json:"to_commit"`
+	AppliedAt  time.Time `json:"applied_at"`
+}
+
+// writePendingUpdateMarker atomically records a pending update next to the binary.
+func writePendingUpdateMarker(binaryPath string, p *pendingUpdate) error {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	tmp := binaryPath + pendingUpdateSuffix + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, binaryPath+pendingUpdateSuffix)
+}
+
+// readPendingUpdateMarker returns the pending update record, if present and parseable.
+func readPendingUpdateMarker(binaryPath string) (*pendingUpdate, bool) {
+	data, err := os.ReadFile(binaryPath + pendingUpdateSuffix)
+	if err != nil {
+		return nil, false
+	}
+	var p pendingUpdate
+	if err := json.Unmarshal(data, &p); err != nil {
+		log.Printf("[updater] corrupt pending-update marker, ignoring: %v", err)
+		return nil, false
+	}
+	return &p, true
+}
+
+// writeFailedUpdateMarker records the commit of an update that was rolled back.
+func writeFailedUpdateMarker(binaryPath, commit string) error {
+	return os.WriteFile(binaryPath+failedUpdateSuffix, []byte(commit+"\n"), 0644)
+}
+
+// readFailedUpdateMarker returns the rolled-back commit, or "" if none is recorded.
+func readFailedUpdateMarker(binaryPath string) string {
+	data, err := os.ReadFile(binaryPath + failedUpdateSuffix)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// headCommit returns the current HEAD of repoPath, or "" if unavailable.
+func headCommit(repoPath string) string {
+	out, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// filterEnv returns env with every entry named name removed.
+func filterEnv(env []string, name string) []string {
+	filtered := make([]string, 0, len(env))
+	for _, kv := range env {
+		if strings.SplitN(kv, "=", 2)[0] != name {
+			filtered = append(filtered, kv)
+		}
+	}
+	return filtered
 }
 
 // Config holds updater configuration.
@@ -138,6 +244,10 @@ func (u *Updater) TriggerUpdate() {
 func (u *Updater) run() {
 	defer close(u.doneCh)
 
+	if os.Getenv(envRollbackMode) != "" {
+		log.Printf("[updater] running previous binary after a rolled-back update; the failed commit will not be retried automatically")
+	}
+
 	ticker := time.NewTicker(u.checkInterval)
 	defer ticker.Stop()
 
@@ -178,6 +288,20 @@ func (u *Updater) checkAndUpdate() {
 	}
 	if !hasUpdate {
 		log.Printf("[updater] no updates available")
+		return
+	}
+
+	// Refuse to automatically retry an update that was already rolled back.
+	// Without this, the freshly-restored old binary would see HEAD != its own
+	// commit and immediately rebuild the same broken commit, flapping forever.
+	if u.isRolledBackCommit(newCommit) {
+		log.Printf("[updater] refusing update to %s: that commit was rolled back after failing post-restart verification", newCommit)
+		if !u.rollbackSkipNotified {
+			u.rollbackSkipNotified = true
+			markerPath := filepath.Join(u.repoPath, u.binaryPath) + failedUpdateSuffix
+			u.recordFailure(ctx, "update_rolled_back",
+				fmt.Sprintf("Skipping update to %s: a previous attempt was rolled back because the binary failed its post-restart health check. Push a new commit, or remove %s to force a retry.", newCommit, markerPath))
+		}
 		return
 	}
 
@@ -495,21 +619,40 @@ func (u *Updater) replaceAndRestart(newCommit string) {
 		return
 	}
 
+	// Record that an update is pending verification. The marker — not the env
+	// var below — is what survives systemd restarts, so a binary that crashes
+	// before finishing verification is still rolled back on a later boot (or by
+	// the ExecStopPost crash-alert script once systemd gives up restarting).
+	if err := writePendingUpdateMarker(oldPath, &pendingUpdate{
+		FromCommit: u.runningCommit,
+		ToCommit:   newCommit,
+		AppliedAt:  time.Now().UTC(),
+	}); err != nil {
+		log.Printf("[updater] failed to write pending-update marker: %v (post-restart rollback may not trigger)", err)
+	}
+
 	log.Printf("[updater] binary replaced, restarting (commit: %s)", newCommit)
 
 	// Set environment variable to signal the new binary to perform startup health check
 	env := os.Environ()
-	env = append(env, "BRIDGE_UPDATED_FROM_COMMIT="+u.runningCommit)
+	env = append(env, envUpdatedFromCommit+"="+u.runningCommit)
 
 	// Use exec to replace the current process with the new binary
 	// This keeps the same PID and is cleaner than exiting and letting systemd restart
-	err := syscall.Exec(oldPath, []string{"bridge"}, env)
+	err := execBinary(oldPath, []string{"bridge"}, env)
 	if err != nil {
 		log.Printf("[updater] exec failed: %v", err)
 		// If exec fails, exit cleanly and let systemd restart
-		os.Exit(0)
+		exitProcess(0)
 	}
 	// exec never returns
+}
+
+// isRolledBackCommit reports whether newCommit was previously rolled back
+// after failing post-restart verification.
+func (u *Updater) isRolledBackCommit(newCommit string) bool {
+	blocked := readFailedUpdateMarker(filepath.Join(u.repoPath, u.binaryPath))
+	return blocked != "" && blocked == newCommit
 }
 
 // copyFile copies a file from src to dst
@@ -540,6 +683,13 @@ func (u *Updater) ManualUpdate(ctx context.Context, args string) string {
 	}
 	if !hasUpdate {
 		return "✅ No updates available"
+	}
+
+	// Refuse to automatically retry an update that was rolled back.
+	if u.isRolledBackCommit(newCommit) {
+		markerPath := filepath.Join(u.repoPath, u.binaryPath) + failedUpdateSuffix
+		return fmt.Sprintf("⚠️ Not updating: commit %s was previously rolled back after failing its post-restart health check.\n\nPush a new commit, or remove %s to force a retry.",
+			newCommit[:8], markerPath)
 	}
 
 	// Build the new binary
@@ -640,68 +790,87 @@ func (u *Updater) CheckForUpdates(ctx context.Context) *bridge.UpdateResult {
 	}
 }
 
-// CheckStartupHealth performs a health check after a binary update.
-// This should be called at startup if BRIDGE_UPDATED_FROM_COMMIT is set.
-// If health checks fail, it rolls back to the previous binary and exits.
-// Returns nil if healthy, or an error if rollback was performed.
+// CheckStartupHealth verifies that a just-applied update actually came up.
+// It should be called at startup, after the health server is serving /livez.
+//
+// An update is pending verification when the <binary>.update-pending marker
+// exists (written by replaceAndRestart before exec-ing the new binary). The
+// marker persists across systemd restarts, so even a binary that crashed
+// before reaching this check gets verified — and rolled back if it never comes
+// up — on the next boot. The BRIDGE_UPDATED_FROM_COMMIT env var is honored as
+// a legacy fallback for updates applied by an older binary that did not write
+// a marker.
+//
+// On success the marker, the backup, and any stale rolled-back-commit marker
+// are removed. If the liveness endpoint does not answer within
+// healthCheckTimeout, the previous binary is restored, the failed commit is
+// recorded (the updater refuses to automatically retry it), the admin chat is
+// notified, and the previous binary is exec'd in place.
+//
+// Returns nil when healthy or when rollback succeeded; a non-nil error means
+// rollback itself failed (the caller should exit so systemd restarts the
+// already-restored previous binary).
 func CheckStartupHealth(repoPath, binaryPath string) error {
-	// Only check if we just updated
-	prevCommit := os.Getenv("BRIDGE_UPDATED_FROM_COMMIT")
-	if prevCommit == "" {
-		return nil // Not an update startup
+	oldPath := filepath.Join(repoPath, binaryPath)
+
+	pending, ok := readPendingUpdateMarker(oldPath)
+	if !ok {
+		prevCommit := os.Getenv(envUpdatedFromCommit)
+		if prevCommit == "" {
+			return nil // not an update startup
+		}
+		// Legacy: exec'd by an older binary that did not write a marker.
+		pending = &pendingUpdate{FromCommit: prevCommit, ToCommit: headCommit(repoPath)}
 	}
 
-	oldPath := filepath.Join(repoPath, binaryPath)
 	backupPath := oldPath + backupBinarySuffix
-
-	// Check if backup exists
 	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
-		log.Printf("[updater] no backup found, skipping health check")
+		log.Printf("[updater] update pending but no backup found; cannot roll back, continuing")
+		os.Remove(oldPath + pendingUpdateSuffix)
 		return nil
 	}
 
-	log.Printf("[updater] performing post-update health check (prev commit: %s)", prevCommit)
+	log.Printf("[updater] verifying post-update startup health (prev: %s, new: %s)",
+		pending.FromCommit, pending.ToCommit)
 
-	// Wait a moment for the health server to start
-	time.Sleep(2 * time.Second)
+	if !waitForLiveness() {
+		log.Printf("[updater] new binary did not come up within %s", healthCheckTimeout)
+		return performRollback(oldPath, backupPath, pending)
+	}
 
-	// Poll health endpoint with timeout
+	log.Printf("[updater] post-update health check passed, update to %s confirmed", pending.ToCommit)
+	os.Remove(backupPath)
+	os.Remove(oldPath + pendingUpdateSuffix)
+	// A verified-healthy boot supersedes an older rolled-back commit.
+	os.Remove(oldPath + failedUpdateSuffix)
+	return nil
+}
+
+// waitForLiveness polls the local liveness endpoint until it answers or the
+// timeout elapses.
+func waitForLiveness() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
 	defer cancel()
 
-	healthy := false
+	client := &http.Client{Timeout: 2 * time.Second}
 	ticker := time.NewTicker(healthCheckInterval)
 	defer ticker.Stop()
-
-	client := &http.Client{Timeout: 2 * time.Second}
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[updater] health check timeout after %s", healthCheckTimeout)
-			// Timeout - roll back
-			return performRollback(oldPath, backupPath, prevCommit)
+			return false
 		case <-ticker.C:
-			if checkIsHealthy(ctx, client) {
-				healthy = true
-				log.Printf("[updater] health check passed, update successful")
-				// Clean up backup
-				os.Remove(backupPath)
-				break
+			if checkIsLive(ctx, client) {
+				return true
 			}
 		}
-
-		if healthy {
-			break
-		}
 	}
-
-	return nil
 }
 
-// checkIsHealthy performs a single health check against the local health endpoint.
-func checkIsHealthy(ctx context.Context, client *http.Client) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthCheckURL, nil)
+// checkIsLive performs a single liveness request against the local endpoint.
+func checkIsLive(ctx context.Context, client *http.Client) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, livenessCheckURL, nil)
 	if err != nil {
 		return false
 	}
@@ -711,25 +880,17 @@ func checkIsHealthy(ctx context.Context, client *http.Client) bool {
 		return false
 	}
 	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
 
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-
-	// Parse response to check the healthy field
-	var result struct {
-		Healthy bool `json:"healthy"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return false
-	}
-
-	return result.Healthy
+	return resp.StatusCode == http.StatusOK
 }
 
-// performRollback restores the previous binary and triggers a rollback restart.
-func performRollback(currentPath, backupPath, prevCommit string) error {
-	log.Printf("[updater] ROLLING BACK to previous binary (commit %s)", prevCommit)
+// performRollback restores the previous binary over the failing one and exec's
+// it in place. The failed commit is recorded so the updater will not
+// automatically retry it, and the admin chat is notified via the proxy (the
+// same PROXY_URL/ADMIN_CHAT_ID path as scripts/bridge-crash-alert.sh).
+func performRollback(currentPath, backupPath string, pending *pendingUpdate) error {
+	log.Printf("[updater] ROLLING BACK to previous binary (failed commit: %s)", pending.ToCommit)
 
 	// Restore backup
 	if err := os.Rename(backupPath, currentPath); err != nil {
@@ -740,24 +901,40 @@ func performRollback(currentPath, backupPath, prevCommit string) error {
 	// Make sure it's executable
 	os.Chmod(currentPath, 0755)
 
+	// Clear the pending marker: the restored binary must not re-enter
+	// verification when it boots.
+	os.Remove(currentPath + pendingUpdateSuffix)
+
+	// Record the failed commit so the updater does not retry it automatically.
+	if pending.ToCommit != "" {
+		if err := writeFailedUpdateMarker(currentPath, pending.ToCommit); err != nil {
+			log.Printf("[updater] failed to record rolled-back commit: %v", err)
+		}
+	}
+
 	// Send rollback notification if possible
-	sendRollbackNotification(prevCommit)
+	sendRollbackNotification(pending)
+
+	// Exec the restored binary. Strip BRIDGE_UPDATED_FROM_COMMIT so it does
+	// not re-enter verification, and set BRIDGE_ROLLBACK_MODE for observability.
+	env := filterEnv(os.Environ(), envUpdatedFromCommit)
+	env = append(env, envRollbackMode+"=1")
 
 	log.Printf("[updater] rollback complete, restarting with previous binary")
 
-	// Exec the previous binary
-	err := syscall.Exec(currentPath, []string{"bridge"}, os.Environ())
-	if err != nil {
-		log.Printf("[updater] rollback exec failed: %v", err)
-		os.Exit(1)
+	if err := execBinary(currentPath, []string{"bridge"}, env); err != nil {
+		// Return rather than exiting here: the caller logs the failure and
+		// exits, and systemd then restarts the already-restored previous binary.
+		return fmt.Errorf("rollback exec failed: %w", err)
 	}
-	// exec never returns
+	// exec does not return in production
 	return nil
 }
 
-// sendRollbackNotification sends a notification about the rollback.
-// This uses the proxy directly since the bridge sender may not be available.
-func sendRollbackNotification(prevCommit string) {
+// sendRollbackNotification notifies the admin chat that an update was rolled
+// back. It posts directly to the proxy (the bridge's own sender is not usable
+// from this early-startup code path).
+func sendRollbackNotification(pending *pendingUpdate) {
 	proxyURL := os.Getenv("PROXY_URL")
 	adminChatID := os.Getenv("ADMIN_CHAT_ID")
 
@@ -766,35 +943,36 @@ func sendRollbackNotification(prevCommit string) {
 		return
 	}
 
-	message := fmt.Sprintf("⚠️ Bridge update FAILED - rolling back to previous version\n\nPrevious commit: %s\n\nThe new binary failed health checks after restart. Please check logs:\n`journalctl -u telegram-claude-bridge -n 100`", prevCommit)
+	chatID, err := strconv.ParseInt(strings.TrimSpace(adminChatID), 10, 64)
+	if err != nil {
+		log.Printf("[updater] cannot send rollback notification: invalid ADMIN_CHAT_ID %q", adminChatID)
+		return
+	}
+
+	message := fmt.Sprintf("⚠️ Bridge update rolled back.\n\nThe new binary (%s) failed its post-restart health check, so the previous binary (%s) was restored automatically.\n\nThe updater will not retry this commit automatically; push a new commit to update again.\nLogs: journalctl -u telegram-claude-bridge -n 100",
+		pending.ToCommit, pending.FromCommit)
 
 	// Build JSON payload
 	payload := map[string]interface{}{
-		"chat_id": mustParseInt(adminChatID),
+		"chat_id": chatID,
 		"text":    message,
 	}
 
-	// Send via proxy
-	resp, err := http.Post(proxyURL+"/send", "application/json", jsonReader(payload))
+	// Send via proxy. Bounded timeout: this runs mid-rollback, before the
+	// previous binary is exec'd — an unbounded POST would leave the bridge
+	// down indefinitely if the proxy stalls.
+	notifyClient := &http.Client{Timeout: 10 * time.Second}
+	resp, err := notifyClient.Post(proxyURL+"/send", "application/json", jsonReader(payload))
 	if err != nil {
 		log.Printf("[updater] failed to send rollback notification: %v", err)
 		return
 	}
 	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("[updater] rollback notification returned status %d", resp.StatusCode)
 	}
-}
-
-// mustParseInt parses a string to int64, panics on failure.
-func mustParseInt(s string) int64 {
-	var i int64
-	_, err := fmt.Sscanf(s, "%d", &i)
-	if err != nil {
-		panic(fmt.Sprintf("invalid int: %s", s))
-	}
-	return i
 }
 
 // jsonReader creates an io.Reader from a JSON-encoded value.
