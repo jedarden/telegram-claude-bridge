@@ -1,10 +1,35 @@
 package bridge
 
 import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
+	"github.com/jedarden/telegram-claude-bridge/internal/telegram"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// useDocumentTempDir keeps document attachment tests isolated from the
+// production staging directory. processDocument shares imageTempDir with the
+// other attachment processors.
+func useDocumentTempDir(t *testing.T) string {
+	t.Helper()
+	original := imageTempDir
+	imageTempDir = t.TempDir()
+	t.Cleanup(func() { imageTempDir = original })
+	return imageTempDir
+}
+
+func newDocumentSessionManager(proxyURL string) *SessionManager {
+	return &SessionManager{proxyURL: proxyURL}
+}
 
 // TestIsDocumentSupported_TextFiles tests that text files are supported.
 func TestIsDocumentSupported_TextFiles(t *testing.T) {
@@ -206,8 +231,8 @@ func TestIsDocumentSupported_NilMime(t *testing.T) {
 // TestDocumentExtFromMime_Text tests extension mapping for text types.
 func TestDocumentExtFromMime_Text(t *testing.T) {
 	tests := []struct {
-		mime  string
-		want  string
+		mime string
+		want string
 	}{
 		{"text/plain", ".txt"},
 		{"text/html", ".txt"},
@@ -228,8 +253,8 @@ func TestDocumentExtFromMime_Text(t *testing.T) {
 // TestDocumentExtFromMime_Code tests extension mapping for code files.
 func TestDocumentExtFromMime_Code(t *testing.T) {
 	tests := []struct {
-		mime  string
-		want  string
+		mime string
+		want string
 	}{
 		{"application/json", ".json"},
 		{"application/xml", ".xml"},
@@ -270,8 +295,8 @@ func TestDocumentExtFromMime_Code(t *testing.T) {
 // TestDocumentExtFromMime_Images tests extension mapping for images.
 func TestDocumentExtFromMime_Images(t *testing.T) {
 	tests := []struct {
-		mime  string
-		want  string
+		mime string
+		want string
 	}{
 		{"image/jpeg", ".jpg"},
 		{"image/png", ".png"},
@@ -295,8 +320,8 @@ func TestDocumentExtFromMime_Images(t *testing.T) {
 // TestDocumentExtFromMime_Other tests extension mapping for other file types.
 func TestDocumentExtFromMime_Other(t *testing.T) {
 	tests := []struct {
-		mime  string
-		want  string
+		mime string
+		want string
 	}{
 		{"application/pdf", ".pdf"},
 		{"application/x-pdf", ".pdf"},
@@ -323,22 +348,235 @@ func TestDocumentExtFromMime_Nil(t *testing.T) {
 	}
 }
 
+// TestDocumentProcessRouting verifies that each document category reaches the
+// attachment path Claude can read, while unsupported types are returned with a
+// user-facing warning. It also pins the staged filename behavior: an original
+// extension is retained, but the user-controlled basename is never used.
+func TestDocumentProcessRouting(t *testing.T) {
+	tests := []struct {
+		name            string
+		mimeType        string
+		fileName        string
+		wantExtension   string
+		wantUnsupported bool
+	}{
+		{
+			name:          "PDF routes as a readable attachment",
+			mimeType:      "application/pdf",
+			fileName:      "quarterly-report.pdf",
+			wantExtension: ".pdf",
+		},
+		{
+			name:          "plain text without a filename uses text extension",
+			mimeType:      "text/plain",
+			wantExtension: ".txt",
+		},
+		{
+			name:          "Go source routes as code",
+			mimeType:      "application/x-go",
+			fileName:      "main.go",
+			wantExtension: ".go",
+		},
+		{
+			name:          "image routes as a readable attachment",
+			mimeType:      "image/png",
+			fileName:      "diagram.png",
+			wantExtension: ".png",
+		},
+		{
+			name:          "Jupyter notebook filename routes as code",
+			mimeType:      "application/octet-stream",
+			fileName:      "analysis.ipynb",
+			wantExtension: ".ipynb",
+		},
+		{
+			name:            "archive returns an unsupported type warning",
+			mimeType:        "application/zip",
+			fileName:        "release.zip",
+			wantExtension:   ".zip",
+			wantUnsupported: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempRoot := useDocumentTempDir(t)
+			const (
+				chatID    = int64(12345)
+				messageID = int64(67890)
+			)
+			fileID := strings.ReplaceAll(tt.name, " ", "-")
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/file/"+fileID, r.URL.Path)
+				_, _ = w.Write([]byte("document bytes"))
+			}))
+			t.Cleanup(server.Close)
+
+			content := &contract.Content{
+				FileID:   &fileID,
+				MimeType: &tt.mimeType,
+			}
+			if tt.fileName != "" {
+				content.FileName = &tt.fileName
+			}
+
+			path, unsupportedMsg, cleanupPaths, err := newDocumentSessionManager(server.URL).processDocument(
+				context.Background(), chatID, messageID, content,
+			)
+			require.NoError(t, err)
+
+			wantPath := filepath.Join(tempRoot, fmt.Sprintf("%d", chatID), fmt.Sprintf("%d%s", messageID, tt.wantExtension))
+			assert.Equal(t, wantPath, path)
+			assert.Equal(t, []string{wantPath}, cleanupPaths)
+			assert.FileExists(t, path)
+			assert.Equal(t, []byte("document bytes"), mustReadDocument(t, path))
+
+			if tt.wantUnsupported {
+				assert.Contains(t, unsupportedMsg, tt.fileName)
+				assert.Contains(t, unsupportedMsg, "not directly supported")
+			} else {
+				assert.Empty(t, unsupportedMsg)
+			}
+		})
+	}
+}
+
+// TestDocumentProcessSizeBounds confirms that a document at the proxy's 20 MiB
+// limit is staged, whereas the proxy's over-limit response is surfaced and no
+// partial attachment is returned to the caller.
+func TestDocumentProcessSizeBounds(t *testing.T) {
+	tests := []struct {
+		name      string
+		fileSize  int64
+		status    int
+		wantErr   string
+		wantPaths bool
+	}{
+		{
+			name:      "at proxy limit",
+			fileSize:  telegram.MaxFileSize,
+			status:    http.StatusOK,
+			wantPaths: true,
+		},
+		{
+			name:     "one byte over proxy limit",
+			fileSize: telegram.MaxFileSize + 1,
+			status:   http.StatusRequestEntityTooLarge,
+			wantErr:  "status 413",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			useDocumentTempDir(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method)
+				w.WriteHeader(tt.status)
+				if tt.status == http.StatusOK {
+					_, _ = w.Write([]byte("within limit"))
+				}
+			}))
+			t.Cleanup(server.Close)
+
+			fileID := "sized-document"
+			mimeType := "application/pdf"
+			path, unsupportedMsg, cleanupPaths, err := newDocumentSessionManager(server.URL).processDocument(
+				context.Background(), 1, 2, &contract.Content{
+					FileID:   &fileID,
+					FileSize: &tt.fileSize,
+					MimeType: &mimeType,
+				},
+			)
+
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "download document")
+				assert.Contains(t, err.Error(), tt.wantErr)
+				assert.Empty(t, path)
+				assert.Empty(t, unsupportedMsg)
+				assert.Empty(t, cleanupPaths)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.NotEmpty(t, path)
+			assert.Empty(t, unsupportedMsg)
+			if tt.wantPaths {
+				assert.Equal(t, []string{path}, cleanupPaths)
+			}
+		})
+	}
+}
+
+// TestDocumentProcessErrorPaths covers failures before and during the
+// download. Unsupported document MIME types are intentionally not an error:
+// they are handled by TestDocumentProcessRouting as a warning after download.
+func TestDocumentProcessErrorPaths(t *testing.T) {
+	t.Run("staging directory creation fails", func(t *testing.T) {
+		original := imageTempDir
+		imageTempDir = filepath.Join(t.TempDir(), "not-a-directory")
+		require.NoError(t, os.WriteFile(imageTempDir, []byte("x"), 0o644))
+		t.Cleanup(func() { imageTempDir = original })
+
+		fileID := "unreachable"
+		mimeType := "text/plain"
+		path, unsupportedMsg, cleanupPaths, err := newDocumentSessionManager("http://127.0.0.1:1").processDocument(
+			context.Background(), 1, 2, &contract.Content{FileID: &fileID, MimeType: &mimeType},
+		)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "mkdir")
+		assert.Empty(t, path)
+		assert.Empty(t, unsupportedMsg)
+		assert.Empty(t, cleanupPaths)
+	})
+
+	t.Run("proxy download failure", func(t *testing.T) {
+		useDocumentTempDir(t)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+		}))
+		t.Cleanup(server.Close)
+
+		fileID := "expired-document"
+		mimeType := "text/plain"
+		path, unsupportedMsg, cleanupPaths, err := newDocumentSessionManager(server.URL).processDocument(
+			context.Background(), 1, 2, &contract.Content{FileID: &fileID, MimeType: &mimeType},
+		)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "download document")
+		assert.Contains(t, err.Error(), "status 502")
+		assert.Empty(t, path)
+		assert.Empty(t, unsupportedMsg)
+		assert.Empty(t, cleanupPaths)
+	})
+}
+
+func mustReadDocument(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return data
+}
+
 // TestGetUnsupportedMessage tests the unsupported message generation.
 func TestGetUnsupportedMessage(t *testing.T) {
 	tests := []struct {
-		name           string
-		fileName      string
-		containsText  string
+		name         string
+		fileName     string
+		containsText string
 	}{
 		{
-			name:          "with filename",
-			fileName:      "archive.zip",
-			containsText:  "archive.zip",
+			name:         "with filename",
+			fileName:     "archive.zip",
+			containsText: "archive.zip",
 		},
 		{
-			name:          "without filename",
-			fileName:      "",
-			containsText:  "uploaded file",
+			name:         "without filename",
+			fileName:     "",
+			containsText: "uploaded file",
 		},
 	}
 
