@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -289,4 +290,74 @@ func TestPoller_DeduplicationFiltersDuplicateUpdateIDs(t *testing.T) {
 	}
 
 	cancel()
+}
+
+// TestPoller_SendsAckAfterProcessing verifies the bridge reports its durable
+// progress to the proxy: the first poll carries no ack, and after a batch is
+// forwarded, subsequent polls carry ?ack=<highest forwarded update_id>.
+func TestPoller_SendsAckAfterProcessing(t *testing.T) {
+	var mu sync.Mutex
+	var acks []string
+	call := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/updates" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		acks = append(acks, r.URL.Query().Get("ack"))
+		i := call
+		call++
+		mu.Unlock()
+
+		var updates []contract.Update
+		if i == 0 {
+			updates = []contract.Update{makePollerUpdate(700), makePollerUpdate(701)}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(contract.UpdatesResponse{OK: true, Updates: updates})
+	}))
+	defer srv.Close()
+
+	ch := make(chan contract.Update, 10)
+	p := NewPoller(srv.URL, 1, ch, nil) // no db: ack advances on forward
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go p.Start(ctx)
+
+	got := collect(t, ch, 2, 2*time.Second)
+	if len(got) != 2 {
+		t.Fatalf("got %d updates, want 2", len(got))
+	}
+
+	// Wait for the poll that follows batch processing and check its ack.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(acks)
+		var first, second string
+		if n > 0 {
+			first = acks[0]
+		}
+		if n > 1 {
+			second = acks[1]
+		}
+		mu.Unlock()
+
+		if first != "" {
+			t.Fatalf("first poll ack = %q, want empty (nothing processed yet)", first)
+		}
+		if n >= 2 {
+			if second != "701" {
+				t.Fatalf("second poll ack = %q, want 701", second)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("poller never made a second request")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

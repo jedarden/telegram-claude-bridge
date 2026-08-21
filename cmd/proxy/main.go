@@ -110,7 +110,18 @@ func handleUpdates(p *telegram.Poller) http.HandlerFunc {
 			}
 		}
 
-		updates := p.TakeUpdates(r.Context(), timeout)
+		// Ack: the caller reports the highest update_id it has durably
+		// processed. Discard retained updates up to and including it before
+		// peeking, so the response reflects what is still outstanding.
+		// Anything not covered by the ack stays in the buffer and is
+		// re-delivered on subsequent calls.
+		if v := r.URL.Query().Get("ack"); v != "" {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+				p.Ack(n)
+			}
+		}
+
+		updates := p.PeekUpdates(r.Context(), timeout)
 		if updates == nil {
 			updates = []contract.Update{}
 		}

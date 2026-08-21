@@ -19,22 +19,35 @@ import (
 
 const telegramAPIBase = "https://api.telegram.org"
 
+// DefaultUpdateBufferCap is the default maximum number of delivered-but-unacked
+// updates the poller retains for re-delivery. Overflow policy: when the cap is
+// exceeded the OLDEST retained updates are dropped (and logged). Dropped
+// updates are already acknowledged to Telegram and therefore unrecoverable —
+// the cap exists to bound proxy memory during an extended bridge outage, and
+// it deliberately keeps the newest updates.
+const DefaultUpdateBufferCap = 10000
+
 // Poller manages Telegram long-polling and buffers normalized updates for consumption.
 type Poller struct {
-	token        string
-	apiBase      string
-	client       *http.Client
-	version      string
-	commitSHA    string
-	offsetPath   string // path to persist offset; empty means no persistence
+	token      string
+	apiBase    string
+	client     *http.Client
+	version    string
+	commitSHA  string
+	offsetPath string // path to persist offset + unacked buffer; empty means no persistence
 
-	mu      sync.Mutex
-	offset  int64
-	lastID  *int64
-	updates []contract.Update
-	polling bool
-	started time.Time
-	newData chan struct{} // cap-1 signal: new updates are available
+	mu        sync.Mutex
+	offset    int64
+	lastID    *int64
+	updates   []contract.Update // delivered-but-unacked, ascending update_id
+	bufferCap int
+	polling   bool
+	started   time.Time
+	newData   chan struct{} // cap-1 signal: new updates are available
+
+	// saveMu serializes state-file writes so that a snapshot taken by one
+	// writer cannot be overwritten by a stale snapshot from another.
+	saveMu sync.Mutex
 
 	// messageCache stores recent message content for /get_message endpoint
 	// Key: chatID:MessageID, Value: MessageContent
@@ -43,8 +56,8 @@ type Poller struct {
 
 // NewPoller creates a Poller. Pass an empty apiBase to use the production Telegram API.
 // The version and commitSHA parameters are used for health endpoint reporting.
-// If offsetPath is non-empty, the poller will persist its offset to that file and
-// reload it on startup to survive restarts.
+// If offsetPath is non-empty, the poller will persist its offset and retained
+// unacked updates to that file and reload them on startup to survive restarts.
 func NewPoller(token, apiBase, version, commitSHA, offsetPath string) *Poller {
 	if apiBase == "" {
 		apiBase = telegramAPIBase
@@ -58,18 +71,37 @@ func NewPoller(token, apiBase, version, commitSHA, offsetPath string) *Poller {
 		started:      time.Now(),
 		newData:      make(chan struct{}, 1),
 		offsetPath:   offsetPath,
+		bufferCap:    DefaultUpdateBufferCap,
 		messageCache: make(map[string]*contract.MessageContent),
 	}
 
-	// Load initial offset from file if configured
+	// Load persisted offset and unacked updates if configured
 	if offsetPath != "" {
-		if offset := p.loadOffset(); offset > 0 {
+		offset, unacked := p.loadState()
+		if offset > 0 {
 			p.offset = offset
-			log.Printf("poller: loaded offset %d from %s", offset, offsetPath)
+		}
+		if len(unacked) > 0 {
+			p.updates = unacked
+		}
+		if offset > 0 || len(unacked) > 0 {
+			log.Printf("poller: loaded offset %d and %d unacked updates from %s", offset, len(unacked), offsetPath)
 		}
 	}
 
 	return p
+}
+
+// SetUpdateBufferCap adjusts the maximum number of unacked updates retained for
+// re-delivery (see DefaultUpdateBufferCap for the overflow policy). Values < 1
+// are ignored. Call before Start.
+func (p *Poller) SetUpdateBufferCap(n int) {
+	if n < 1 {
+		return
+	}
+	p.mu.Lock()
+	p.bufferCap = n
+	p.mu.Unlock()
 }
 
 // Start runs the long-polling loop until ctx is cancelled. Call in a goroutine.
@@ -131,6 +163,15 @@ func (p *Poller) Start(ctx context.Context) {
 		if len(normalized) > 0 {
 			p.mu.Lock()
 			p.updates = append(p.updates, normalized...)
+			if over := len(p.updates) - p.bufferCap; over > 0 {
+				// Overflow policy: drop the oldest retained updates (see
+				// DefaultUpdateBufferCap). They are already acknowledged to
+				// Telegram, so they cannot be re-delivered — keep the newest.
+				trimmed := make([]contract.Update, 0, p.bufferCap)
+				trimmed = append(trimmed, p.updates[over:]...)
+				p.updates = trimmed
+				log.Printf("poller: unacked update buffer cap (%d) exceeded — dropped %d oldest updates; they cannot be re-delivered", p.bufferCap, over)
+			}
 			id := normalized[len(normalized)-1].UpdateID
 			p.lastID = &id
 
@@ -174,16 +215,24 @@ func (p *Poller) Start(ctx context.Context) {
 			default:
 			}
 		}
+
+		// getUpdates advanced the offset (and the buffer may have grown) —
+		// persist both so a restart cannot lose unacked updates. Unreachable
+		// for empty batches (early continue above).
+		p.saveState()
 	}
 }
 
-// TakeUpdates drains buffered updates. If none are available it waits up to timeout
-// for new ones to arrive (or until ctx is cancelled).
-func (p *Poller) TakeUpdates(ctx context.Context, timeout time.Duration) []contract.Update {
+// PeekUpdates returns every retained update — delivered but not yet acked —
+// without removing any of them. Unacked updates are re-delivered on every call
+// until the consumer acknowledges them via Ack; the consumer is expected to
+// tolerate (and deduplicate) re-delivery. If nothing is retained it waits up
+// to timeout for new updates to arrive (or until ctx is cancelled), mirroring
+// Telegram's own getUpdates long-poll.
+func (p *Poller) PeekUpdates(ctx context.Context, timeout time.Duration) []contract.Update {
 	p.mu.Lock()
 	if len(p.updates) > 0 {
-		out := p.updates
-		p.updates = nil
+		out := append([]contract.Update(nil), p.updates...)
 		p.mu.Unlock()
 		return out
 	}
@@ -198,10 +247,41 @@ func (p *Poller) TakeUpdates(ctx context.Context, timeout time.Duration) []contr
 	}
 
 	p.mu.Lock()
-	out := p.updates
-	p.updates = nil
+	defer p.mu.Unlock()
+	if len(p.updates) == 0 {
+		return nil
+	}
+	return append([]contract.Update(nil), p.updates...)
+}
+
+// Ack discards retained updates with update_id <= through. The caller asserts
+// it has durably taken responsibility for everything up to and including
+// `through` (e.g. written it to its own database); discarded updates are never
+// re-delivered. Returns the number of updates discarded. Passing through <= 0
+// is a no-op.
+func (p *Poller) Ack(through int64) int {
+	if through <= 0 {
+		return 0
+	}
+
+	p.mu.Lock()
+	cut := 0
+	// Updates are retained in ascending update_id order (Telegram's ordering),
+	// so the covered set is a prefix.
+	for cut < len(p.updates) && p.updates[cut].UpdateID <= through {
+		cut++
+	}
+	if cut == 0 {
+		p.mu.Unlock()
+		return 0
+	}
+	rest := make([]contract.Update, len(p.updates)-cut)
+	copy(rest, p.updates[cut:])
+	p.updates = rest
 	p.mu.Unlock()
-	return out
+
+	p.saveState()
+	return cut
 }
 
 // Health returns the current health status of the poller.
@@ -228,63 +308,79 @@ func (p *Poller) GetMessage(chatID, messageID int64) *contract.MessageContent {
 	return p.messageCache[key]
 }
 
-// offsetFile represents the JSON structure of the offset file.
-type offsetFile struct {
-	Offset int64 `json:"offset"`
+// stateFile is the JSON structure of the persisted poller state. Older files
+// that contain only {"offset": N} decode with an empty Unacked — fine.
+type stateFile struct {
+	Offset  int64             `json:"offset"`
+	Unacked []contract.Update `json:"unacked,omitempty"`
 }
 
-// loadOffset reads the persisted offset from disk. Returns 0 if file doesn't exist
-// or on error (in which case we start fresh from offset 0).
-func (p *Poller) loadOffset() int64 {
+// loadState reads the persisted offset and unacked update buffer from disk.
+// Returns (0, nil) if the file doesn't exist or on error (in which case we
+// start fresh from offset 0 with nothing retained).
+func (p *Poller) loadState() (int64, []contract.Update) {
 	if p.offsetPath == "" {
-		return 0
+		return 0, nil
 	}
 
 	data, err := os.ReadFile(p.offsetPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			log.Printf("poller: error reading offset file: %v — starting from offset 0", err)
+			log.Printf("poller: error reading state file: %v — starting from offset 0", err)
 		}
-		return 0
+		return 0, nil
 	}
 
-	var of offsetFile
-	if err := json.Unmarshal(data, &of); err != nil {
-		log.Printf("poller: error parsing offset file: %v — starting from offset 0", err)
-		return 0
+	var sf stateFile
+	if err := json.Unmarshal(data, &sf); err != nil {
+		log.Printf("poller: error parsing state file: %v — starting from offset 0", err)
+		return 0, nil
 	}
 
-	return of.Offset
+	return sf.Offset, sf.Unacked
 }
 
-// saveOffset writes the current offset to disk atomically using a temp file + rename.
-// Errors are logged but don't stop polling (we'll retry on the next getUpdates).
-func (p *Poller) saveOffset(offset int64) {
+// saveState writes the current offset and retained unacked updates to disk
+// atomically using a temp file + rename. Errors are logged but don't stop
+// polling (we'll retry on the next getUpdates).
+func (p *Poller) saveState() {
 	if p.offsetPath == "" {
 		return
 	}
 
+	p.saveMu.Lock()
+	defer p.saveMu.Unlock()
+
+	// Snapshot under the state mutex while holding saveMu, so concurrent
+	// writers (poll loop, Ack) persist strictly ordered snapshots.
+	p.mu.Lock()
+	sf := stateFile{Offset: p.offset}
+	if len(p.updates) > 0 {
+		sf.Unacked = append([]contract.Update(nil), p.updates...)
+	}
+	p.mu.Unlock()
+
 	// Ensure directory exists
 	if err := os.MkdirAll(filepath.Dir(p.offsetPath), 0755); err != nil {
-		log.Printf("poller: error creating offset directory: %v", err)
+		log.Printf("poller: error creating state directory: %v", err)
 		return
 	}
 
-	data, err := json.Marshal(offsetFile{Offset: offset})
+	data, err := json.Marshal(sf)
 	if err != nil {
-		log.Printf("poller: error marshaling offset: %v", err)
+		log.Printf("poller: error marshaling state: %v", err)
 		return
 	}
 
 	// Write to temp file first, then rename for atomicity
 	tmpPath := p.offsetPath + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		log.Printf("poller: error writing offset temp file: %v", err)
+		log.Printf("poller: error writing state temp file: %v", err)
 		return
 	}
 
 	if err := os.Rename(tmpPath, p.offsetPath); err != nil {
-		log.Printf("poller: error renaming offset file: %v", err)
+		log.Printf("poller: error renaming state file: %v", err)
 		os.Remove(tmpPath) // clean up temp file
 		return
 	}
@@ -346,7 +442,8 @@ func (p *Poller) getUpdates(ctx context.Context) ([]Update, error) {
 		p.mu.Lock()
 		p.offset = lastID + 1
 		p.mu.Unlock()
-		p.saveOffset(p.offset)
+		// The offset advance and any new buffer contents are persisted by the
+		// caller (Start) once the batch has been appended.
 	}
 
 	return result.Result, nil

@@ -25,6 +25,13 @@ type Poller struct {
 	updates     chan<- contract.Update
 	client      *http.Client
 	db          *DB // For update deduplication
+
+	// ack is the highest update_id this bridge has durably taken
+	// responsibility for (recorded in the dedup table when db != nil). It is
+	// sent as ?ack= on each poll so the proxy can discard the updates behind
+	// it; everything newer is re-delivered until acked. Only pollLoop touches
+	// it, so no locking is needed.
+	ack int64
 }
 
 // NewPoller creates a Poller that sends received updates to updates.
@@ -88,15 +95,20 @@ func (p *Poller) pollLoop(ctx context.Context) {
 		}
 		backoff = backoffMin // reset on success
 
+		// batchAck tracks the highest update_id this poll has durably recorded
+		// (or, with no db, forwarded). It is sent on the next poll so the
+		// proxy can discard everything up to it; newer updates are re-delivered.
+		batchAck := p.ack
 		for _, u := range updates {
 			// Skip if this update was already processed (deduplication).
-			// This protects against replay when the proxy loses its offset.
+			// This protects against replay when the proxy re-delivers.
 			if p.db != nil {
 				alreadyProcessed, err := p.db.IsUpdateProcessed(ctx, u.UpdateID)
 				if err != nil {
 					log.Printf("[bridge/poller] dedup check failed for update %d: %v — processing anyway", u.UpdateID, err)
 				} else if alreadyProcessed {
 					log.Printf("[bridge/poller] skipping duplicate update %d", u.UpdateID)
+					batchAck = max(batchAck, u.UpdateID)
 					continue
 				}
 			}
@@ -104,24 +116,35 @@ func (p *Poller) pollLoop(ctx context.Context) {
 			// Forward to channel for routing.
 			select {
 			case p.updates <- u:
-				// Mark as processed only after successful send.
+				// Mark as processed only after successful send. The update is
+				// routed at this point regardless, so even a failed mark
+				// still advances the ack — re-delivering it would only
+				// duplicate work the dedup table can no longer catch.
 				if p.db != nil {
 					if err := p.db.MarkUpdateProcessed(ctx, u.UpdateID); err != nil {
 						log.Printf("[bridge/poller] failed to mark update %d as processed: %v", u.UpdateID, err)
 					}
 				}
+				batchAck = max(batchAck, u.UpdateID)
 			case <-ctx.Done():
 				return
 			}
 		}
+		p.ack = batchAck
 	}
 }
 
-// fetchUpdates calls GET /updates?timeout=<pollTimeout> on the proxy and
-// returns the list of updates. An empty list is valid (long-poll timed out
-// with no new updates). Returns an error on network failure or non-200 status.
+// fetchUpdates calls GET /updates?timeout=<pollTimeout>&ack=<ack> on the proxy
+// and returns the list of updates. The ack tells the proxy the highest update_id
+// this bridge has durably recorded; the proxy discards everything up to it and
+// re-delivers the rest until covered by a later ack. An empty list is valid
+// (long-poll timed out with no unacked updates). Returns an error on network
+// failure or non-200 status.
 func (p *Poller) fetchUpdates(ctx context.Context) ([]contract.Update, error) {
 	url := fmt.Sprintf("%s/updates?timeout=%d", p.proxyURL, p.pollTimeout)
+	if p.ack > 0 {
+		url += fmt.Sprintf("&ack=%d", p.ack)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -150,4 +173,3 @@ func (p *Poller) fetchUpdates(ctx context.Context) ([]contract.Update, error) {
 
 	return body.Updates, nil
 }
-
