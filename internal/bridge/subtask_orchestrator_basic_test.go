@@ -219,11 +219,11 @@ func TestSplitParallelPrompts_DelimiterHandling(t *testing.T) {
 			description:  "Four dashes should not split",
 		},
 		{
-			name:         "spaces around dashes prevent split",
+			name:         "spaces around dashes still split",
 			input:        "First \n --- \n Second",
-			wantLen:      1,
-			shouldSplit:  false,
-			description:  "Spaces around delimiter should prevent split",
+			wantLen:      2,
+			shouldSplit:  true,
+			description:  "Spaces around a --- line are still a delimiter",
 		},
 		{
 			name:         "delimiter at start only",

@@ -109,24 +109,25 @@ func TestSplitParallelPrompts_ConsecutiveDelimiters(t *testing.T) {
 		wantLen     int
 		wantPrompts []string
 	}{
-		// Consecutive delimiters in the middle (with text before and after)
+		// Consecutive delimiters in the middle: empty prompts are filtered,
+		// so runs of delimiters collapse into a single split point.
 		{
 			name:        "two consecutive delimiters",
 			input:       "First\n---\n---\nSecond",
 			wantLen:     2,
-			wantPrompts: []string{"First", "---\nSecond"},
+			wantPrompts: []string{"First", "Second"},
 		},
 		{
 			name:        "three consecutive delimiters",
 			input:       "First\n---\n---\n---\nSecond",
-			wantLen:     3,
-			wantPrompts: []string{"First", "---", "Second"},
+			wantLen:     2,
+			wantPrompts: []string{"First", "Second"},
 		},
 		{
 			name:        "four consecutive delimiters",
 			input:       "A\n---\n---\n---\n---\nB",
-			wantLen:     3,
-			wantPrompts: []string{"A", "---", "---\nB"},
+			wantLen:     2,
+			wantPrompts: []string{"A", "B"},
 		},
 		// Consecutive delimiters at the start
 		{
@@ -229,7 +230,7 @@ func TestSplitParallelPrompts_ConsecutiveDelimiters(t *testing.T) {
 }
 
 // TestSplitParallelPrompts_MixedDelimiterPatterns tests different whitespace patterns around delimiters.
-// The function only splits on exact "\n---\n", not on variants with extra whitespace.
+// A --- line tolerates surrounding spaces, but tab-delimited lookalikes are content.
 func TestSplitParallelPrompts_MixedDelimiterPatterns(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -240,14 +241,14 @@ func TestSplitParallelPrompts_MixedDelimiterPatterns(t *testing.T) {
 		{
 			name:        "spaces before delimiter",
 			input:       "First  \n ---\nSecond",
-			wantLen:     1,
-			wantPrompts: []string{"First  \n ---\nSecond"},
+			wantLen:     2,
+			wantPrompts: []string{"First", "Second"},
 		},
 		{
 			name:        "spaces after delimiter",
 			input:       "First\n---  \nSecond",
-			wantLen:     1,
-			wantPrompts: []string{"First\n---  \nSecond"},
+			wantLen:     2,
+			wantPrompts: []string{"First", "Second"},
 		},
 		{
 			name:        "tabs around delimiter",
@@ -264,8 +265,8 @@ func TestSplitParallelPrompts_MixedDelimiterPatterns(t *testing.T) {
 		{
 			name:        "different whitespace each time",
 			input:       "First\n ---\nSecond\n  ---\nThird\n\t---\nFourth",
-			wantLen:     1,
-			wantPrompts: []string{"First\n ---\nSecond\n  ---\nThird\n\t---\nFourth"},
+			wantLen:     3,
+			wantPrompts: []string{"First", "Second", "Third\n\t---\nFourth"},
 		},
 	}
 
@@ -521,7 +522,8 @@ func TestSplitParallelPrompts_SpecialCharsEdgeCases(t *testing.T) {
 			input:   "Parse {\"key\": \"value\", \"nested\": {\"x\": 1}}\n---\nNext",
 			wantLen: 2,
 			verify: func(prompts []string) bool {
-				return strings.Contains(prompts[0], "{\"key\": \"value\"}")
+				return strings.Contains(prompts[0], "{\"key\": \"value\"") &&
+					strings.Contains(prompts[0], "\"nested\": {\"x\": 1}")
 			},
 		},
 		{
@@ -632,10 +634,10 @@ func TestSplitParallelPrompts_NonDelimiterDashes(t *testing.T) {
 			wantContent: "Text\n---Next",
 		},
 		{
-			name:        "spaces around dashes prevent split",
+			name:        "spaces around dashes still split",
 			input:       "First \n --- \n Second",
-			wantLen:     1,
-			wantContent: "First \n --- \n Second",
+			wantLen:     2,
+			wantContent: "First",
 		},
 		{
 			name:        "tab before dashes",
@@ -720,18 +722,19 @@ func TestSplitParallelPrompts_DelimiterInContent(t *testing.T) {
 		{
 			name:    "dashes within a code block",
 			input:   "Here's a list:\n- item 1\n- item 2\n---\nNext prompt",
-			wantLen: 1,
+			wantLen: 2,
 			verify: func(prompts []string) bool {
 				return strings.Contains(prompts[0], "- item 2") &&
-					!strings.Contains(prompts[0], "Next prompt")
+					prompts[1] == "Next prompt"
 			},
 		},
 		{
 			name:    "dashes in markdown list",
 			input:   "Check:\n- First task\n- Second task\n- Third task\n---\nNext",
-			wantLen: 1,
+			wantLen: 2,
 			verify: func(prompts []string) bool {
-				return strings.Contains(prompts[0], "- Third task")
+				return strings.Contains(prompts[0], "- Third task") &&
+					prompts[1] == "Next"
 			},
 		},
 		{
@@ -913,12 +916,12 @@ func TestSplitParallelPrompts_WhitespaceAroundDelimiters(t *testing.T) {
 		wantPrompts []string
 		verify      func([]string) bool
 	}{
-		// Whitespace BEFORE delimiter (prevents split)
+		// Whitespace BEFORE delimiter (spaces are tolerated; tabs make it content)
 		{
 			name:        "whitespace before delimiter - spaces",
 			input:       "text\n  ---\nmore",
-			wantLen:     1,
-			wantPrompts: []string{"text\n  ---\nmore"},
+			wantLen:     2,
+			wantPrompts: []string{"text", "more"},
 		},
 		{
 			name:        "whitespace before delimiter - tabs",
@@ -935,15 +938,15 @@ func TestSplitParallelPrompts_WhitespaceAroundDelimiters(t *testing.T) {
 		{
 			name:        "whitespace before delimiter - multiple lines with spaces",
 			input:       "first line\n  \n---\nmore text",
-			wantLen:     1,
-			wantPrompts: []string{"first line\n  \n---\nmore text"},
+			wantLen:     2,
+			wantPrompts: []string{"first line", "more text"},
 		},
-		// Whitespace AFTER delimiter (prevents split)
+		// Whitespace AFTER delimiter (spaces are tolerated; tabs make it content)
 		{
 			name:        "whitespace after delimiter - spaces",
 			input:       "text\n---  \nmore",
-			wantLen:     1,
-			wantPrompts: []string{"text\n---  \nmore"},
+			wantLen:     2,
+			wantPrompts: []string{"text", "more"},
 		},
 		{
 			name:        "whitespace after delimiter - tabs",
@@ -960,15 +963,15 @@ func TestSplitParallelPrompts_WhitespaceAroundDelimiters(t *testing.T) {
 		{
 			name:        "whitespace after delimiter - multiple lines with spaces",
 			input:       "text\n---\n  \nmore text",
-			wantLen:     1,
-			wantPrompts: []string{"text\n---\n  \nmore text"},
+			wantLen:     2,
+			wantPrompts: []string{"text", "more text"},
 		},
-		// Whitespace AROUND delimiters (prevents split)
+		// Whitespace AROUND delimiters (spaces on both sides still split)
 		{
 			name:        "whitespace around delimiter - both sides",
 			input:       "text  \n --- \n  more",
-			wantLen:     1,
-			wantPrompts: []string{"text  \n --- \n  more"},
+			wantLen:     2,
+			wantPrompts: []string{"text", "more"},
 		},
 		{
 			name:        "whitespace around delimiter - tabs",
@@ -1033,25 +1036,25 @@ func TestSplitParallelPrompts_WhitespaceAroundDelimiters(t *testing.T) {
 			},
 		},
 		{
-			name:    "internal indentation is preserved",
+			name:    "indentation on interior lines is preserved",
 			input:   "  indented\n    more\n---\nnext",
 			wantLen: 2,
 			verify: func(prompts []string) bool {
-				return prompts[0] == "  indented\n    more"
+				return prompts[0] == "indented\n    more"
 			},
 		},
-		// Mixed valid and invalid delimiters (whitespace prevents some splits)
+		// Mixed delimiters with and without surrounding spaces all split
 		{
-			name:        "valid delimiter then invalid (with whitespace)",
+			name:        "valid delimiter then spaced delimiter",
 			input:       "first\n---\nsecond\n ---\nthird",
-			wantLen:     2,
-			wantPrompts: []string{"first", "second\n ---\nthird"},
+			wantLen:     3,
+			wantPrompts: []string{"first", "second", "third"},
 		},
 		{
-			name:        "invalid delimiter (with whitespace) then valid",
+			name:        "spaced delimiter then valid delimiter",
 			input:       "first\n ---\nsecond\n---\nthird",
-			wantLen:     2,
-			wantPrompts: []string{"first\n ---\nsecond", "third"},
+			wantLen:     3,
+			wantPrompts: []string{"first", "second", "third"},
 		},
 		{
 			name:        "valid delimiters with whitespace between",
@@ -1099,13 +1102,13 @@ func TestSplitParallelPrompts_DelimiterPositionEdgeCases(t *testing.T) {
 			name:        "delimiter at beginning of input",
 			input:       "---\ntext",
 			wantLen:     1,
-			wantPrompts: []string{"---\ntext"},
+			wantPrompts: []string{"text"},
 		},
 		{
 			name:        "delimiter at end of input",
 			input:       "text\n---",
 			wantLen:     1,
-			wantPrompts: []string{"text\n---"},
+			wantPrompts: []string{"text"},
 		},
 		{
 			name:        "only the delimiter",
@@ -1117,43 +1120,43 @@ func TestSplitParallelPrompts_DelimiterPositionEdgeCases(t *testing.T) {
 			name:        "delimiter at beginning with multiple lines",
 			input:       "---\nfirst line\nsecond line",
 			wantLen:     1,
-			wantPrompts: []string{"---\nfirst line\nsecond line"},
+			wantPrompts: []string{"first line\nsecond line"},
 		},
 		{
 			name:        "delimiter at end with multiple lines",
 			input:       "first line\nsecond line\n---",
 			wantLen:     1,
-			wantPrompts: []string{"first line\nsecond line\n---"},
+			wantPrompts: []string{"first line\nsecond line"},
 		},
 		{
 			name:        "delimiter at both edges without surrounding newlines",
 			input:       "---\ntext\n---",
 			wantLen:     1,
-			wantPrompts: []string{"---\ntext\n---"},
+			wantPrompts: []string{"text"},
 		},
 		{
 			name:        "multiple delimiters at beginning without leading newline",
 			input:       "---\n---\ntext",
-			wantLen:     2,
-			wantPrompts: []string{"---", "text"},
+			wantLen:     1,
+			wantPrompts: []string{"text"},
 		},
 		{
 			name:        "multiple delimiters at end without trailing newline",
 			input:       "text\n---\n---",
-			wantLen:     2,
-			wantPrompts: []string{"text", "---"},
+			wantLen:     1,
+			wantPrompts: []string{"text"},
 		},
 		{
 			name:        "valid delimiter after delimiter at beginning",
 			input:       "---\ntext\n---\nnext",
 			wantLen:     2,
-			wantPrompts: []string{"---\ntext", "next"},
+			wantPrompts: []string{"text", "next"},
 		},
 		{
 			name:        "valid delimiter before delimiter at end",
 			input:       "first\n---\nsecond\n---",
 			wantLen:     2,
-			wantPrompts: []string{"first", "second\n---"},
+			wantPrompts: []string{"first", "second"},
 		},
 	}
 
