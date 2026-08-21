@@ -119,6 +119,38 @@ func TestParseCommand(t *testing.T) {
 
 // ── Test Helpers ─────────────────────────────────────────────────────────────────────
 
+// TestEscapeCommand covers the markdown escaping applied to job commands in
+// user-facing notifications: only backticks are escaped, so a command shown
+// inside a Telegram code span renders literally.
+func TestEscapeCommand(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"echo hello", "echo hello"},
+		{"", ""},
+		{"plain-text_123 ./path", "plain-text_123 ./path"},
+		{"echo `date`", "echo \\`date\\`"},
+		{"`ticks` at `both` ends", "\\`ticks\\` at \\`both\\` ends"},
+		{"nested `back`tick", "nested \\`back\\`tick"},
+		{
+			// Escaping is not idempotent: an already-escaped backtick gains a
+			// second backslash if the command is escaped again.
+			input:    "already \\`escaped\\`",
+			expected: "already \\\\`escaped\\\\`",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := escapeCommand(tt.input)
+			if got != tt.expected {
+				t.Errorf("escapeCommand(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
 // generateJobID Tests ───────────────────────────────────────────────────────────
 
 func TestGenerateJobID(t *testing.T) {

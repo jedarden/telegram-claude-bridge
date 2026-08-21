@@ -1555,6 +1555,168 @@ func TestShellMock(t *testing.T) {
 	})
 }
 
+func TestEnsureSession_NewSessionFailure(t *testing.T) {
+	setupTmuxTest(t)
+	mockTmuxCommandResult(t, "has-session", "", 1)
+	mockTmuxCommandFailure(t, "new-session", "session exists", 1)
+
+	err := NewPTYManager().EnsureSession()
+	if err == nil {
+		t.Fatal("EnsureSession() error = nil, want new-session failure")
+	}
+	if !strings.Contains(err.Error(), "create tmux session") {
+		t.Errorf("EnsureSession() error = %q, want it to contain %q", err, "create tmux session")
+	}
+	if !strings.Contains(err.Error(), "session exists") {
+		t.Errorf("EnsureSession() error = %q, want it to contain tmux stderr", err)
+	}
+}
+
+// TestInjectPrompt covers the bracketed-paste injection sequence: the buffer
+// name derives from the pane target (colon → dash, so concurrent panes cannot
+// collide), the paste uses -p for bracketed-paste markers, and Enter is sent
+// through tmux rather than the slave PTY.
+func TestInjectPrompt(t *testing.T) {
+	tests := []struct {
+		name          string
+		paneTarget    string
+		prompt        string
+		failCommand   string
+		failStderr    string
+		wantErrSubstr string
+	}{
+		{
+			name:       "success",
+			paneTarget: "telegram-bridge:t100-10",
+			prompt:     "hello world",
+		},
+		{
+			name:          "set-buffer failure",
+			paneTarget:    "telegram-bridge:t100-10",
+			prompt:        "hello",
+			failCommand:   "set-buffer",
+			failStderr:    "buffer write failed",
+			wantErrSubstr: "set-buffer",
+		},
+		{
+			name:          "paste-buffer failure",
+			paneTarget:    "telegram-bridge:t100-10",
+			prompt:        "hello",
+			failCommand:   "paste-buffer",
+			failStderr:    "no such buffer",
+			wantErrSubstr: "paste-buffer",
+		},
+		{
+			name:          "send-keys failure",
+			paneTarget:    "telegram-bridge:t100-10",
+			prompt:        "hello",
+			failCommand:   "send-keys",
+			failStderr:    "can't find pane",
+			wantErrSubstr: "send-keys",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			state := setupTmuxTest(t)
+			if tc.failCommand != "" {
+				mockTmuxCommandFailure(t, tc.failCommand, tc.failStderr, 1)
+			}
+
+			err := NewPTYManager().InjectPrompt(tc.paneTarget, tc.prompt)
+			if tc.wantErrSubstr != "" {
+				if err == nil {
+					t.Fatalf("InjectPrompt(%q) error = nil, want failure", tc.paneTarget)
+				}
+				if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+					t.Errorf("InjectPrompt(%q) error = %q, want it to contain %q", tc.paneTarget, err, tc.wantErrSubstr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("InjectPrompt(%q) returned error: %v", tc.paneTarget, err)
+			}
+
+			bufName := "inj-" + strings.ReplaceAll(tc.paneTarget, ":", "-")
+			wantCalls := []string{
+				"set-buffer -b " + bufName + " " + tc.prompt,
+				"paste-buffer -t " + tc.paneTarget + " -b " + bufName + " -p",
+				"send-keys -t " + tc.paneTarget + " Enter",
+			}
+			gotCalls := state.tmuxCalls(t)
+			if len(gotCalls) != len(wantCalls) {
+				t.Fatalf("recorded %d tmux calls, want %d: %v", len(gotCalls), len(wantCalls), gotCalls)
+			}
+			for i, want := range wantCalls {
+				if gotCalls[i] != want {
+					t.Errorf("tmux call %d = %q, want %q", i, gotCalls[i], want)
+				}
+			}
+		})
+	}
+}
+
+// TestInjectPrompt_MultilinePrompt checks a multi-line prompt injects without
+// error. The call log cannot be asserted here (an embedded newline inside the
+// set-buffer argument breaks the mock's line-based recording), so the sequence
+// shape is pinned by TestInjectPrompt's single-line cases.
+func TestInjectPrompt_MultilinePrompt(t *testing.T) {
+	setupTmuxTest(t)
+
+	err := NewPTYManager().InjectPrompt("telegram-bridge:t100-10", "line one\nline two\nline three")
+	if err != nil {
+		t.Fatalf("InjectPrompt(multiline) returned error: %v", err)
+	}
+}
+
+func TestKillPane(t *testing.T) {
+	tests := []struct {
+		name       string
+		paneTarget string
+		failStderr string
+		wantErr    bool
+	}{
+		{
+			name:       "success",
+			paneTarget: "telegram-bridge:t100-10",
+		},
+		{
+			name:       "window missing",
+			paneTarget: "telegram-bridge:gone",
+			failStderr: "can't find window",
+			wantErr:    true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			state := setupTmuxTest(t)
+			if tc.failStderr != "" {
+				mockTmuxCommandFailure(t, "kill-window", tc.failStderr, 1)
+			}
+
+			err := NewPTYManager().KillPane(tc.paneTarget)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("KillPane(%q) error = nil, want failure", tc.paneTarget)
+				}
+				if !strings.Contains(err.Error(), "kill pane") || !strings.Contains(err.Error(), tc.failStderr) {
+					t.Errorf("KillPane(%q) error = %q, want it to contain %q and %q", tc.paneTarget, err, "kill pane", tc.failStderr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("KillPane(%q) returned error: %v", tc.paneTarget, err)
+			}
+
+			calls := state.tmuxCalls(t)
+			if len(calls) != 1 || calls[0] != "kill-window -t "+tc.paneTarget {
+				t.Errorf("tmux calls = %v, want single kill-window for %q", calls, tc.paneTarget)
+			}
+		})
+	}
+}
+
 func TestNewPTYManager(t *testing.T) {
 	pm := NewPTYManager()
 	if pm == nil {
