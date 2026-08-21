@@ -312,7 +312,7 @@ Workers do not get `--resume` (fresh session each time) and cannot call `spawn_w
 **Key CLI flags and PTY mechanics:**
 - Interactive mode (no `-p`) — claude runs in REPL mode, billing via subscription
 - `--resume <session_id>` — orchestrator only; restores full conversation context across pane restarts
-- `--append-system-prompt` — injects dispatcher context into orchestrator (see Phase 9)
+- `--append-system-prompt` — injects dispatcher context into orchestrator (see Phase 8)
 - `--disallowed-tools spawn_worker` — workers cannot recursively spawn
 - `--model` — per-session or per-worker model override
 - `--allowed-tools` / `--disallowed-tools` — tool restrictions per group
@@ -1402,6 +1402,77 @@ Workers complete asynchronously — results accumulate in `pendingWorkerResults`
 Some topics should remain in direct mode (no system prompt injection, no worker spawning). Add `/dispatch [on|off]` command to toggle `sessions.dispatcher_mode` per topic, overriding the group default.
 
 **Deliverable:** Bridge is a true dispatcher. Orchestrator Claude instances coordinate worker instances. User sees real-time progress updates and individual worker results as they complete, followed by a synthesised final response.
+
+---
+
+## Phase 9: Worker Lifecycle Hardening — COMPLETE (2026-08-21)
+
+### Purpose
+
+Survive bridge crashes without leaking tmux panes, Claude processes, or worker capacity. Tracked by genesis bead `telegram-d580c374`; the driving incident and gap analysis are in `notes/bf-1j7a.md`.
+
+### Background
+
+On 2026-07-06 the bridge crash-looped 55×: the systemd watchdog killed it on transient downstream-health failures, and every claude tmux pane (session or `spawn_worker`) alive at process death was orphaned permanently. tmux escapes the unit's cgroup (confirmed via `cgroup.procs`), in-memory idle-kill timers are lost on restart, and `cleanup.go` never called `KillPane`. `notes/bf-1j7a.md` item 4 ("Stale 'running' Workers After Crash", Critical) named the capacity side of the same failure: workers stuck in `status='running'` forever consume `max_workers` slots.
+
+- [x] 9.1: Decouple systemd watchdog liveness from downstream health checks
+- [x] 9.2: Startup tmux reconciliation (kill orphaned panes vs DB state)
+- [x] 9.3: cleanup.go becomes PTY-aware (KillPane on inactive sessions + stale running-worker sweep)
+
+### 9.1 — Decouple systemd watchdog liveness from downstream health checks — COMPLETE
+
+`internal/health/watchdog.go`: `Watchdog.ping()` notifies systemd only when the bridge's own `/livez` endpoint answers, and `/livez` deliberately checks nothing downstream (proxy, DB, claude CLI). A flapping proxy can no longer get the unit killed — the crash-loop trigger. Downstream health is still reported via `/health` and health events; it just isn't liveness. (commit `2575adf`, bead `telegram-47ddf6ec`)
+
+### 9.2 — Startup tmux reconciliation against DB state — COMPLETE
+
+The plan called for a one-shot startup pass killing panes with no live DB record. What landed is stronger: `SessionCleanup.sweepOrphanedPanes` (`internal/bridge/cleanup.go`) runs as the first step of every cleanup cycle — including the immediate run at startup — and reconciles tmux → DB, the reverse direction of the stale-worker sweep:
+
+- The live set is `ListRunningWorkers` + `ListActiveSessions` (`internal/bridge/state.go`); worker panes match by `w-{workerID[:8]}-` prefix, session panes by `t{absChatID}-{threadID}`.
+- Unmatched panes are reaped after `orphanPaneGracePeriod` (30 s). Worker pane names embed their UnixNano creation timestamp, so a pane leaked by a crash is reclaimable on the first cycle after restart; session pane names carry no timestamp, so their grace starts at first observation by this process.
+- `PTYManager.managedPanes` / `PaneManaged` protects transient panes this process intentionally owns but that have no DB row yet — the window between tmux window creation and the SQLite INSERT committing.
+
+(commits `761815a`, `4eac4f5`; bead `telegram-5e290366`)
+
+Historical note: `notes/bf-2qwv.md` documents a `ReconcileOrphans` implementation at `pty_manager.go` "lines 605-709" as already complete. That code never existed on `main` (`git log -S` finds no committed implementation — the note described an uncommitted working tree). The periodic sweep above is what actually shipped and supersedes the one-shot design.
+
+### 9.3 — PTY-aware cleanup: KillPane on inactive sessions + stale running-worker sweep — COMPLETE
+
+**KillPane in `SessionCleanup.MarkInactive`** (`cleanup.go`): the status update and pane kill happen inside one transaction — `UPDATE sessions SET status='inactive'`, then `ptyMgr.KillPane("telegram-bridge:t{absChatID}-{threadID}")`, then commit. A KillPane failure is logged and non-fatal; the pane is usually already dead, which is exactly the crash case. The production stale-session path is the equivalent inline sequence in `runCleanup` (7-day TTL): summary posted and stored → `SetSessionStatus("inactive")` → `KillPane` → topic color → optional topic close.
+
+**Stale worker sweep** (`sweepStaleWorkers`, `cleanup.go`): independent of the 7-day session TTL, on the same ticker. `ListStaleWorkers(ctx, workerTTL)` selects workers with `status='running'` and `started_at` older than the TTL; for each, the sweep finds the pane by `w-{workerID[:8]}-` prefix among live tmux windows, kills it, and force-fails the row with `error = "Force-failed: exceeded worker TTL after bridge restart or crash"`. Wired in `cmd/bridge/main.go` via `NewSessionCleanup(..., bridge.DefaultWorkerTTL)`; the first cycle runs immediately at startup, so a restart bounds a stale worker's lifetime at TTL + startup, not "forever".
+
+`DefaultWorkerTTL = 10 * time.Minute` (`cleanup.go`) is deliberately far below the session TTL: it is a crash-recovery ceiling, not a workload timeout — normal worker completion goes through the WorkerPool's own finish path.
+
+**How this closes the "Stale 'running' Workers After Crash" gap** (`notes/bf-1j7a.md` item 4, Critical): after a SIGKILL, worker rows previously stayed `running` forever, so `CountRunningWorkers` permanently consumed `max_workers` (eventually zero capacity), and their panes kept real claude processes alive outside the unit's cgroup. The sweep now transitions those rows to `failed` (capacity freed) and kills their panes (processes reaped) within one TTL of the crash; the 9.2 orphan sweep additionally reaps panes whose rows never existed or were already deleted.
+
+Landed incrementally: KillPane-on-inactive + sweep (`9c806da`; beads `telegram-a5616d11`, `telegram-b32bc8c4`, `telegram-2bd107da`), `DefaultWorkerTTL` naming (`a4c6b64`), orphan-pane sweep (`761815a`), `ListStaleSessions` scan fix (`d6f0fd2`), full-cycle and sweep tests (`7b5b305`; bead `telegram-075211ac`).
+
+### Decision record
+
+No separate ADR was created. The Phase 9 beads reference "ADR 0001 in `docs/adr/`", but that directory and document were never created — the decision record is this section, genesis bead `telegram-d580c374`, and `notes/bf-1j7a.md`. (plan.md's existing ADR-001, the 2026-07-20 self-update deploy worktree, is an unrelated decision that took the 0001 slot in this file.)
+
+### Retrospective
+
+What worked:
+
+- Two complementary sweep directions with the DB as the authority — DB→tmux (`sweepStaleWorkers`) for stale rows, tmux→DB (`sweepOrphanedPanes`) for orphan panes — each backstops the other's blind spot, so neither a lost row nor a lost pane survives a cycle.
+- Grace period + `managedPanes` tracking, so the reaper never races pane creation against INSERT commit.
+- Worker pane names embedding their creation timestamp — old worker panes age out with no first-seen state to maintain.
+- Non-fatal, idempotent KillPane — "pane may already be dead" is the normal post-crash case, not an error worth failing a transaction over.
+
+What didn't:
+
+- **The sweep shipped dead and nobody noticed.** Migrations 21 and 23 added `topic_name` and `last_from_user_id` to `sessions`; every other session SELECT was updated to scan 18 columns, `ListStaleSessions` still selected 16. Every call failed with `sql: expected 16 destination arguments in Scan, not 18`, `runCleanup` logged the error and returned, and cleanup did nothing — indistinguishable from "nothing stale" unless you read the logs. It surfaced only when `7b5b305` wrote the first full-cycle test (`d6f0fd2` fixed it). Lesson: fail-by-early-return cleanup needs an end-to-end cycle test; unit tests of the helpers cannot see a broken query.
+- **A completion claim verified against a working tree, not `main`.** The bf-2qwv note asserted 9.2 was "already fully implemented" based on code that existed only locally and was never committed. Lesson: verify "already done" against committed history.
+- Worker-pane prefix matching is coarse: worker IDs are `worker_{threadID}_{nanotime}`, so the 8-char prefix mostly encodes the thread's leading digits, and panes of workers from different threads can share a prefix. Harmless in effect — every prefix-matched pane in a sweep belongs to a stale worker and dies that cycle — but exact matching would be cleaner.
+
+### Residual limitations (resolved out of 9.3, non-blocking)
+
+- `MarkInactive` has no production caller — `runCleanup` inlines the equivalent sequence. Either route the stale-session loop through it or drop the helper; until then it is test-only surface.
+- `DefaultWorkerTTL` is a compile-time constant, not per-group config like the session TTL. Correct for a crash-recovery ceiling; revisit only if a real workload needs workers legitimately running longer than 10 minutes across a bridge restart.
+- Pane matching could use full worker IDs (pane names would need to carry them) instead of 8-char prefixes.
+
+**Deliverable:** Crashes no longer leak panes, processes, or worker capacity; cleanup is PTY-aware in both directions.
 
 ---
 
