@@ -435,39 +435,44 @@ func TestImageFileAccessErrors(t *testing.T) {
 // TestProcessPhoto_Success tests the full processPhoto flow with mocked downloads.
 func TestProcessPhoto_Success(t *testing.T) {
 	tests := []struct {
-		name        string
-		chatID      int64
-		messageID   int64
-		imageData   []byte
-		description string
+		name         string
+		chatID       int64
+		messageID    int64
+		imageData    []byte
+		outputFormat string
+		description  string
 	}{
 		{
-			name:        "JPEG photo downloaded and processed",
-			chatID:      12345,
-			messageID:   67890,
-			imageData:   createTestJPEG(t, 400, 300),
-			description: "JPEG should be downloaded, saved, and optionally resized",
+			name:         "JPEG photo downloaded and processed",
+			chatID:       12345,
+			messageID:    67890,
+			imageData:    createTestJPEG(t, 400, 300),
+			outputFormat: "jpeg",
+			description:  "JPEG should be downloaded, saved, and optionally resized",
 		},
 		{
-			name:        "PNG photo downloaded and processed",
-			chatID:      98765,
-			messageID:   43210,
-			imageData:   createTestPNG(t, 400, 300),
-			description: "PNG should be downloaded, saved, and output as JPEG",
+			name:         "PNG photo downloaded and processed",
+			chatID:       98765,
+			messageID:    43210,
+			imageData:    createTestPNG(t, 400, 300),
+			outputFormat: "png",
+			description:  "In-bounds PNG should be downloaded without re-encoding",
 		},
 		{
-			name:        "large JPEG resized during processing",
-			chatID:      11111,
-			messageID:   22222,
-			imageData:   createTestJPEG(t, 1600, 1200),
-			description: "Large JPEG should be downloaded and resized",
+			name:         "large JPEG resized during processing",
+			chatID:       11111,
+			messageID:    22222,
+			imageData:    createTestJPEG(t, 1600, 1200),
+			outputFormat: "jpeg",
+			description:  "Large JPEG should be downloaded and resized",
 		},
 		{
-			name:        "small JPEG not resized",
-			chatID:      55555,
-			messageID:   66666,
-			imageData:   createTestJPEG(t, 200, 150),
-			description: "Small JPEG should be downloaded but not resized",
+			name:         "small JPEG not resized",
+			chatID:       55555,
+			messageID:    66666,
+			imageData:    createTestJPEG(t, 200, 150),
+			outputFormat: "jpeg",
+			description:  "Small JPEG should be downloaded but not resized",
 		},
 	}
 
@@ -505,15 +510,14 @@ func TestProcessPhoto_Success(t *testing.T) {
 			expectedPath := filepath.Join(expectedDir, fmt.Sprintf("%d.jpg", tt.messageID))
 			assert.Equal(t, expectedPath, resultPath, "output path should match expected structure")
 
-			// Verify the output is a valid JPEG
+			// Files within the size limit are preserved; resized files are JPEG.
 			data, err := os.ReadFile(resultPath)
 			require.NoError(t, err, "should be able to read output file")
-			require.True(t, len(data) >= 2, "file should have at least JPEG header")
-			assert.Equal(t, []byte{0xFF, 0xD8}, data[:2], "output should be JPEG format")
 
 			// Verify dimensions are within bounds
-			cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+			cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
 			require.NoError(t, err, "output should be decodable")
+			assert.Equal(t, tt.outputFormat, format, "output format should match resize behavior")
 			assert.LessOrEqual(t, cfg.Width, imageMaxDim, "width should be within bounds")
 			assert.LessOrEqual(t, cfg.Height, imageMaxDim, "height should be within bounds")
 
@@ -563,7 +567,7 @@ func TestProcessPhoto_ErrorPaths(t *testing.T) {
 
 		resultPath, err := sm.processPhoto(context.Background(), chatID, messageID, fileID)
 		assert.Error(t, err, "download failure should fail")
-		assert.Contains(t, err.Error(), "download", "error should mention download")
+		assert.Contains(t, err.Error(), "status 500", "error should preserve the download status")
 		assert.Empty(t, resultPath, "no path on error")
 	})
 
