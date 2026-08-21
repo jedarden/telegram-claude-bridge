@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1381,48 +1383,129 @@ func TestProcessAudio_NilMimeType(t *testing.T) {
 
 // ── startTyping Goroutine Tests ────────────────────────────────────────────
 
+// typingRecorder captures every /send_chat_action payload a test server
+// receives, safely across handler goroutines.
+type typingRecorder struct {
+	mu       sync.Mutex
+	payloads []contract.ChatActionRequest
+}
+
+func (r *typingRecorder) add(req contract.ChatActionRequest) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.payloads = append(r.payloads, req)
+}
+
+func (r *typingRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.payloads)
+}
+
+func (r *typingRecorder) last() contract.ChatActionRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.payloads[len(r.payloads)-1]
+}
+
+// newTypingCountServer starts a test server that records /send_chat_action
+// requests and returns it together with its recorder.
+func newTypingCountServer(t *testing.T) (*httptest.Server, *typingRecorder) {
+	t.Helper()
+
+	rec := &typingRecorder{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/send_chat_action") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var req contract.ChatActionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		rec.add(req)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	return server, rec
+}
+
+// newTypingSessionManager returns a SessionManager whose sender posts to the
+// given server. startTyping only touches m.sender, so no db or proxy wiring
+// is needed.
+func newTypingSessionManager(t *testing.T, server *httptest.Server) *SessionManager {
+	t.Helper()
+
+	sender, err := NewSender(server.URL, filepath.Join(t.TempDir(), "sender.db"))
+	require.NoError(t, err, "failed to create sender")
+	t.Cleanup(func() { sender.Close() })
+
+	return &SessionManager{sender: sender}
+}
+
 func TestStartTyping(t *testing.T) {
-	// Test the startTyping goroutine behavior
+	// The first indicator fires synchronously before startTyping returns;
+	// subsequent ones come from the goroutine's 4-second ticker, which is too
+	// slow to wait for here — the stop subtests assert the ticker never fires
+	// within the test window instead.
 
-	t.Run("typing interval is 4 seconds", func(t *testing.T) {
-		// Verify the typing indicator fires at the expected interval
-		// The ticker is set to 4 seconds in the implementation
-		interval := 4 * time.Second
-		if interval != 4*time.Second {
-			t.Errorf("typing interval: got %v, want 4s", interval)
-		}
+	t.Run("sends typing indicator immediately", func(t *testing.T) {
+		server, rec := newTypingCountServer(t)
+		sm := newTypingSessionManager(t, server)
+
+		tid := int64(42)
+		stop := sm.startTyping(context.Background(), 12345, &tid)
+		defer stop()
+
+		require.Equal(t, 1, rec.count(), "first indicator should fire before startTyping returns")
+		got := rec.last()
+		assert.Equal(t, int64(12345), got.ChatID, "chat ID should be passed through")
+		require.NotNil(t, got.ThreadID, "thread ID should be passed through")
+		assert.Equal(t, int64(42), *got.ThreadID, "thread ID should be passed through")
+		assert.Equal(t, "typing", got.Action, "action should be typing")
 	})
 
-	t.Run("stop function closes channel", func(t *testing.T) {
-		// Test that the stop function properly closes the stop channel
-		stop := make(chan struct{})
-		close(stop)
+	t.Run("nil thread ID passes through as nil", func(t *testing.T) {
+		server, rec := newTypingCountServer(t)
+		sm := newTypingSessionManager(t, server)
 
-		select {
-		case <-stop:
-			// Expected - channel is closed
-		default:
-			t.Error("stop channel should be closed")
-		}
+		stop := sm.startTyping(context.Background(), 12345, nil)
+		defer stop()
+
+		require.Equal(t, 1, rec.count(), "first indicator should fire before startTyping returns")
+		assert.Nil(t, rec.last().ThreadID, "thread ID should stay nil")
 	})
 
-	t.Run("stop function is idempotent", func(t *testing.T) {
-		// Test that calling stop multiple times is safe
-		stop := make(chan struct{})
-		close(stop)
+	t.Run("stop is idempotent and prevents further indicators", func(t *testing.T) {
+		server, rec := newTypingCountServer(t)
+		sm := newTypingSessionManager(t, server)
 
-		// Calling close again should not panic
-		defer func() {
-			if r := recover(); r != nil {
-				t.Errorf("panic on double close: %v", r)
-			}
-		}()
+		stop := sm.startTyping(context.Background(), 12345, nil)
+		require.Equal(t, 1, rec.count(), "first indicator should have fired")
 
-		select {
-		case <-stop:
-			// Expected - channel is already closed
-		default:
-			t.Error("stop channel should be closed")
-		}
+		stop()
+		stop() // second call must take the already-stopped branch, not panic
+
+		// The ticker would only fire after 4s; within this window no
+		// additional indicator may appear once stopped.
+		time.Sleep(100 * time.Millisecond)
+		assert.Equal(t, 1, rec.count(), "no further indicators after stop")
+	})
+
+	t.Run("context cancellation stops the goroutine", func(t *testing.T) {
+		server, rec := newTypingCountServer(t)
+		sm := newTypingSessionManager(t, server)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		stop := sm.startTyping(ctx, 12345, nil)
+		require.Equal(t, 1, rec.count(), "first indicator should have fired")
+
+		cancel()
+		stop() // must not block or panic after cancellation
+
+		time.Sleep(50 * time.Millisecond)
+		assert.Equal(t, 1, rec.count(), "no further indicators after context cancellation")
 	})
 }
