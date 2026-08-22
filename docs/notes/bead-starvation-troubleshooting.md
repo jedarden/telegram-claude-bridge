@@ -52,8 +52,7 @@ legitimately empty" from "bound to the wrong store entirely". Timeline:
 
 | Date | Event |
 |---|---|
-| 2026-08-14 | Three alert beads created (`0acc2877`, `481450e8`, `104df728`). Store state at the time: this repo 138 beads / 11 open; `/home/coding/.beads/beads.db` existed with **0 beads** |
-| 2026-08-16 | Fourth alert (`fd5fc508`, "Open: 10, in-progress: 0") — this one remained open as the tracking bead for the investigation |
+| 2026-08-14 | All four alert beads created in one burst at 16:52:30–32 UTC, immediately after the bead-rs workspace init (`0acc2877` 16:52:30.876, `fd5fc508` 16:52:30.898, `481450e8` 16:52:31.316, `104df728` 16:52:32.166 — per checkpoint `created_at`; corrected 2026-08-22, an earlier revision of this table dated `fd5fc508` to 08-16). Store state at the time: 113 beads / 10 open per the alert bodies; `/home/coding/.beads/beads.db` existed with **0 beads**. `fd5fc508` remained open as the tracking bead for the investigation |
 | 2026-08-21 | Investigation beads close the loop: workspace-resolution mechanics documented, bead-db census taken, live worker verified bound correctly, ancestor trap confirmed defused |
 | 2026-08-22 | Post-fix verification: discovery/claim fully functional; remaining "empty frontier" observations are legitimate dependency chains |
 
