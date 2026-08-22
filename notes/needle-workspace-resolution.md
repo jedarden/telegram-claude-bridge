@@ -95,6 +95,18 @@ is absent, bead-rs silently climbs** — e.g. a workspace resolved to
 `/home/coding` (or any directory under it without its own store) binds
 `/home/coding/.beads` whenever that store exists.
 
+> **Update 2026-08-22 — the silent climb is gone (bead-rs R030).** The
+> behavior described above was accurate when this doc was written (verified
+> against source the morning of 2026-08-21); commit `2440b90` (R030, later
+> that day) changed `WorkspaceConfig::probe` to **stop at the first `.beads`
+> directory on the walk and fail** if it lacks `config.json`
+> (`foreign_workspace_message`, "discovery does not continue past the first
+> .beads directory"), rather than climbing past it. A mis-resolved process now
+> gets a loud "not a bead-rs workspace" error instead of silently binding an
+> ancestor store. The trap this doc describes is therefore historical; the
+> operational summary and triage runbook now live in
+> `docs/notes/bead-starvation-troubleshooting.md`.
+
 ## The asymmetry — where mismatches come from
 
 Needle's own `.beads` logic points **down / exact**, bead-rs's points **up**:
