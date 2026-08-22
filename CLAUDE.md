@@ -383,13 +383,32 @@ Version info injected via ldflags at build time.
 
 ## CI/CD
 
-No CI is configured. GitHub Actions are disabled (`.github/workflows/ci.yml.disabled`). All testing is local.
+GitHub Actions are disabled (`.github/workflows/ci.yml.disabled`). CI runs on
+**Argo Workflows in iad-ci** via the `telegram-claude-bridge-build`
+WorkflowTemplate (`declarative-config/k8s/iad-ci/argo-workflows/telegram-claude-bridge-workflowtemplate.yml`),
+triggered by pushes to `main`:
+
+1. `resolve-version` — bumps `VERSION` (patch) and pushes, unless the last
+   commit already touched it
+2. `go-test` — `go vet ./...` + `go test ./...` against a fresh clone
+3. `docker-build` / `docker-build-dashboard` — kaniko pushes
+   `ronaldraygun/telegram-claude-bridge:<version>` and
+   `ronaldraygun/telegram-claude-bridge-dashboard:<version>` to Docker Hub
+4. `update-declarative-config` — bumps the image tags in declarative-config;
+   ArgoCD then rolls the deployment
+
+Note: CI clones from Forgejo (`git.ardenone.com`) and must authenticate with
+the Forgejo token (`forgejo-webhook-token`), not the GitHub webhook token —
+git ≥ 2.45 sends credential-helper values proactively, so a GitHub token
+fails the clone with exit 128 even though this repo is public (fixed
+2026-08-22 after every build had died in `go-test` since the golang image
+picked up git 2.54).
 
 ## Deployment Architecture
 
-The project uses **Docker + systemd**, not Kubernetes:
-
-- **Proxy**: Docker container (scratch-based, ~5 MB)
+- **Proxy**: Kubernetes Deployment (`telegram-proxy`) in namespace
+  `telegram-bridge` on ardenone-cluster, from the CI-built Docker Hub image;
+  manifests in `declarative-config/k8s/ardenone-cluster/telegram-bridge/`
 - **Bridge**: systemd service on bare metal (needs tmux, claude CLI, whisper)
 - **Dashboard**: Optional TUI, runs standalone
 
