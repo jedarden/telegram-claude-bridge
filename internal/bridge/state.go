@@ -1161,6 +1161,34 @@ func (d *DB) GetSessionParticipants(ctx context.Context, chatID, threadID int64)
 	return users, rows.Err()
 }
 
+// ── budget_alerts ─────────────────────────────────────────────────────────────
+
+// ShouldSendBudgetAlert atomically claims the one-time alert for a group at the
+// given threshold (80 or 100). It returns true exactly once per
+// (chat_id, threshold) — concurrent topics recording cost events cannot both
+// win the claim — until ClearBudgetAlerts re-arms the group.
+func (d *DB) ShouldSendBudgetAlert(ctx context.Context, chatID int64, threshold int) (bool, error) {
+	res, err := d.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO budget_alerts (chat_id, threshold) VALUES (?, ?)`,
+		chatID, threshold)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// ClearBudgetAlerts re-arms threshold alerts for a group. Called when the
+// budget changes so the new budget's 80%/100% crossings alert again.
+func (d *DB) ClearBudgetAlerts(ctx context.Context, chatID int64) error {
+	_, err := d.db.ExecContext(ctx,
+		`DELETE FROM budget_alerts WHERE chat_id = ?`, chatID)
+	return err
+}
+
 // GetSessionUserCosts returns cost breakdown by user for a session.
 func (d *DB) GetSessionUserCosts(ctx context.Context, chatID, threadID int64) ([]*UserCostSummary, error) {
 	rows, err := d.db.QueryContext(ctx,

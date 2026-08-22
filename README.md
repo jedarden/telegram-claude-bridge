@@ -161,7 +161,7 @@ The proxy runs as a Docker container and has no host-level dependencies beyond a
 | `/dispatch [on\|off\|default]` | Toggle orchestrator mode |
 | `/timeout [N]` | Set per-topic timeout in seconds (`0` = use group default) |
 | `/cost` | Show cost breakdown (group total / daily trend / per-topic / per-user) |
-| `/budget [amount]` | View or set the group budget |
+| `/budget [amount]` | View or set the group budget (one-time alerts are pushed to the topic at 80% and 100% usage; changing the budget re-arms them) |
 | `/parallel <prompts>` | Run up to 5 prompts in parallel (separate with `---` on its own line) |
 | `/bg <command>` | Run a shell command in the background and stream output to the topic |
 | `/jobs` | List background jobs |

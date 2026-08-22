@@ -1700,6 +1700,12 @@ func (h *CommandHandler) cmdBudget(ctx context.Context, update contract.Update, 
 		return "", fmt.Errorf("save budget: %w", err)
 	}
 
+	// Re-arm threshold alerts so the new budget's 80%/100% crossings
+	// notify again.
+	if err := h.db.ClearBudgetAlerts(ctx, update.ChatID); err != nil {
+		return "", fmt.Errorf("reset budget alerts: %w", err)
+	}
+
 	return fmt.Sprintf("Budget updated to: $%.2f", newBudget), nil
 }
 

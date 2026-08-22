@@ -630,3 +630,71 @@ func TestDB_FilePersistedOnDisk(t *testing.T) {
 		t.Error("data not persisted across close/reopen")
 	}
 }
+
+// ── budget_alerts ─────────────────────────────────────────────────────────────
+
+func TestShouldSendBudgetAlert_OneTimePerThreshold(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	for _, thr := range []int{80, 100} {
+		first, err := db.ShouldSendBudgetAlert(ctx, 100, thr)
+		if err != nil {
+			t.Fatalf("first claim at %d%%: %v", thr, err)
+		}
+		if !first {
+			t.Errorf("threshold %d: first claim should return true", thr)
+		}
+		again, err := db.ShouldSendBudgetAlert(ctx, 100, thr)
+		if err != nil {
+			t.Fatalf("second claim at %d%%: %v", thr, err)
+		}
+		if again {
+			t.Errorf("threshold %d: second claim should return false", thr)
+		}
+	}
+
+	// Claims are per-group: another chat claims its own alerts independently.
+	first, err := db.ShouldSendBudgetAlert(ctx, 200, 80)
+	if err != nil {
+		t.Fatalf("other group claim: %v", err)
+	}
+	if !first {
+		t.Error("other group should claim its 80% alert independently")
+	}
+}
+
+func TestClearBudgetAlerts_Rearms(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if _, err := db.ShouldSendBudgetAlert(ctx, 100, 80); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if err := db.ClearBudgetAlerts(ctx, 100); err != nil {
+		t.Fatalf("ClearBudgetAlerts: %v", err)
+	}
+
+	first, err := db.ShouldSendBudgetAlert(ctx, 100, 80)
+	if err != nil {
+		t.Fatalf("claim after clear: %v", err)
+	}
+	if !first {
+		t.Error("clear should re-arm the threshold alert")
+	}
+
+	// Clearing only touches the named group.
+	if _, err := db.ShouldSendBudgetAlert(ctx, 100, 80); err != nil {
+		t.Fatalf("re-claim: %v", err)
+	}
+	if err := db.ClearBudgetAlerts(ctx, 300); err != nil {
+		t.Fatalf("ClearBudgetAlerts other group: %v", err)
+	}
+	again, err := db.ShouldSendBudgetAlert(ctx, 100, 80)
+	if err != nil {
+		t.Fatalf("claim after unrelated clear: %v", err)
+	}
+	if again {
+		t.Error("clearing another group must not re-arm this group's alert")
+	}
+}

@@ -1853,6 +1853,7 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 			log.Printf("[session_mgr] record cost event (%d,%d): %v", key.chatID, key.threadID, err)
 			// Non-fatal: continue anyway
 		}
+		m.maybeSendBudgetAlert(ctx, key.chatID, key.threadID, group)
 
 		// Publish cost recorded event
 		if m.eventPublisher != nil && out.TotalCostUSD > 0 {
@@ -1921,6 +1922,7 @@ func (m *SessionManager) persistSession(ctx context.Context, key topicKey, exist
 		log.Printf("[session_mgr] record cost event (%d,%d): %v", key.chatID, key.threadID, err)
 		// Non-fatal: continue anyway
 	}
+	m.maybeSendBudgetAlert(ctx, key.chatID, key.threadID, group)
 
 	// Publish cost recorded event
 	if m.eventPublisher != nil && out.TotalCostUSD > 0 {
@@ -2785,7 +2787,8 @@ func (m *SessionManager) updateTopicColor(ctx context.Context, chatID, threadID 
 }
 
 // checkBudgetEnforcement checks if the group has exceeded its budget.
-// Returns an error if the budget is exceeded (100%+) or a warning if approaching (80%+).
+// Returns an error if the budget is exceeded (100%+); approaching the limit
+// (80%+) is reported by maybeSendBudgetAlert instead, once per crossing.
 func (m *SessionManager) checkBudgetEnforcement(ctx context.Context, chatID int64, group *Group) error {
 	if group.MaxBudget <= 0 {
 		return nil // No budget configured
@@ -2804,15 +2807,61 @@ func (m *SessionManager) checkBudgetEnforcement(ctx context.Context, chatID int6
 			currentCost, group.MaxBudget)
 	}
 
-	if budgetPercent >= 80 {
-		// Send a warning but allow the request to proceed
-		tidPtr := (*int64)(nil) // General topic (no thread)
-		_ = m.sender.SendResponse(ctx, chatID, tidPtr, 0,
-			fmt.Sprintf("⚠️ Warning: Approaching budget limit ($%.2f / $%.2f = %.1f%% used). Consider increasing via /budget.",
-				currentCost, group.MaxBudget, budgetPercent))
+	return nil
+}
+
+// maybeSendBudgetAlert pushes a one-time notification the first time a group's
+// cumulative cost crosses 80% of its budget, and again when it crosses 100%.
+// Called after each cost event is recorded, so a runaway topic (e.g. a long
+// /parallel or /dispatch session) surfaces without anyone having to run /cost.
+//
+// Alert state is claimed atomically in the budget_alerts table: repeated cost
+// events — from this topic or any other — never send more than one message per
+// threshold. Alerts go to the topic that recorded the crossing cost event.
+func (m *SessionManager) maybeSendBudgetAlert(ctx context.Context, chatID, threadID int64, group *Group) {
+	if group == nil || group.MaxBudget <= 0 {
+		return // No budget configured
 	}
 
-	return nil
+	total, err := m.db.GetGroupTotalCost(ctx, chatID)
+	if err != nil {
+		log.Printf("[session_mgr] get group cost for budget alert: %v", err)
+		return
+	}
+
+	budgetPercent := (total / group.MaxBudget) * 100
+	if budgetPercent < 80 {
+		return
+	}
+
+	tid := threadID
+	if budgetPercent >= 100 {
+		// Already exceeded — skip the 80% warning and alert at 100% only.
+		first, err := m.db.ShouldSendBudgetAlert(ctx, chatID, 100)
+		if err != nil {
+			log.Printf("[session_mgr] claim 100%% budget alert (%d): %v", chatID, err)
+			return
+		}
+		if !first {
+			return
+		}
+		_ = m.sender.SendResponse(ctx, chatID, &tid, 0,
+			fmt.Sprintf("🔴 Budget exceeded: $%.2f of $%.2f (%.1f%% used). Further requests will be blocked until the budget is raised via /budget.",
+				total, group.MaxBudget, budgetPercent))
+		return
+	}
+
+	first, err := m.db.ShouldSendBudgetAlert(ctx, chatID, 80)
+	if err != nil {
+		log.Printf("[session_mgr] claim 80%% budget alert (%d): %v", chatID, err)
+		return
+	}
+	if !first {
+		return
+	}
+	_ = m.sender.SendResponse(ctx, chatID, &tid, 0,
+		fmt.Sprintf("⚠️ Approaching budget limit: $%.2f of $%.2f (%.1f%% used). Consider raising it via /budget.",
+			total, group.MaxBudget, budgetPercent))
 }
 
 // isBlockedError returns true if the error message indicates Claude is waiting
