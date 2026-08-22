@@ -111,6 +111,12 @@ type BridgeConfig struct {
 	// CanaryIntervalMinutes is how often to run the canary test.
 	// Default: 0 (run once at startup only).
 	CanaryIntervalMinutes int
+
+	// HealthAddr is the bind address of the localhost health/metrics HTTP
+	// server. Default: "127.0.0.1:9091". Point it at a Tailscale interface
+	// (or "0.0.0.0:9091") to allow external scraping of /metrics — /health
+	// and /livez remain restricted to localhost-originated requests.
+	HealthAddr string
 }
 
 // fetchOpenBaoSecret retrieves a secret from OpenBao's KV v2 store.
@@ -332,6 +338,11 @@ func LoadBridgeConfig() (*BridgeConfig, error) {
 	}
 
 	cfg.EventSocketPath = envOrDefault("EVENT_SOCKET_PATH", "/tmp/telegram-bridge-events.sock")
+
+	// Health/metrics server bind address. Default keeps it host-local; a
+	// non-loopback bind exposes the read-only /metrics endpoint to external
+	// scrapers (e.g. FABRIC over Tailscale).
+	cfg.HealthAddr = envOrDefault("HEALTH_ADDR", "127.0.0.1:9091")
 
 	// Global max workers configuration. MAX_GLOBAL_WORKERS is the canonical
 	// name; accept the former GLOBAL_MAX_WORKERS name for compatibility with

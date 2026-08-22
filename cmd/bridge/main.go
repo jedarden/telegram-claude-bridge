@@ -49,6 +49,7 @@ func main() {
 
 	// Initialize health checker with structured JSON logging
 	checker := health.NewChecker(cfg.ProxyURL, db.SqlDB())
+	checker.SetBuildInfo(Version, CommitSHA)
 
 	// Release close claims stranded by a previous process that died while
 	// generating a close summary; without this those sessions could never
@@ -131,15 +132,16 @@ func main() {
 	router.OnService = serviceHandler.Handle
 	router.OnCallback = callbackHandler.Handle
 
-	// Start health server on localhost:9091
-	healthAddr := "127.0.0.1:9091"
-	healthServer := health.NewServer(healthAddr, checker)
+	// Start health server (bind address configurable via HEALTH_ADDR for
+	// external /metrics scraping; /health and /livez stay localhost-only)
+	healthServer := health.NewServer(cfg.HealthAddr, checker)
+	healthServer.SetMetricsProvider(db)
 	healthServer.Start()
 
 	// Perform startup health check if this is a post-update startup
 	// This verifies the new binary is healthy before we mark it as ready
 	// If health checks fail, it will roll back to the previous binary and exit
-	if err := updater.CheckStartupHealth(cfg.RepoPath, cfg.BinaryPath); err != nil {
+	if err := updater.CheckStartupHealth(cfg.RepoPath, cfg.BinaryPath, db, "http://"+cfg.HealthAddr); err != nil {
 		// Health check failed and rollback was initiated
 		// This function will not return if rollback succeeds (it execs the old binary)
 		// If we reach here, rollback itself failed - log and exit
@@ -148,7 +150,7 @@ func main() {
 	}
 
 	// Start systemd watchdog
-	watchdog := health.NewWatchdog(checker, "http://"+healthAddr)
+	watchdog := health.NewWatchdog(checker, "http://"+cfg.HealthAddr)
 	watchdog.Start(ctx)
 
 	// Run canary test if enabled (default: true)

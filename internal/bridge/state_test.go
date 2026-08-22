@@ -698,3 +698,101 @@ func TestClearBudgetAlerts_Rearms(t *testing.T) {
 		t.Error("clearing another group must not re-arm this group's alert")
 	}
 }
+
+func TestUpdateHistory_RecordAndGetLast(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if s, err := db.GetLastUpdateSuccess(ctx); err != nil {
+		t.Fatalf("GetLastUpdateSuccess on empty table: %v", err)
+	} else if s != nil {
+		t.Errorf("GetLastUpdateSuccess on empty table = %+v, want nil", s)
+	}
+
+	if at, ok, err := db.LastUpdateSuccessAt(ctx); err != nil || ok || !at.IsZero() {
+		t.Errorf("LastUpdateSuccessAt on empty table = (%v, %v, %v), want zero/false/nil", at, ok, err)
+	}
+
+	first := &UpdateSuccess{
+		FromCommit: "aaa", ToCommit: "bbb",
+		AppliedAt: time.Now().UTC().Add(-2 * time.Hour),
+	}
+	first.VerifiedAt = first.AppliedAt.Add(time.Minute)
+	if err := db.RecordUpdateSuccess(ctx, first); err != nil {
+		t.Fatalf("RecordUpdateSuccess: %v", err)
+	}
+
+	second := &UpdateSuccess{
+		FromCommit: "bbb", ToCommit: "ccc",
+		AppliedAt: time.Now().UTC().Add(-1 * time.Hour),
+	}
+	second.VerifiedAt = second.AppliedAt.Add(time.Minute)
+	if err := db.RecordUpdateSuccess(ctx, second); err != nil {
+		t.Fatalf("RecordUpdateSuccess: %v", err)
+	}
+
+	got, err := db.GetLastUpdateSuccess(ctx)
+	if err != nil {
+		t.Fatalf("GetLastUpdateSuccess: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected recorded update, got nil")
+	}
+	if got.FromCommit != "bbb" || got.ToCommit != "ccc" {
+		t.Errorf("last update = %s -> %s, want bbb -> ccc", got.FromCommit, got.ToCommit)
+	}
+	wantVerified := second.VerifiedAt.Truncate(time.Second)
+	if !got.VerifiedAt.Equal(wantVerified) {
+		t.Errorf("VerifiedAt = %v, want %v", got.VerifiedAt, wantVerified)
+	}
+
+	if at, ok, err := db.LastUpdateSuccessAt(ctx); err != nil || !ok || !at.Equal(wantVerified) {
+		t.Errorf("LastUpdateSuccessAt = (%v, %v, %v), want (%v, true, nil)", at, ok, err, wantVerified)
+	}
+}
+
+func TestCountActiveSessions(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	setupGroupAndSession(t, db, 100, 10)
+	setupGroupAndSession(t, db, 100, 20)
+	setupGroupAndSession(t, db, 100, 30)
+
+	// Mark two of the three sessions inactive.
+	if _, err := db.db.ExecContext(ctx,
+		`UPDATE sessions SET status = 'inactive' WHERE thread_id IN (20, 30)`); err != nil {
+		t.Fatalf("mark inactive: %v", err)
+	}
+
+	n, err := db.CountActiveSessions(ctx)
+	if err != nil {
+		t.Fatalf("CountActiveSessions: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("CountActiveSessions = %d, want 1", n)
+	}
+}
+
+func TestTodayTotalCostUSD(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	events := []CostEvent{
+		{ChatID: 100, ThreadID: 10, CostUSD: 1.25, Model: "claude-sonnet-4-6"},              // today (default CreatedAt)
+		{ChatID: 100, ThreadID: 10, CostUSD: 2.50, Model: "claude-sonnet-4-6",
+			CreatedAt: time.Now().UTC().Add(-48 * time.Hour)}, // two days ago
+	}
+	for i := range events {
+		if err := db.RecordCostEvent(ctx, &events[i]); err != nil {
+			t.Fatalf("RecordCostEvent: %v", err)
+		}
+	}
+
+	total, err := db.TodayTotalCostUSD(ctx)
+	if err != nil {
+		t.Fatalf("TodayTotalCostUSD: %v", err)
+	}
+	if total != 1.25 {
+		t.Errorf("TodayTotalCostUSD = %v, want 1.25", total)
+	}
+}

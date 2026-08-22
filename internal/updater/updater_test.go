@@ -1345,7 +1345,7 @@ func TestCheckStartupHealth(t *testing.T) {
 
 		os.Unsetenv(envUpdatedFromCommit)
 
-		if err := CheckStartupHealth(tempDir, "bridge"); err != nil {
+		if err := CheckStartupHealth(tempDir, "bridge", nil, ""); err != nil {
 			t.Errorf("CheckStartupHealth() should return nil when not updating, got: %v", err)
 		}
 	})
@@ -1360,7 +1360,7 @@ func TestCheckStartupHealth(t *testing.T) {
 			t.Fatalf("failed to write marker: %v", err)
 		}
 
-		if err := CheckStartupHealth(tempDir, "bridge"); err != nil {
+		if err := CheckStartupHealth(tempDir, "bridge", nil, ""); err != nil {
 			t.Errorf("CheckStartupHealth() should return nil when no backup exists, got: %v", err)
 		}
 
@@ -1393,7 +1393,7 @@ func TestCheckStartupHealth(t *testing.T) {
 		live := true
 		serveLiveness(t, &live)
 
-		if err := CheckStartupHealth(tempDir, "bridge"); err != nil {
+		if err := CheckStartupHealth(tempDir, "bridge", nil, ""); err != nil {
 			t.Fatalf("CheckStartupHealth() should return nil on healthy update, got: %v", err)
 		}
 
@@ -1411,6 +1411,51 @@ func TestCheckStartupHealth(t *testing.T) {
 		}
 		if len(*calls) != 0 {
 			t.Errorf("exec should not be called on healthy update, got %d calls", len(*calls))
+		}
+	})
+
+	t.Run("healthy update records success in update_history", func(t *testing.T) {
+		tempDir := t.TempDir()
+		initTestRepo(t, tempDir)
+		os.Unsetenv(envUpdatedFromCommit)
+
+		db, err := bridge.OpenDB(filepath.Join(t.TempDir(), "test.db"))
+		if err != nil {
+			t.Fatalf("OpenDB: %v", err)
+		}
+		defer db.Close()
+
+		binaryPath := filepath.Join(tempDir, "bridge")
+		if err := os.WriteFile(binaryPath, []byte("new binary"), 0755); err != nil {
+			t.Fatalf("failed to write binary: %v", err)
+		}
+		if err := os.WriteFile(binaryPath+backupBinarySuffix, []byte("old binary"), 0755); err != nil {
+			t.Fatalf("failed to write backup: %v", err)
+		}
+		if err := writePendingUpdateMarker(binaryPath, &pendingUpdate{FromCommit: "oldsha", ToCommit: "newsha"}); err != nil {
+			t.Fatalf("failed to write marker: %v", err)
+		}
+
+		stubExec(t, nil)
+		live := true
+		serveLiveness(t, &live)
+
+		if err := CheckStartupHealth(tempDir, "bridge", db, ""); err != nil {
+			t.Fatalf("CheckStartupHealth() should return nil on healthy update, got: %v", err)
+		}
+
+		s, err := db.GetLastUpdateSuccess(context.Background())
+		if err != nil {
+			t.Fatalf("GetLastUpdateSuccess: %v", err)
+		}
+		if s == nil {
+			t.Fatal("verified update should be recorded in update_history")
+		}
+		if s.FromCommit != "oldsha" || s.ToCommit != "newsha" {
+			t.Errorf("recorded update = %s -> %s, want oldsha -> newsha", s.FromCommit, s.ToCommit)
+		}
+		if s.VerifiedAt.IsZero() {
+			t.Error("recorded VerifiedAt should not be zero")
 		}
 	})
 
@@ -1436,7 +1481,7 @@ func TestCheckStartupHealth(t *testing.T) {
 		serveLiveness(t, &live)
 		shortHealthCheck(t)
 
-		if err := CheckStartupHealth(tempDir, "bridge"); err != nil {
+		if err := CheckStartupHealth(tempDir, "bridge", nil, ""); err != nil {
 			t.Fatalf("CheckStartupHealth() should succeed via rollback, got: %v", err)
 		}
 
@@ -1484,7 +1529,7 @@ func TestCheckStartupHealth(t *testing.T) {
 		serveLiveness(t, &live)
 		shortHealthCheck(t)
 
-		if err := CheckStartupHealth(tempDir, "bridge"); err == nil {
+		if err := CheckStartupHealth(tempDir, "bridge", nil, ""); err == nil {
 			t.Fatal("CheckStartupHealth() should return error when rollback exec fails")
 		}
 
@@ -1524,7 +1569,7 @@ func TestCheckStartupHealth(t *testing.T) {
 		serveLiveness(t, &live)
 		shortHealthCheck(t)
 
-		if err := CheckStartupHealth(tempDir, "bridge"); err != nil {
+		if err := CheckStartupHealth(tempDir, "bridge", nil, ""); err != nil {
 			t.Fatalf("CheckStartupHealth() should succeed via rollback, got: %v", err)
 		}
 
@@ -1707,7 +1752,7 @@ func TestCheckIsLive(t *testing.T) {
 		livenessCheckURL = srv.URL + "/livez"
 		defer func() { livenessCheckURL = origURL }()
 
-		if !checkIsLive(context.Background(), srv.Client()) {
+		if !checkIsLive(context.Background(), srv.Client(), srv.URL+"/livez") {
 			t.Error("checkIsLive() should return true on 200 OK")
 		}
 	})
@@ -1722,7 +1767,7 @@ func TestCheckIsLive(t *testing.T) {
 		livenessCheckURL = srv.URL + "/livez"
 		defer func() { livenessCheckURL = origURL }()
 
-		if checkIsLive(context.Background(), srv.Client()) {
+		if checkIsLive(context.Background(), srv.Client(), srv.URL+"/livez") {
 			t.Error("checkIsLive() should return false on non-200")
 		}
 	})
@@ -1730,8 +1775,9 @@ func TestCheckIsLive(t *testing.T) {
 	t.Run("returns false on connection error", func(t *testing.T) {
 		client := &http.Client{Timeout: 100 * time.Millisecond}
 
-		// No server running, should return false
-		if checkIsLive(context.Background(), client) {
+		// Port 1 refuses connections on any host — including this one, where
+		// the production bridge answers on the default 9091.
+		if checkIsLive(context.Background(), client, "http://127.0.0.1:1/livez") {
 			t.Error("checkIsLive() should return false when no server running")
 		}
 	})

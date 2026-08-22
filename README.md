@@ -133,6 +133,27 @@ The proxy runs as a Docker container and has no host-level dependencies beyond a
 | `UPDATE_INTERVAL_MINUTES` | `5` | Self-update check interval (`0` = disabled) |
 | `CANARY_ENABLED` | `true` | Run the throwaway PTY/Claude drift check at startup |
 | `CANARY_INTERVAL_MINUTES` | `0` | Repeat the PTY canary periodically (`0` = startup only) |
+| `HEALTH_ADDR` | `127.0.0.1:9091` | Bind address of the health/metrics HTTP server. Point at a Tailscale interface to allow external `/metrics` scraping |
+
+### Metrics endpoint
+
+The health server (default `127.0.0.1:9091`) exposes **Prometheus text-format metrics** at `GET /metrics`:
+
+| Metric | Meaning |
+|--------|---------|
+| `bridge_sessions_active` | Sessions currently in `active` status |
+| `bridge_cost_usd_today` | Total API cost (USD) recorded today (UTC) |
+| `bridge_last_update_success_timestamp_seconds` | Unix time of the last self-update verified healthy after restart; **absent** when no update has ever been verified — combine with `absent()` or staleness alerting to catch a stalled updater (ADR-001) |
+| `bridge_build_info{version,commit}` | Version/commit the running binary was built from |
+| `bridge_uptime_seconds` | Process uptime |
+
+Unlike `/health` and `/livez` (localhost-origin requests only), `/metrics` answers any source — it is a side-effect-free read, so external scrapers (e.g. over Tailscale) can poll it once `HEALTH_ADDR` is bound to a non-loopback interface:
+
+```bash
+curl -s http://<host>:9091/metrics
+```
+
+Verified self-updates are persisted in the `update_history` table (migration v27), so the last-success timestamp survives restarts.
 
 ---
 

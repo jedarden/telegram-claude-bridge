@@ -70,6 +70,7 @@ internal/
 ├── health/          # Health checking and systemd watchdog
 │   ├── health.go    # Health checker for proxy/db
 │   ├── health_test.go
+│   ├── metrics.go   # Prometheus /metrics endpoint
 │   └── watchdog.go  # systemd watchdog implementation
 ├── telegram/        # Telegram API client (proxy-side)
 │   ├── poller.go    # Telegram getUpdates long-polling
@@ -238,7 +239,13 @@ NDJSON event streaming to Unix socket:
 - Checks proxy health (`GET /health`)
 - Checks database connectivity
 - Publishes health events
-- Provides HTTP health endpoint on localhost:9091
+- Provides HTTP health endpoint (bind via `HEALTH_ADDR`, default localhost:9091)
+
+**`internal/health/metrics.go`**
+
+- Prometheus text-format `GET /metrics` endpoint on the same server (any source address)
+- `MetricsProvider` interface (implemented by `*bridge.DB`): active session count, today's total cost (UTC), last verified self-update timestamp
+- Metrics feed ADR-001 stall detection; verified updates persist in the `update_history` table (migration v27) via `updater.CheckStartupHealth`
 
 **`internal/health/watchdog.go`**
 

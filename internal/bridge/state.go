@@ -181,7 +181,16 @@ type UpdateFailure struct {
 	Resolved   bool      // Whether the failure has been resolved (success after failure)
 }
 
-const schemaVersion = 26
+// UpdateSuccess represents a self-update that was applied and then verified
+// healthy by the post-restart check (updater.CheckStartupHealth).
+type UpdateSuccess struct {
+	FromCommit string    // Commit the binary updated from
+	ToCommit   string    // Commit the binary updated to
+	AppliedAt  time.Time // When the new binary replaced the old one
+	VerifiedAt time.Time // When the new binary passed the post-restart health check
+}
+
+const schemaVersion = 27
 
 // migrations is an ordered list of SQL statements applied once on startup.
 // Each entry is applied inside a single transaction. Migrations are idempotent
@@ -413,6 +422,20 @@ var migrations = []string{
 
 			CREATE INDEX IF NOT EXISTS idx_update_failures_created_at ON update_failures(attempted_at);
 			CREATE INDEX IF NOT EXISTS idx_update_failures_resolved ON update_failures(resolved);`,
+
+			// Version 27 — add update_history table recording each self-update
+			// that was applied AND verified healthy. update_failures records the
+			// skips/errors; this records the successes, so an external poller can
+			// detect a stalled updater (ADR-001) via /metrics instead of journald.
+			`CREATE TABLE IF NOT EXISTS update_history (
+				id          INTEGER PRIMARY KEY AUTOINCREMENT,
+				from_commit TEXT NOT NULL,
+				to_commit   TEXT NOT NULL,
+				applied_at  TEXT NOT NULL,
+				verified_at TEXT NOT NULL
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_update_history_verified_at ON update_history(verified_at);`,
 		}
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
 // and applies any pending migrations.
@@ -2149,4 +2172,78 @@ func (d *DB) MarkUpdateFailuresResolved(ctx context.Context) error {
 		`UPDATE update_failures SET resolved = 1 WHERE resolved = 0`,
 	)
 	return err
+}
+
+// ── update_history (verified self-update tracking) ────────────────────────────
+
+// RecordUpdateSuccess records a self-update that was applied and then verified
+// healthy by the post-restart check. Together with update_failures this gives
+// external pollers (see the /metrics endpoint) a durable signal for detecting
+// a stalled updater (ADR-001) without reading journald.
+func (d *DB) RecordUpdateSuccess(ctx context.Context, s *UpdateSuccess) error {
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO update_history (from_commit, to_commit, applied_at, verified_at)
+		 VALUES (?, ?, ?, ?)`,
+		s.FromCommit, s.ToCommit,
+		s.AppliedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		s.VerifiedAt.UTC().Format("2006-01-02T15:04:05Z"),
+	)
+	return err
+}
+
+// GetLastUpdateSuccess returns the most recent verified self-update, or nil if
+// none has been recorded yet.
+func (d *DB) GetLastUpdateSuccess(ctx context.Context) (*UpdateSuccess, error) {
+	var s UpdateSuccess
+	var appliedAt, verifiedAt string
+	err := d.db.QueryRowContext(ctx,
+		`SELECT from_commit, to_commit, applied_at, verified_at
+		 FROM update_history
+		 ORDER BY verified_at DESC
+		 LIMIT 1`,
+	).Scan(&s.FromCommit, &s.ToCommit, &appliedAt, &verifiedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	s.AppliedAt, _ = time.Parse("2006-01-02T15:04:05Z", appliedAt)
+	s.VerifiedAt, _ = time.Parse("2006-01-02T15:04:05Z", verifiedAt)
+	return &s, nil
+}
+
+// LastUpdateSuccessAt returns the verification time of the most recent
+// verified self-update. ok is false when no update has been recorded. Part of
+// the health.MetricsProvider surface exposed on /metrics.
+func (d *DB) LastUpdateSuccessAt(ctx context.Context) (time.Time, bool, error) {
+	s, err := d.GetLastUpdateSuccess(ctx)
+	if err != nil || s == nil {
+		return time.Time{}, false, err
+	}
+	return s.VerifiedAt, true, nil
+}
+
+// ── /metrics support queries ──────────────────────────────────────────────────
+
+// CountActiveSessions returns the number of sessions currently in 'active'
+// status across all groups. Part of the health.MetricsProvider surface.
+func (d *DB) CountActiveSessions(ctx context.Context) (int, error) {
+	var count int
+	err := d.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sessions WHERE status = 'active'`,
+	).Scan(&count)
+	return count, err
+}
+
+// TodayTotalCostUSD returns the total API cost recorded today (UTC, matching
+// the DATE('now') convention used by GetDailyCosts and the /cost command).
+// Part of the health.MetricsProvider surface.
+func (d *DB) TodayTotalCostUSD(ctx context.Context) (float64, error) {
+	var total float64
+	err := d.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events
+		 WHERE DATE(created_at) = DATE('now')`,
+	).Scan(&total)
+	return total, err
 }

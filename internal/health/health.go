@@ -52,6 +52,8 @@ type Checker struct {
 	logger      *slog.Logger
 	eventPublisher any
 	bridgeStartTime time.Time
+	version     string // build version, reported in /health and /metrics
+	commit      string // build commit, reported in /metrics
 }
 
 // HealthCheck represents a single health check result for event publishing.
@@ -82,7 +84,34 @@ func NewChecker(proxyURL string, db *sql.DB) *Checker {
 		bridgeStartTime: now,
 		lastHealthy:     true,
 		logger:          logger,
+		version:         "1.0.0",
 	}
+}
+
+// SetBuildInfo records the binary's version and commit (from ldflags) so
+// /health and /metrics can report what is actually running. When not called,
+// /health keeps reporting the historical placeholder "1.0.0".
+func (c *Checker) SetBuildInfo(version, commit string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if version != "" {
+		c.version = version
+	}
+	c.commit = commit
+}
+
+// buildInfo returns the recorded version and commit.
+func (c *Checker) buildInfo() (version, commit string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.version, c.commit
+}
+
+// processStartTime returns when the checker (i.e. the process) was created.
+func (c *Checker) processStartTime() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.startTime
 }
 
 // SetLogLevel updates the logging level.
@@ -109,7 +138,7 @@ func (c *Checker) Check(ctx context.Context) *Result {
 	result := &Result{
 		Checks:  make([]Status, 0, 3),
 		Uptime:  time.Since(c.startTime).Round(time.Second).String(),
-		Version: "1.0.0",
+		Version: c.version,
 	}
 
 	// Check proxy connectivity
@@ -422,6 +451,8 @@ type Server struct {
 	server    *http.Server
 	reconnect chan struct{} // Signals when proxy becomes healthy after being unhealthy
 	addr      string         // Actual bound address (set after Start)
+	metricsMu sync.RWMutex
+	metrics   MetricsProvider // Source of the /metrics counters (optional)
 }
 
 // NewServer creates a new health server listening on addr (e.g., "127.0.0.1:9091").
@@ -434,6 +465,7 @@ func NewServer(addr string, checker *Checker) *Server {
 	}
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/livez", s.handleLivez)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	s.server = &http.Server{
 		Addr:         addr,

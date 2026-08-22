@@ -802,15 +802,21 @@ func (u *Updater) CheckForUpdates(ctx context.Context) *bridge.UpdateResult {
 // a marker.
 //
 // On success the marker, the backup, and any stale rolled-back-commit marker
-// are removed. If the liveness endpoint does not answer within
-// healthCheckTimeout, the previous binary is restored, the failed commit is
-// recorded (the updater refuses to automatically retry it), the admin chat is
-// notified, and the previous binary is exec'd in place.
+// are removed, and the verified update is recorded in update_history so the
+// /metrics endpoint can expose when self-update last worked. If the liveness
+// endpoint does not answer within healthCheckTimeout, the previous binary is
+// restored, the failed commit is recorded (the updater refuses to
+// automatically retry it), the admin chat is notified, and the previous
+// binary is exec'd in place.
+//
+// db may be nil (recording is skipped); livenessURL overrides the default
+// liveness endpoint when the health server is bound elsewhere (HEALTH_ADDR),
+// and may be empty to use the default.
 //
 // Returns nil when healthy or when rollback succeeded; a non-nil error means
 // rollback itself failed (the caller should exit so systemd restarts the
 // already-restored previous binary).
-func CheckStartupHealth(repoPath, binaryPath string) error {
+func CheckStartupHealth(repoPath, binaryPath string, db *bridge.DB, livenessURL string) error {
 	oldPath := filepath.Join(repoPath, binaryPath)
 
 	pending, ok := readPendingUpdateMarker(oldPath)
@@ -827,13 +833,15 @@ func CheckStartupHealth(repoPath, binaryPath string) error {
 	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
 		log.Printf("[updater] update pending but no backup found; cannot roll back, continuing")
 		os.Remove(oldPath + pendingUpdateSuffix)
+		// The new binary is running this code, which is verification enough.
+		recordUpdateSuccess(db, pending)
 		return nil
 	}
 
 	log.Printf("[updater] verifying post-update startup health (prev: %s, new: %s)",
 		pending.FromCommit, pending.ToCommit)
 
-	if !waitForLiveness() {
+	if !waitForLiveness(livenessURL) {
 		log.Printf("[updater] new binary did not come up within %s", healthCheckTimeout)
 		return performRollback(oldPath, backupPath, pending)
 	}
@@ -843,14 +851,44 @@ func CheckStartupHealth(repoPath, binaryPath string) error {
 	os.Remove(oldPath + pendingUpdateSuffix)
 	// A verified-healthy boot supersedes an older rolled-back commit.
 	os.Remove(oldPath + failedUpdateSuffix)
+	recordUpdateSuccess(db, pending)
 	return nil
 }
 
+// recordUpdateSuccess persists a verified update to update_history. Failures
+// are logged, not returned: losing the record must not fail an update that
+// already succeeded.
+func recordUpdateSuccess(db *bridge.DB, pending *pendingUpdate) {
+	if db == nil {
+		return
+	}
+	now := time.Now().UTC()
+	appliedAt := pending.AppliedAt
+	if appliedAt.IsZero() {
+		appliedAt = now // legacy env-var path carries no AppliedAt
+	}
+	if err := db.RecordUpdateSuccess(context.Background(), &bridge.UpdateSuccess{
+		FromCommit: pending.FromCommit,
+		ToCommit:   pending.ToCommit,
+		AppliedAt:  appliedAt,
+		VerifiedAt: now,
+	}); err != nil {
+		log.Printf("[updater] failed to record update success: %v", err)
+	}
+}
+
 // waitForLiveness polls the local liveness endpoint until it answers or the
-// timeout elapses.
-func waitForLiveness() bool {
+// timeout elapses. urlOverride adapts the check when the health server is
+// bound somewhere other than the default localhost:9091; empty uses the
+// default.
+func waitForLiveness(urlOverride string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
 	defer cancel()
+
+	url := livenessCheckURL
+	if urlOverride != "" {
+		url = urlOverride
+	}
 
 	client := &http.Client{Timeout: 2 * time.Second}
 	ticker := time.NewTicker(healthCheckInterval)
@@ -861,7 +899,7 @@ func waitForLiveness() bool {
 		case <-ctx.Done():
 			return false
 		case <-ticker.C:
-			if checkIsLive(ctx, client) {
+			if checkIsLive(ctx, client, url) {
 				return true
 			}
 		}
@@ -869,8 +907,8 @@ func waitForLiveness() bool {
 }
 
 // checkIsLive performs a single liveness request against the local endpoint.
-func checkIsLive(ctx context.Context, client *http.Client) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, livenessCheckURL, nil)
+func checkIsLive(ctx context.Context, client *http.Client, url string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false
 	}
