@@ -291,3 +291,9 @@ The bridge implements `sd_notify` (`Type=notify`) with a 60 s watchdog, so syste
 ## Version
 
 Current version: **0.3.0**
+
+---
+
+Part of [jedarden.com](https://jedarden.com)
+
+*This GitHub repo is a read-only mirror of git.ardenone.com/jedarden/telegram-claude-bridge — issues and PRs are welcome here either way.*
