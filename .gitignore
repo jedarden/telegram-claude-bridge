@@ -12,3 +12,10 @@ bin/
 
 # Temp files
 /tmp/
+
+# Worker execution traces can contain raw tool output (credentials) — never
+# commit (see 2026-07-25 GH_TOKEN leak, 2026-08-22 CF token leak). The
+# durable record is .beads/checkpoint/.
+.beads/traces/
+.beads/events.jsonl
+.beads/heartbeats.jsonl
