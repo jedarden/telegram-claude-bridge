@@ -19,3 +19,7 @@ bin/
 .beads/traces/
 .beads/events.jsonl
 .beads/heartbeats.jsonl
+
+# Runtime logs can contain full upstream URLs, chat content, and credentials.
+logs/
+*.log

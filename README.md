@@ -2,6 +2,13 @@
 
 A bridge that connects a Telegram bot to [Claude Code](https://github.com/anthropics/claude-code) CLI sessions, letting users interact with Claude directly from Telegram group forum topics. Each topic gets a persistent Claude Code session running in tmux; the bridge routes messages in, streams responses back, and keeps sessions warm between turns. Uses Anthropic subscription billing (interactive PTY), not API credits.
 
+> **Security-sensitive defaults:** `ALLOWED_CHAT_ID=0` accepts every chat, and
+> new groups default to `bypassPermissions`, which launches Claude with
+> `--dangerously-skip-permissions`. Before running the bridge, restrict it to a
+> trusted chat, set `ADMIN_USER_ID`, choose the least-permissive workable mode,
+> and run it under an OS account that cannot access unrelated repositories or
+> credentials.
+
 ---
 
 ## How it works
