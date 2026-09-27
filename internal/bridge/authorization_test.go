@@ -209,6 +209,65 @@ func TestAuthorizer_NoBootstrapRequiresDatabaseAdministrator(t *testing.T) {
 	}
 }
 
+func TestSeededAdministratorCanRegisterGroupWhenBootstrapDisabled(t *testing.T) {
+	const (
+		adminUser    = int64(9001)
+		nonAdminUser = int64(200)
+		adminChat    = int64(100)
+		nonAdminChat = int64(200)
+	)
+
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// This is the database state produced by manage-admins.sh bootstrap. With
+	// ADMIN_USER_ID=0, the runtime must use this row rather than an environment
+	// identity to authorize the first group registration.
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: adminUser, Role: "admin"}); err != nil {
+		t.Fatalf("seed administrator: %v", err)
+	}
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: nonAdminUser, Role: "user"}); err != nil {
+		t.Fatalf("seed non-admin user: %v", err)
+	}
+
+	root := t.TempDir()
+	policy, err := NewWorkingDirectoryPolicy(root)
+	if err != nil {
+		t.Fatalf("NewWorkingDirectoryPolicy: %v", err)
+	}
+	sender, _ := newRecordingProxy(t)
+	h := NewCommandHandler(db, sender, "http://unused", nil, nil, "v1.0.0", "test", "test")
+	h.SetWorkingDirectoryPolicy(policy)
+
+	// A zero admin ID is the important part of this fixture: only the seeded
+	// database role should authorize the command.
+	authorizer := NewAuthorizer(db, 0, 0)
+	r := NewRouter(db, nil)
+	r.SetAuthorizer(authorizer)
+	r.OnCommand = h.Handle
+
+	r.Route(ctx, commandTextUpdate(adminUser, adminChat, 1, "/cwd "+root))
+	group, err := db.GetGroup(ctx, adminChat)
+	if err != nil {
+		t.Fatalf("get administrator group: %v", err)
+	}
+	if group == nil {
+		t.Fatal("seeded administrator was not allowed to register the first group")
+	}
+	if group.CWD != root {
+		t.Fatalf("administrator group cwd = %q, want %q", group.CWD, root)
+	}
+
+	r.Route(ctx, commandTextUpdate(nonAdminUser, nonAdminChat, 2, "/cwd "+root))
+	group, err = db.GetGroup(ctx, nonAdminChat)
+	if err != nil {
+		t.Fatalf("get non-admin group: %v", err)
+	}
+	if group != nil {
+		t.Fatalf("non-admin user registered a group: %+v", group)
+	}
+}
+
 func TestCommandHandler_NoBootstrapRejectsUnauthorizedAdminMutation(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
