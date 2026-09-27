@@ -399,8 +399,9 @@ func handleFile(s *telegram.Sender) http.HandlerFunc {
 
 		tgFile, apiErr := s.GetFile(r.Context(), fileID)
 		if apiErr != nil {
-			// Telegram 400-range errors mean invalid or expired file_id.
-			if apiErr.ErrorCode >= 400 && apiErr.ErrorCode < 500 {
+			// Telegram 400-range errors mean invalid or expired file_id, except
+			// 429, which is a rate-limit response and must be preserved.
+			if apiErr.ErrorCode >= 400 && apiErr.ErrorCode < 500 && apiErr.ErrorCode != contract.ErrCodeRateLimit {
 				writeProxyError(w, http.StatusNotFound, 404, "file not found or expired")
 				return
 			}
@@ -420,7 +421,11 @@ func handleFile(s *telegram.Sender) http.HandlerFunc {
 
 		resp, err := s.DownloadFile(r.Context(), *tgFile.FilePath)
 		if err != nil {
-			writeProxyError(w, http.StatusBadGateway, 502, fmt.Sprintf("download failed: %v", err))
+			if r.Context().Err() == context.DeadlineExceeded {
+				writeProxyError(w, http.StatusGatewayTimeout, contract.ErrCodeTelegramTimeout, fmt.Sprintf("download failed: %v", err))
+			} else {
+				writeProxyError(w, http.StatusBadGateway, contract.ErrCodeTelegramUnreachable, fmt.Sprintf("download failed: %v", err))
+			}
 			return
 		}
 		defer resp.Body.Close()
@@ -684,12 +689,18 @@ func writeProxyError(w http.ResponseWriter, httpStatus, code int, desc string) {
 	}
 }
 
-// writeTelegramError maps a Telegram API error to an HTTP response.
-// 429 → 429, all others → 502 Bad Gateway.
+// writeTelegramError maps a Telegram API or transport error to an HTTP response.
+// Rate limits, readiness failures, and upstream timeouts preserve their
+// corresponding HTTP status; other upstream failures use 502 Bad Gateway.
 func writeTelegramError(w http.ResponseWriter, e *contract.ErrorResponse) {
 	httpStatus := http.StatusBadGateway
-	if e.ErrorCode == contract.ErrCodeRateLimit {
+	switch e.ErrorCode {
+	case contract.ErrCodeRateLimit:
 		httpStatus = http.StatusTooManyRequests
+	case contract.ErrCodeNotPolling:
+		httpStatus = http.StatusServiceUnavailable
+	case contract.ErrCodeTelegramTimeout:
+		httpStatus = http.StatusGatewayTimeout
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(httpStatus)

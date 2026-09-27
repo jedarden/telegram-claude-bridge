@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -84,6 +85,17 @@ type tgAPIResponse struct {
 
 type tgParameters struct {
 	RetryAfter *int `json:"retry_after,omitempty"`
+}
+
+func telegramTransportError(err error) *contract.ErrorResponse {
+	errorCode := contract.ErrCodeTelegramUnreachable
+	if errors.Is(err, context.DeadlineExceeded) {
+		errorCode = contract.ErrCodeTelegramTimeout
+	}
+	return &contract.ErrorResponse{
+		ErrorCode:   errorCode,
+		Description: fmt.Sprintf("Telegram unreachable: %v", err),
+	}
 }
 
 func (r *tgAPIResponse) toErrorResponse() *contract.ErrorResponse {
@@ -399,7 +411,9 @@ func (s *Sender) callMultipart(ctx context.Context, method string, fields map[st
 	// Use downloadClient (no fixed timeout) so context controls the deadline for large uploads.
 	resp, err := s.downloadClient.Do(httpReq)
 	if err != nil {
-		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: redactToken(fmt.Sprintf("Telegram unreachable: %v", err), s.token)}
+		apiErr := telegramTransportError(err)
+		apiErr.Description = redactToken(apiErr.Description, s.token)
+		return nil, apiErr
 	}
 	defer resp.Body.Close()
 
@@ -436,7 +450,9 @@ func (s *Sender) call(ctx context.Context, method string, body map[string]any) (
 
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
-		return nil, &contract.ErrorResponse{ErrorCode: contract.ErrCodeTelegramUnreachable, Description: redactToken(fmt.Sprintf("Telegram unreachable: %v", err), s.token)}
+		apiErr := telegramTransportError(err)
+		apiErr.Description = redactToken(apiErr.Description, s.token)
+		return nil, apiErr
 	}
 	defer resp.Body.Close()
 
