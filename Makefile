@@ -1,4 +1,4 @@
-.PHONY: all build proxy bridge dashboard clean test vet docker
+.PHONY: all build proxy bridge dashboard clean test vet docker validate-deployment-security test-deployment-security
 
 VERSION := $(shell git describe --tags --always 2>/dev/null || echo "dev")
 COMMITSHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -29,3 +29,12 @@ vet:
 
 docker:
 	docker build --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMITSHA) -t telegram-claude-bridge:$(VERSION) .
+
+# Validate the bridge-side security contract checked into this repository.
+# Full deployment validation takes explicit manifest/policy paths; see the
+# deployment security guide and the fixture test below.
+validate-deployment-security:
+	bash scripts/validate-deployment-security.sh --static-only --bridge-unit deploy/telegram-claude-bridge.service
+
+test-deployment-security:
+	bash scripts/test-validate-deployment-security.sh
