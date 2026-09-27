@@ -104,9 +104,25 @@ Commands sent in the General topic of any group:
 - **Topic reopened** → bridge resumes the existing session if still valid
 - **Topic deleted** → bridge removes the routing entry
 
+## Idle Session Policy
+
+An active session is considered idle when its `last_active` timestamp is
+strictly older than seven days. The bridge runs the stale-session sweeper
+immediately at startup and then hourly (`SESSION_CLEANUP_INTERVAL_MINUTES`),
+with `SESSION_TTL_HOURS` available to change the idle threshold. Setting the
+interval to `0` disables the sweeper.
+
+Each sweep only considers sessions whose status is `active`; inactive and
+closed records are preserved. A stale session is conditionally marked
+`inactive` (so activity that arrives during cleanup wins), its PTY is stopped,
+and a best-effort summary is generated, posted, and pinned in the topic. The
+topic icon is changed to the complete/green state. Topics remain open by
+default for reference; setting `CLOSE_INACTIVE_TOPICS=true` closes them after
+the session is marked inactive. Session rows and Claude session data are not
+deleted, so a later explicit resume can recover the stored context.
+
 ## Open Questions
 
 - Auto-create topics from the bridge side? (e.g., Claude suggests splitting work into a new topic)
 - Topic icon colors for status? (active = green, stalled = yellow, complete = grey)
 - Cross-topic context sharing? (reference another session's output)
-- Session TTL / cleanup for stale sessions?

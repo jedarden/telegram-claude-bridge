@@ -341,6 +341,107 @@ func TestSession_ListAndDelete(t *testing.T) {
 	}
 }
 
+func TestSessionCleanup_StaleSessionBoundaries(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, time.January, 10, 12, 0, 0, 0, time.UTC)
+	ttl := 24 * time.Hour
+	cutoff := now.Add(-ttl)
+
+	if err := db.UpsertGroup(ctx, &Group{ChatID: 1, CWD: "/tmp"}); err != nil {
+		t.Fatalf("UpsertGroup: %v", err)
+	}
+	sessions := []*Session{
+		{
+			ChatID: 1, ThreadID: 1, SessionID: "at-threshold", CWD: "/tmp",
+			Status: "active", LastActive: cutoff,
+		},
+		{
+			ChatID: 1, ThreadID: 2, SessionID: "recent", CWD: "/tmp",
+			Status: "active", LastActive: cutoff.Add(time.Minute),
+		},
+		{
+			ChatID: 1, ThreadID: 3, SessionID: "stale", CWD: "/tmp",
+			Status: "active", LastActive: cutoff.Add(-time.Minute),
+		},
+		{
+			ChatID: 1, ThreadID: 4, SessionID: "already-inactive", CWD: "/tmp",
+			Status: "inactive", LastActive: cutoff.Add(-24 * time.Hour),
+		},
+	}
+	for _, session := range sessions {
+		if err := db.CreateSession(ctx, session); err != nil {
+			t.Fatalf("CreateSession(%s): %v", session.SessionID, err)
+		}
+	}
+
+	stale, err := db.ListStaleSessionsAt(ctx, now, ttl)
+	if err != nil {
+		t.Fatalf("ListStaleSessionsAt: %v", err)
+	}
+	if len(stale) != 1 || stale[0].SessionID != "stale" {
+		t.Fatalf("stale sessions = %v, want only stale session", sessionIDs(stale))
+	}
+
+	marked, err := db.MarkSessionInactiveIfStale(ctx, 1, 1, cutoff)
+	if err != nil {
+		t.Fatalf("mark at-threshold session: %v", err)
+	}
+	if marked {
+		t.Error("session exactly at the threshold was marked inactive")
+	}
+
+	marked, err = db.MarkSessionInactiveIfStale(ctx, 1, 2, cutoff)
+	if err != nil {
+		t.Fatalf("mark recent session: %v", err)
+	}
+	if marked {
+		t.Error("recent session was marked inactive")
+	}
+
+	marked, err = db.MarkSessionInactiveIfStale(ctx, 1, 3, cutoff)
+	if err != nil {
+		t.Fatalf("mark stale session: %v", err)
+	}
+	if !marked {
+		t.Error("stale session was not marked inactive")
+	}
+
+	marked, err = db.MarkSessionInactiveIfStale(ctx, 1, 4, cutoff)
+	if err != nil {
+		t.Fatalf("mark already-inactive session: %v", err)
+	}
+	if marked {
+		t.Error("already-inactive session was selected for transition")
+	}
+
+	for threadID, want := range map[int64]string{1: "active", 2: "active", 3: "inactive", 4: "inactive"} {
+		got, err := db.GetSession(ctx, 1, threadID)
+		if err != nil {
+			t.Fatalf("GetSession(thread=%d): %v", threadID, err)
+		}
+		if got.Status != want {
+			t.Errorf("session thread %d status = %q, want %q", threadID, got.Status, want)
+		}
+	}
+
+	got, err := db.GetSession(ctx, 1, 3)
+	if err != nil {
+		t.Fatalf("GetSession(stale): %v", err)
+	}
+	if got.IconColor != ColorComplete {
+		t.Errorf("stale session icon color = %d, want %d", got.IconColor, ColorComplete)
+	}
+}
+
+func sessionIDs(sessions []*Session) []string {
+	ids := make([]string, 0, len(sessions))
+	for _, session := range sessions {
+		ids = append(ids, session.SessionID)
+	}
+	return ids
+}
+
 func TestSession_MarkSessionClosing(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -836,7 +937,7 @@ func TestTodayTotalCostUSD(t *testing.T) {
 	ctx := context.Background()
 
 	events := []CostEvent{
-		{ChatID: 100, ThreadID: 10, CostUSD: 1.25, Model: "claude-sonnet-4-6"},              // today (default CreatedAt)
+		{ChatID: 100, ThreadID: 10, CostUSD: 1.25, Model: "claude-sonnet-4-6"}, // today (default CreatedAt)
 		{ChatID: 100, ThreadID: 10, CostUSD: 2.50, Model: "claude-sonnet-4-6",
 			CreatedAt: time.Now().UTC().Add(-48 * time.Hour)}, // two days ago
 	}

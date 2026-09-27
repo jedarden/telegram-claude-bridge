@@ -365,7 +365,18 @@ func (sc *SessionCleanup) runCleanup(ctx context.Context) {
 		sc.sweepStaleWorkers(ctx)
 	}
 
-	stale, err := sc.db.ListStaleSessions(ctx, sc.ttl)
+	sc.sweepStaleSessions(ctx)
+}
+
+// sweepStaleSessions marks sessions inactive when they have been idle longer
+// than the configured TTL. It re-checks last_active before changing each row
+// because summary generation can overlap with a new user message.
+func (sc *SessionCleanup) sweepStaleSessions(ctx context.Context) {
+	sc.sweepStaleSessionsAt(ctx, time.Now().UTC())
+}
+
+func (sc *SessionCleanup) sweepStaleSessionsAt(ctx context.Context, now time.Time) {
+	stale, err := sc.db.ListStaleSessionsAt(ctx, now, sc.ttl)
 	if err != nil {
 		log.Printf("[cleanup] failed to list stale sessions: %v", err)
 		return
@@ -377,8 +388,10 @@ func (sc *SessionCleanup) runCleanup(ctx context.Context) {
 
 	log.Printf("[cleanup] found %d stale sessions", len(stale))
 
+	cutoff := now.UTC().Add(-sc.ttl)
 	for _, sess := range stale {
 		// Generate and post summary before marking inactive
+		var summary string
 		group, err := sc.db.GetGroup(ctx, sess.ChatID)
 		if err != nil {
 			log.Printf("[cleanup] failed to get group for (%d,%d): %v",
@@ -387,36 +400,47 @@ func (sc *SessionCleanup) runCleanup(ctx context.Context) {
 
 		// Generate summary if we have a valid group
 		if group != nil {
-			summary, summaryErr := GenerateSessionSummary(ctx, sess, group, sc.ptyMgr)
+			generated, summaryErr := GenerateSessionSummary(ctx, sess, group, sc.ptyMgr)
 			if summaryErr != nil {
 				log.Printf("[cleanup] generate summary failed for (%d,%d): %v",
 					sess.ChatID, sess.ThreadID, summaryErr)
-			} else if summary != "" {
-				// Send the summary as a new message in the topic
-				summaryText := fmt.Sprintf("📋 <b>Session Summary</b>\n\n%s", summary)
-
-				msgID, sendErr := sc.sender.SendAndPinMetadata(ctx, sess.ChatID, sess.ThreadID, summaryText)
-				if sendErr != nil {
-					log.Printf("[cleanup] send summary failed for (%d,%d): %v",
-						sess.ChatID, sess.ThreadID, sendErr)
-				} else {
-					log.Printf("[cleanup] posted summary for (%d,%d), msg_id=%d",
-						sess.ChatID, sess.ThreadID, msgID)
-				}
-
-				// Store the summary in the database
-				if storeErr := sc.db.UpdateSessionSummary(ctx, sess.ChatID, sess.ThreadID, summary); storeErr != nil {
-					log.Printf("[cleanup] store summary failed for (%d,%d): %v",
-						sess.ChatID, sess.ThreadID, storeErr)
-				}
+			} else {
+				summary = generated
 			}
 		}
 
-		// Update status to inactive
-		if err := sc.db.SetSessionStatus(ctx, sess.ChatID, sess.ThreadID, "inactive"); err != nil {
+		// Update status to inactive only if the session is still stale. This
+		// prevents a message received during summary generation from being
+		// deactivated by this cleanup pass.
+		markedInactive, err := sc.db.MarkSessionInactiveIfStale(ctx, sess.ChatID, sess.ThreadID, cutoff)
+		if err != nil {
 			log.Printf("[cleanup] failed to set inactive status for (%d,%d): %v",
 				sess.ChatID, sess.ThreadID, err)
 			continue
+		}
+		if !markedInactive {
+			log.Printf("[cleanup] skipped session (%d,%d): activity changed during cleanup",
+				sess.ChatID, sess.ThreadID)
+			continue
+		}
+
+		if summary != "" {
+			// Send the summary as a new message in the topic and pin it as
+			// metadata so the topic remains useful even when left open.
+			summaryText := fmt.Sprintf("📋 <b>Session Summary</b>\n\n%s", summary)
+			msgID, sendErr := sc.sender.SendAndPinMetadata(ctx, sess.ChatID, sess.ThreadID, summaryText)
+			if sendErr != nil {
+				log.Printf("[cleanup] send summary failed for (%d,%d): %v",
+					sess.ChatID, sess.ThreadID, sendErr)
+			} else {
+				log.Printf("[cleanup] posted summary for (%d,%d), msg_id=%d",
+					sess.ChatID, sess.ThreadID, msgID)
+			}
+
+			if storeErr := sc.db.UpdateSessionSummary(ctx, sess.ChatID, sess.ThreadID, summary); storeErr != nil {
+				log.Printf("[cleanup] store summary failed for (%d,%d): %v",
+					sess.ChatID, sess.ThreadID, storeErr)
+			}
 		}
 
 		// Kill the corresponding tmux pane

@@ -14,12 +14,12 @@ import (
 
 // Icon color constants for topic status states.
 const (
-	ColorActive    = contract.IconColorLightBlue // 0x6FB9F0
-	ColorComplete  = contract.IconColorGreen     // 0x8EEE98
-	ColorBlocked   = contract.IconColorYellow    // 0xFFD67E
-	ColorError     = contract.IconColorRedOrange // 0xFB6F5F
-	ColorReview    = contract.IconColorPink      // 0xFF93B2
-	ColorResearch  = contract.IconColorPurple    // 0xCB86DB
+	ColorActive   = contract.IconColorLightBlue // 0x6FB9F0
+	ColorComplete = contract.IconColorGreen     // 0x8EEE98
+	ColorBlocked  = contract.IconColorYellow    // 0xFFD67E
+	ColorError    = contract.IconColorRedOrange // 0xFB6F5F
+	ColorReview   = contract.IconColorPink      // 0xFF93B2
+	ColorResearch = contract.IconColorPurple    // 0xCB86DB
 )
 
 // DB wraps a SQLite database providing all state persistence for the bridge.
@@ -29,21 +29,21 @@ type DB struct {
 
 // Group represents a configured Telegram group/supergroup.
 type Group struct {
-	ChatID             int64
-	Name               string
-	CWD                string
-	DefaultModel       string
-	MaxBudget          float64
-	TimeoutSec         int
-	PermissionMode     string
-	AllowedTools       string // JSON array of tool names, or empty for all tools
-	DisallowedTools    string // JSON array of tool names, or empty for no restrictions
-	MaxSubtasks        int    // Maximum concurrent subtasks per topic (default 5)
-	MaxWorkers         int    // Maximum concurrent spawn_worker per topic (default 5)
+	ChatID              int64
+	Name                string
+	CWD                 string
+	DefaultModel        string
+	MaxBudget           float64
+	TimeoutSec          int
+	PermissionMode      string
+	AllowedTools        string // JSON array of tool names, or empty for all tools
+	DisallowedTools     string // JSON array of tool names, or empty for no restrictions
+	MaxSubtasks         int    // Maximum concurrent subtasks per topic (default 5)
+	MaxWorkers          int    // Maximum concurrent spawn_worker per topic (default 5)
 	ProgressIntervalSec int    // Progress ticker interval in seconds (0 = disabled, default 120)
-	DispatcherMode     int    // 1 = orchestrator system prompt injected (default), 0 = direct mode
-	TranscriptVerify   bool   // true = require user approval before sending audio transcription to Claude
-	CreatedAt          time.Time
+	DispatcherMode      int    // 1 = orchestrator system prompt injected (default), 0 = direct mode
+	TranscriptVerify    bool   // true = require user approval before sending audio transcription to Claude
+	CreatedAt           time.Time
 }
 
 // Session represents an active Claude Code session mapped to a (chat_id, thread_id) pair.
@@ -58,14 +58,14 @@ type Session struct {
 	CreatedAt        time.Time
 	LastActive       time.Time
 	MessageCount     int
-	PinnedMessageID  int64  // ID of the pinned metadata message in this topic
+	PinnedMessageID  int64   // ID of the pinned metadata message in this topic
 	TotalCostUSD     float64 // Total cost of all messages in this session (USD)
-	Summary          string // Summary of the session, generated on close
-	NotificationMode string // Notification mode: "live" (default), "summary", "quiet"
-	TimeoutSec       int    // Per-topic timeout override (0 = use group timeout)
-	DispatcherMode   int    // 1 = dispatcher enabled (default), 0 = direct mode; -1 = use group default
-	TopicName        string // Name of the forum topic (stored for /context lookup)
-	LastFromUserID   int64  // Telegram user ID who sent the last message in this session
+	Summary          string  // Summary of the session, generated on close
+	NotificationMode string  // Notification mode: "live" (default), "summary", "quiet"
+	TimeoutSec       int     // Per-topic timeout override (0 = use group timeout)
+	DispatcherMode   int     // 1 = dispatcher enabled (default), 0 = direct mode; -1 = use group default
+	TopicName        string  // Name of the forum topic (stored for /context lookup)
+	LastFromUserID   int64   // Telegram user ID who sent the last message in this session
 }
 
 // AllowedUser represents a user permitted to interact with the bot.
@@ -77,10 +77,10 @@ type AllowedUser struct {
 
 // UserInfo represents Telegram user information for display.
 type UserInfo struct {
-	UserID   int64
-	Username string // Telegram username (without @ prefix)
+	UserID    int64
+	Username  string // Telegram username (without @ prefix)
 	FirstName string
-	LastName string
+	LastName  string
 }
 
 // SentMessage tracks messages sent by the bot for deduplication / editing.
@@ -94,47 +94,47 @@ type SentMessage struct {
 
 // CostEvent represents a single API invocation cost record.
 type CostEvent struct {
-	ID                   int64
-	ChatID               int64
-	ThreadID             int64
-	CostUSD              float64
-	InputTokens          int
-	OutputTokens         int
-	CacheReadTokens      int
-	CacheCreationTokens  int
-	Model                string
-	FromUserID           int64 // Telegram user ID who triggered this cost event
-	CreatedAt            time.Time
+	ID                  int64
+	ChatID              int64
+	ThreadID            int64
+	CostUSD             float64
+	InputTokens         int
+	OutputTokens        int
+	CacheReadTokens     int
+	CacheCreationTokens int
+	Model               string
+	FromUserID          int64 // Telegram user ID who triggered this cost event
+	CreatedAt           time.Time
 }
 
 // Subtask represents a parallel sub-task spawned by the SubtaskOrchestrator.
 type Subtask struct {
-	ID           string    // Unique subtask ID
-	ChatID       int64     // Parent chat ID
-	ThreadID     int64     // Parent thread ID
-	ParentMsgID  int64     // Message ID of the parent message that spawned this subtask
-	Prompt       string    // The prompt for this subtask
-	SessionID    string    // Optional session ID to resume
-	Status       string    // "running", "complete", "error"
-	Result       string    // Result text if complete
-	Error        string    // Error message if failed
-	StartedAt    time.Time // When the subtask started
-	FinishedAt   *time.Time // When the subtask finished (nil if running)
+	ID          string     // Unique subtask ID
+	ChatID      int64      // Parent chat ID
+	ThreadID    int64      // Parent thread ID
+	ParentMsgID int64      // Message ID of the parent message that spawned this subtask
+	Prompt      string     // The prompt for this subtask
+	SessionID   string     // Optional session ID to resume
+	Status      string     // "running", "complete", "error"
+	Result      string     // Result text if complete
+	Error       string     // Error message if failed
+	StartedAt   time.Time  // When the subtask started
+	FinishedAt  *time.Time // When the subtask finished (nil if running)
 }
 
 // Worker represents a spawned worker process from spawn_worker synthetic tool.
 type Worker struct {
-	ID         string    // Unique worker ID
-	ChatID     int64     // Parent chat ID
-	ThreadID   int64     // Parent thread ID
-	ParentMsg  int64     // Message ID of the parent message that spawned this worker
-	Prompt     string    // The prompt for this worker
-	SessionID  string    // Optional session ID from the worker invocation
-	Model      string    // Model used by this worker
-	Status     string    // "running", "done", "failed"
-	Result     string    // Result text if complete
-	Error      string    // Error message if failed
-	StartedAt  time.Time // When the worker started
+	ID         string     // Unique worker ID
+	ChatID     int64      // Parent chat ID
+	ThreadID   int64      // Parent thread ID
+	ParentMsg  int64      // Message ID of the parent message that spawned this worker
+	Prompt     string     // The prompt for this worker
+	SessionID  string     // Optional session ID from the worker invocation
+	Model      string     // Model used by this worker
+	Status     string     // "running", "done", "failed"
+	Result     string     // Result text if complete
+	Error      string     // Error message if failed
+	StartedAt  time.Time  // When the worker started
 	FinishedAt *time.Time // When the worker finished (nil if running)
 }
 
@@ -166,19 +166,19 @@ type ConversationMessage struct {
 	ID        int64
 	ChatID    int64
 	ThreadID  int64
-	Role      string    // "user" or "assistant"
+	Role      string // "user" or "assistant"
 	Content   string
-	TgMsgID   int64     // Telegram message ID (user messages only; 0 for assistant)
+	TgMsgID   int64 // Telegram message ID (user messages only; 0 for assistant)
 	CreatedAt time.Time
 }
 
 // UpdateFailure represents a failed update check, persisted to surface silent updater failures.
 type UpdateFailure struct {
-	ID         int64     // Auto-increment ID
-	ErrorType  string    // 'build_failed', 'go_not_found', 'git_error', 'uncommitted_changes'
-	ErrorMsg   string    // Detailed error message
+	ID          int64     // Auto-increment ID
+	ErrorType   string    // 'build_failed', 'go_not_found', 'git_error', 'uncommitted_changes'
+	ErrorMsg    string    // Detailed error message
 	AttemptedAt time.Time // When the failure occurred
-	Resolved   bool      // Whether the failure has been resolved (success after failure)
+	Resolved    bool      // Whether the failure has been resolved (success after failure)
 }
 
 // UpdateSuccess represents a self-update that was applied and then verified
@@ -242,17 +242,17 @@ var migrations = []string{
 	// Version 3 — add icon_color to sessions
 	`ALTER TABLE sessions ADD COLUMN icon_color INTEGER NOT NULL DEFAULT 7322096;`, // 0x6FB9F0 (light blue)
 
-		// Version 4 — add pinned_message_id to sessions
-		`ALTER TABLE sessions ADD COLUMN pinned_message_id INTEGER NOT NULL DEFAULT 0;`,
+	// Version 4 — add pinned_message_id to sessions
+	`ALTER TABLE sessions ADD COLUMN pinned_message_id INTEGER NOT NULL DEFAULT 0;`,
 
-		// Version 5 — add total_cost_usd to sessions
-		`ALTER TABLE sessions ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0;`,
+	// Version 5 — add total_cost_usd to sessions
+	`ALTER TABLE sessions ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0;`,
 
-		// Version 6 — add summary to sessions
-		`ALTER TABLE sessions ADD COLUMN summary TEXT;`,
+	// Version 6 — add summary to sessions
+	`ALTER TABLE sessions ADD COLUMN summary TEXT;`,
 
-		// Version 7 — add cost_events table for detailed cost tracking
-		`CREATE TABLE IF NOT EXISTS cost_events (
+	// Version 7 — add cost_events table for detailed cost tracking
+	`CREATE TABLE IF NOT EXISTS cost_events (
 			id          INTEGER PRIMARY KEY AUTOINCREMENT,
 			chat_id     INTEGER NOT NULL,
 			thread_id   INTEGER NOT NULL,
@@ -267,27 +267,27 @@ var migrations = []string{
 
 		CREATE INDEX IF NOT EXISTS idx_cost_events_chat_thread ON cost_events(chat_id, thread_id);
 		CREATE INDEX IF NOT EXISTS idx_cost_events_created_at ON cost_events(created_at);`,
-		// Version 8 — add notification_mode to sessions
-		`ALTER TABLE sessions ADD COLUMN notification_mode TEXT NOT NULL DEFAULT 'live';`,
+	// Version 8 — add notification_mode to sessions
+	`ALTER TABLE sessions ADD COLUMN notification_mode TEXT NOT NULL DEFAULT 'live';`,
 
-		// Version 9 — add tool restrictions to groups
-		`ALTER TABLE groups ADD COLUMN allowed_tools TEXT;
+	// Version 9 — add tool restrictions to groups
+	`ALTER TABLE groups ADD COLUMN allowed_tools TEXT;
 		 ALTER TABLE groups ADD COLUMN disallowed_tools TEXT;`,
 
-		// Version 10 — raise default timeout from 300s to 1800s for existing groups.
-		// Only updates groups still at the old hardcoded default (300); groups
-		// explicitly configured to another value are left untouched.
-		// timeout_sec = 0 is now the sentinel for "no timeout".
-		`UPDATE groups SET timeout_sec = 1800 WHERE timeout_sec = 300;`,
-		// Version 11 — add timeout_sec to sessions for per-topic timeout override.
-		// Default 0 means "use group timeout" (group-level fallback).
-		`ALTER TABLE sessions ADD COLUMN timeout_sec INTEGER NOT NULL DEFAULT 0;`,
+	// Version 10 — raise default timeout from 300s to 1800s for existing groups.
+	// Only updates groups still at the old hardcoded default (300); groups
+	// explicitly configured to another value are left untouched.
+	// timeout_sec = 0 is now the sentinel for "no timeout".
+	`UPDATE groups SET timeout_sec = 1800 WHERE timeout_sec = 300;`,
+	// Version 11 — add timeout_sec to sessions for per-topic timeout override.
+	// Default 0 means "use group timeout" (group-level fallback).
+	`ALTER TABLE sessions ADD COLUMN timeout_sec INTEGER NOT NULL DEFAULT 0;`,
 
-		// Version 12 — add max_subtasks to groups for parallel subtask limiting.
-		`ALTER TABLE groups ADD COLUMN max_subtasks INTEGER NOT NULL DEFAULT 5;`,
+	// Version 12 — add max_subtasks to groups for parallel subtask limiting.
+	`ALTER TABLE groups ADD COLUMN max_subtasks INTEGER NOT NULL DEFAULT 5;`,
 
-		// Version 13 — add subtasks table for parallel task orchestration.
-		`CREATE TABLE IF NOT EXISTS subtasks (
+	// Version 13 — add subtasks table for parallel task orchestration.
+	`CREATE TABLE IF NOT EXISTS subtasks (
 			id           TEXT PRIMARY KEY,
 			chat_id      INTEGER NOT NULL,
 			thread_id    INTEGER NOT NULL,
@@ -304,8 +304,8 @@ var migrations = []string{
 		CREATE INDEX IF NOT EXISTS idx_subtasks_chat_thread ON subtasks(chat_id, thread_id);
 		CREATE INDEX IF NOT EXISTS idx_subtasks_status ON subtasks(status);`,
 
-			// Version 14 — add background_jobs table for background shell job runner.
-			`CREATE TABLE IF NOT EXISTS background_jobs (
+	// Version 14 — add background_jobs table for background shell job runner.
+	`CREATE TABLE IF NOT EXISTS background_jobs (
 				id          TEXT PRIMARY KEY,
 				chat_id     INTEGER NOT NULL,
 				thread_id   INTEGER NOT NULL,
@@ -319,11 +319,11 @@ var migrations = []string{
 			CREATE INDEX IF NOT EXISTS idx_background_jobs_chat_thread ON background_jobs(chat_id, thread_id);
 			CREATE INDEX IF NOT EXISTS idx_background_jobs_status ON background_jobs(status);`,
 
-			// Version 15 — add progress_interval_sec to groups for progress ticker.
-			`ALTER TABLE groups ADD COLUMN progress_interval_sec INTEGER NOT NULL DEFAULT 120;`,
+	// Version 15 — add progress_interval_sec to groups for progress ticker.
+	`ALTER TABLE groups ADD COLUMN progress_interval_sec INTEGER NOT NULL DEFAULT 120;`,
 
-			// Version 16 — add workers table for spawn_worker synthetic tool and max_workers to groups.
-			`ALTER TABLE groups ADD COLUMN max_workers INTEGER NOT NULL DEFAULT 5;
+	// Version 16 — add workers table for spawn_worker synthetic tool and max_workers to groups.
+	`ALTER TABLE groups ADD COLUMN max_workers INTEGER NOT NULL DEFAULT 5;
 
 			CREATE TABLE IF NOT EXISTS workers (
 				id           TEXT PRIMARY KEY,
@@ -343,15 +343,15 @@ var migrations = []string{
 			CREATE INDEX IF NOT EXISTS idx_workers_chat_thread ON workers(chat_id, thread_id);
 			CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status);`,
 
-			// Version 17 — add dispatcher_mode to groups and sessions for orchestrator system prompt injection.
-			`ALTER TABLE groups ADD COLUMN dispatcher_mode INTEGER NOT NULL DEFAULT 1;
+	// Version 17 — add dispatcher_mode to groups and sessions for orchestrator system prompt injection.
+	`ALTER TABLE groups ADD COLUMN dispatcher_mode INTEGER NOT NULL DEFAULT 1;
 			 ALTER TABLE sessions ADD COLUMN dispatcher_mode INTEGER NOT NULL DEFAULT -1;`,
 
-			// Version 18 — add from_user_id to cost_events for per-user attribution.
-			`ALTER TABLE cost_events ADD COLUMN from_user_id INTEGER NOT NULL DEFAULT 0;`,
+	// Version 18 — add from_user_id to cost_events for per-user attribution.
+	`ALTER TABLE cost_events ADD COLUMN from_user_id INTEGER NOT NULL DEFAULT 0;`,
 
-			// Version 19 — add snippets table for context snippet management (Phase 5.2).
-			`CREATE TABLE IF NOT EXISTS snippets (
+	// Version 19 — add snippets table for context snippet management (Phase 5.2).
+	`CREATE TABLE IF NOT EXISTS snippets (
 				id         INTEGER PRIMARY KEY AUTOINCREMENT,
 				chat_id    INTEGER NOT NULL,
 				name       TEXT NOT NULL,
@@ -362,10 +362,10 @@ var migrations = []string{
 
 			CREATE INDEX IF NOT EXISTS idx_snippets_chat_id ON snippets(chat_id);`,
 
-			// Version 20 — conversation history table, independent of Claude sessions.
-			// Stores every user message and assistant response so history survives
-			// session loss, binary restarts, or --resume failures.
-			`CREATE TABLE IF NOT EXISTS conversation_messages (
+	// Version 20 — conversation history table, independent of Claude sessions.
+	// Stores every user message and assistant response so history survives
+	// session loss, binary restarts, or --resume failures.
+	`CREATE TABLE IF NOT EXISTS conversation_messages (
 				id         INTEGER PRIMARY KEY AUTOINCREMENT,
 				chat_id    INTEGER NOT NULL,
 				thread_id  INTEGER NOT NULL,
@@ -378,20 +378,20 @@ var migrations = []string{
 			CREATE INDEX IF NOT EXISTS idx_conv_msgs_topic
 				ON conversation_messages (chat_id, thread_id, created_at);`,
 
-			// Version 21 — add topic_name to sessions for /context command lookup.
-			`ALTER TABLE sessions ADD COLUMN topic_name TEXT;`,
+	// Version 21 — add topic_name to sessions for /context command lookup.
+	`ALTER TABLE sessions ADD COLUMN topic_name TEXT;`,
 
-			// Version 22 — add transcript_verify to groups for opt-in audio transcription verification.
-			`ALTER TABLE groups ADD COLUMN transcript_verify INTEGER NOT NULL DEFAULT 0;`,
+	// Version 22 — add transcript_verify to groups for opt-in audio transcription verification.
+	`ALTER TABLE groups ADD COLUMN transcript_verify INTEGER NOT NULL DEFAULT 0;`,
 
-				// Version 23 — add last_from_user_id to sessions for per-user last message attribution.
-				`ALTER TABLE sessions ADD COLUMN last_from_user_id INTEGER NOT NULL DEFAULT 0;`,
+	// Version 23 — add last_from_user_id to sessions for per-user last message attribution.
+	`ALTER TABLE sessions ADD COLUMN last_from_user_id INTEGER NOT NULL DEFAULT 0;`,
 
-				// Version 24 — add processed_updates table for update deduplication.
-				// Tracks which Telegram update_ids have been processed to prevent replay
-				// after proxy restarts or offset loss. The update_id is the unique,
-				// monotonically-increasing identifier from Telegram's getUpdates API.
-				`CREATE TABLE IF NOT EXISTS processed_updates (
+	// Version 24 — add processed_updates table for update deduplication.
+	// Tracks which Telegram update_ids have been processed to prevent replay
+	// after proxy restarts or offset loss. The update_id is the unique,
+	// monotonically-increasing identifier from Telegram's getUpdates API.
+	`CREATE TABLE IF NOT EXISTS processed_updates (
 					update_id INTEGER PRIMARY KEY,
 					processed_at TEXT NOT NULL DEFAULT (datetime('now'))
 				);
@@ -399,9 +399,9 @@ var migrations = []string{
 				CREATE INDEX IF NOT EXISTS idx_processed_updates_at
 					ON processed_updates (processed_at);`,
 
-				// Version 25 — add budget_alerts table for tracking one-time budget threshold alerts.
-				// Tracks which groups have already received alerts at 80% and 100% budget thresholds.
-				`CREATE TABLE IF NOT EXISTS budget_alerts (
+	// Version 25 — add budget_alerts table for tracking one-time budget threshold alerts.
+	// Tracks which groups have already received alerts at 80% and 100% budget thresholds.
+	`CREATE TABLE IF NOT EXISTS budget_alerts (
 					chat_id      INTEGER NOT NULL,
 					threshold    INTEGER NOT NULL, -- 80 for 80%, 100 for 100%
 					alerted_at   TEXT NOT NULL DEFAULT (datetime('now')),
@@ -410,9 +410,9 @@ var migrations = []string{
 
 				CREATE INDEX IF NOT EXISTS idx_budget_alerts_chat ON budget_alerts(chat_id);`,
 
-			// Version 26 — add update_failures table for tracking update check failures.
-			// Surfaces silent updater failures to operators via /status and /update commands.
-			`CREATE TABLE IF NOT EXISTS update_failures (
+	// Version 26 — add update_failures table for tracking update check failures.
+	// Surfaces silent updater failures to operators via /status and /update commands.
+	`CREATE TABLE IF NOT EXISTS update_failures (
 				id         INTEGER PRIMARY KEY AUTOINCREMENT,
 				error_type TEXT NOT NULL,    -- 'build_failed', 'go_not_found', 'git_error', 'uncommitted_changes'
 				error_msg  TEXT NOT NULL,     -- detailed error message
@@ -423,11 +423,11 @@ var migrations = []string{
 			CREATE INDEX IF NOT EXISTS idx_update_failures_created_at ON update_failures(attempted_at);
 			CREATE INDEX IF NOT EXISTS idx_update_failures_resolved ON update_failures(resolved);`,
 
-			// Version 27 — add update_history table recording each self-update
-			// that was applied AND verified healthy. update_failures records the
-			// skips/errors; this records the successes, so an external poller can
-			// detect a stalled updater (ADR-001) via /metrics instead of journald.
-			`CREATE TABLE IF NOT EXISTS update_history (
+	// Version 27 — add update_history table recording each self-update
+	// that was applied AND verified healthy. update_failures records the
+	// skips/errors; this records the successes, so an external poller can
+	// detect a stalled updater (ADR-001) via /metrics instead of journald.
+	`CREATE TABLE IF NOT EXISTS update_history (
 				id          INTEGER PRIMARY KEY AUTOINCREMENT,
 				from_commit TEXT NOT NULL,
 				to_commit   TEXT NOT NULL,
@@ -436,7 +436,8 @@ var migrations = []string{
 			);
 
 			CREATE INDEX IF NOT EXISTS idx_update_history_verified_at ON update_history(verified_at);`,
-		}
+}
+
 // OpenDB opens (or creates) the SQLite database at path, enables WAL mode,
 // and applies any pending migrations.
 func OpenDB(path string) (*DB, error) {
@@ -561,8 +562,6 @@ func (d *DB) UpsertGroup(ctx context.Context, g *Group) error {
 	)
 	return err
 }
-
-
 
 // ListGroups returns all configured groups.
 func (d *DB) ListGroups(ctx context.Context) ([]*Group, error) {
@@ -723,8 +722,8 @@ func (d *DB) UpdateSession(ctx context.Context, s *Session) error {
 		s.NotificationMode,
 		s.TimeoutSec,
 		s.DispatcherMode,
-			nullableString(s.TopicName),
-			s.LastFromUserID,
+		nullableString(s.TopicName),
+		s.LastFromUserID,
 		s.ChatID, s.ThreadID,
 	)
 	return err
@@ -883,6 +882,18 @@ func (d *DB) SetSessionPinnedMessageID(ctx context.Context, chatID, threadID int
 // ListStaleSessions returns sessions where last_active is older than ttl.
 // Only returns sessions with status='active' — already inactive/closed sessions are excluded.
 func (d *DB) ListStaleSessions(ctx context.Context, ttl time.Duration) ([]*Session, error) {
+	return d.ListStaleSessionsAt(ctx, time.Now().UTC(), ttl)
+}
+
+// ListStaleSessionsAt is the deterministic form of ListStaleSessions. A
+// session exactly at the cutoff is still active; only sessions strictly older
+// than the idle threshold are returned.
+func (d *DB) ListStaleSessionsAt(ctx context.Context, now time.Time, ttl time.Duration) ([]*Session, error) {
+	if ttl <= 0 {
+		return nil, nil
+	}
+
+	cutoff := now.UTC().Add(-ttl).Format(time.RFC3339Nano)
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT chat_id, thread_id, session_id, cwd, COALESCE(model,''), status,
 			        created_at, last_active, message_count, icon_color, pinned_message_id, total_cost_usd,
@@ -890,9 +901,9 @@ func (d *DB) ListStaleSessions(ctx context.Context, ttl time.Duration) ([]*Sessi
 			        COALESCE(topic_name,''), COALESCE(last_from_user_id,0)
 			 FROM sessions
 			 WHERE status = 'active'
-			   AND datetime(last_active) < datetime('now', '-' || ? || ' seconds')
+			   AND julianday(last_active) < julianday(?)
 			 ORDER BY last_active ASC`,
-		int64(ttl.Seconds()),
+		cutoff,
 	)
 	if err != nil {
 		return nil, err
@@ -908,6 +919,25 @@ func (d *DB) ListStaleSessions(ctx context.Context, ttl time.Duration) ([]*Sessi
 		sessions = append(sessions, s)
 	}
 	return sessions, rows.Err()
+}
+
+// MarkSessionInactiveIfStale atomically marks an active session inactive only
+// if it is still older than cutoff. The re-check prevents a message received
+// while a cleanup cycle is generating a summary from being deactivated.
+func (d *DB) MarkSessionInactiveIfStale(ctx context.Context, chatID, threadID int64, cutoff time.Time) (bool, error) {
+	result, err := d.db.ExecContext(ctx,
+		`UPDATE sessions
+		 SET status = 'inactive', icon_color = ?
+		 WHERE chat_id = ? AND thread_id = ?
+		   AND status = 'active'
+		   AND julianday(last_active) < julianday(?)`,
+		ColorComplete, chatID, threadID, cutoff.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	return changed == 1, err
 }
 
 // SetSessionStatus updates the status field for a session.
@@ -1013,9 +1043,9 @@ func (d *DB) GetTopicTotalCost(ctx context.Context, chatID, threadID int64) (flo
 
 // TopicCostSummary holds cost breakdown for a single topic.
 type TopicCostSummary struct {
-	ThreadID    int64
-	TotalCost   float64
-	EventCount  int
+	ThreadID   int64
+	TotalCost  float64
+	EventCount int
 }
 
 // GetCostsByTopic returns a list of topics with their costs for a group.
@@ -1047,7 +1077,7 @@ func (d *DB) GetCostsByTopic(ctx context.Context, chatID int64) ([]*TopicCostSum
 
 // DailyCostSummary holds cost data for a single day.
 type DailyCostSummary struct {
-	Date    string
+	Date      string
 	TotalCost float64
 }
 
@@ -1964,7 +1994,7 @@ func scanWorker(s workerScanner) (*Worker, error) {
 	return &w, nil
 }
 
-	// ── snippets ─────────────────────────────────────────────────────────────────────
+// ── snippets ─────────────────────────────────────────────────────────────────────
 
 // CreateSnippet inserts a new snippet record.
 func (d *DB) CreateSnippet(ctx context.Context, s *Snippet) error {
