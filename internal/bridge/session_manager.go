@@ -396,6 +396,7 @@ type SessionManager struct {
 	eventPublisher events.Publishable
 	ptyMgr         *PTYManager
 	commandExec    commandExec // for executing external commands (whisper, ffmpeg, etc.)
+	authorizer     *Authorizer // nil for standalone callers; set by the bridge entry point
 
 	mu                   sync.Mutex
 	topics               map[topicKey]*topicWorker
@@ -637,6 +638,22 @@ func NewSessionManager(db *DB, sender *Sender, proxyURL string, eventPublisher e
 	}
 	m.workerPool = NewWorkerPool(db, sender, m, globalMaxWorkers)
 	return m
+}
+
+// SetAuthorizer installs the process-wide authorization policy used for
+// natural-language session controls. Command forms are checked by
+// CommandHandler; this second entry point closes the equivalent intent path.
+func (m *SessionManager) SetAuthorizer(authorizer *Authorizer) {
+	if authorizer != nil {
+		m.authorizer = authorizer
+	}
+}
+
+func (m *SessionManager) isAdmin(ctx context.Context, userID int64) (bool, error) {
+	if m.authorizer == nil {
+		return true, nil
+	}
+	return m.authorizer.IsAdmin(ctx, userID)
 }
 
 // PTYManager returns the shared PTYManager for use by other bridge components.
@@ -930,6 +947,17 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	if last.update.Content != nil && last.update.Content.Text != nil {
 		isCancelOnly, remainder := detectCancelIntent(*last.update.Content.Text)
 		if isCancelOnly || remainder != "" {
+			admin, err := m.isAdmin(ctx, last.update.FromUser.ID)
+			if err != nil {
+				log.Printf("[session_mgr] cancel authorization check: %v", err)
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Permission denied. Administrator authorization could not be verified.")
+				return
+			}
+			if !admin {
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Permission denied. Only admins can cancel session requests.")
+				return
+			}
+
 			// Cancel intent detected
 			if m.CancelTopic(ctx, key.chatID, key.threadID, 0) {
 				// Successfully cancelled an active invocation
@@ -990,6 +1018,17 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 
 		newModel, cleanedText, tierDelta := detectModelChange(*last.update.Content.Text)
 		if newModel != "" || tierDelta != 0 {
+			admin, err := m.isAdmin(ctx, last.update.FromUser.ID)
+			if err != nil {
+				log.Printf("[session_mgr] model authorization check: %v", err)
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Permission denied. Administrator authorization could not be verified.")
+				return
+			}
+			if !admin {
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Permission denied. Only admins can change the model.")
+				return
+			}
+
 			var targetModel string
 			var changeMsg string
 
@@ -1186,6 +1225,17 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	if last.update.Content != nil && last.update.Content.Text != nil {
 		detected, _ := detectCloseIntent(*last.update.Content.Text)
 		if detected {
+			admin, err := m.isAdmin(ctx, last.update.FromUser.ID)
+			if err != nil {
+				log.Printf("[session_mgr] close authorization check: %v", err)
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Permission denied. Administrator authorization could not be verified.")
+				return
+			}
+			if !admin {
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Permission denied. Only admins can close sessions.")
+				return
+			}
+
 			if session == nil {
 				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "No active session to close.")
 				return
@@ -1227,6 +1277,17 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	if last.update.Content != nil && last.update.Content.Text != nil {
 		intent := detectTimeoutIntent(*last.update.Content.Text)
 		if intent.detected {
+			admin, err := m.isAdmin(ctx, last.update.FromUser.ID)
+			if err != nil {
+				log.Printf("[session_mgr] timeout authorization check: %v", err)
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Permission denied. Administrator authorization could not be verified.")
+				return
+			}
+			if !admin {
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Permission denied. Only admins can change session timeouts.")
+				return
+			}
+
 			// Create or update session if needed
 			if session == nil {
 				session = &Session{
@@ -1297,6 +1358,17 @@ func (m *SessionManager) processBatch(ctx context.Context, key topicKey, batch [
 	if last.update.Content != nil && last.update.Content.Text != nil {
 		intent := detectNewSessionIntent(*last.update.Content.Text)
 		if intent.detected {
+			admin, err := m.isAdmin(ctx, last.update.FromUser.ID)
+			if err != nil {
+				log.Printf("[session_mgr] new-session authorization check: %v", err)
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Permission denied. Administrator authorization could not be verified.")
+				return
+			}
+			if !admin {
+				_ = m.sender.SendResponse(ctx, key.chatID, tidPtr, origMsgID, "Permission denied. Only admins can create sessions.")
+				return
+			}
+
 			// Create the new topic and session
 			threadID, err := m.createNewSession(ctx, key.chatID, group, intent.topicName, intent.remainder)
 			if err != nil {

@@ -171,6 +171,16 @@ func newTestCommandHandler(t *testing.T, db *DB) *CommandHandler {
 	}))
 
 	h := NewCommandHandler(db, nil, srv.URL, nil, nil, "v1.0.0", "abc123", "2024-01-01")
+	// Most legacy command tests call handlers directly without setting up an
+	// allowlist. Keep those fixtures explicit administrators, while preserving
+	// tests that seed a non-admin row before constructing the handler.
+	if users, err := db.ListAllowedUsers(context.Background()); err == nil && len(users) == 0 {
+		for _, userID := range []int64{42, 12345} {
+			if err := db.UpsertAllowedUser(context.Background(), &AllowedUser{UserID: userID, Role: "admin"}); err != nil {
+				t.Fatalf("seed test admin %d: %v", userID, err)
+			}
+		}
+	}
 	t.Cleanup(srv.Close)
 
 	return h
@@ -312,7 +322,6 @@ func TestCmdCWD_ShowCurrent(t *testing.T) {
 	if err := db.UpsertGroup(ctx, group); err != nil {
 		t.Fatalf("upsert group: %v", err)
 	}
-
 	h := newTestCommandHandler(t, db)
 
 	threadID := int64(1)
@@ -368,7 +377,6 @@ func TestCmdCWD_SetPath_AdminCheck(t *testing.T) {
 	if err := db.UpsertGroup(ctx, group); err != nil {
 		t.Fatalf("upsert group: %v", err)
 	}
-
 	h := newTestCommandHandler(t, db)
 	update := makeUpdate(100, nil, 100, "/cwd /new/path", 12345)
 
@@ -1583,7 +1591,7 @@ func TestCmdSessions_NoSessions(t *testing.T) {
 
 	h := newTestCommandHandler(t, db)
 
-	reply, err := h.cmdSessions(ctx)
+	reply, err := h.cmdSessions(ctx, makeUpdate(100, nil, 1, "/sessions", 42))
 	if err != nil {
 		t.Fatalf("cmdSessions: %v", err)
 	}
@@ -1627,7 +1635,7 @@ func TestCmdSessions_WithSessions(t *testing.T) {
 
 	h := newTestCommandHandler(t, db)
 
-	reply, err := h.cmdSessions(ctx)
+	reply, err := h.cmdSessions(ctx, makeUpdate(100, nil, 1, "/sessions", 42))
 	if err != nil {
 		t.Fatalf("cmdSessions: %v", err)
 	}
@@ -3881,6 +3889,9 @@ func TestCmdNew_Validation(t *testing.T) {
 func TestCmdNew_Success(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 42, Role: "admin"}); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
 
 	cwd := t.TempDir()
 	group := &Group{ChatID: 100, CWD: cwd, DefaultModel: "claude-sonnet-4-6", CreatedAt: time.Now().UTC()}
@@ -3987,6 +3998,9 @@ func TestCmdNew_Success(t *testing.T) {
 func TestCmdNew_CreateTopicProxyError(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 42, Role: "admin"}); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
 
 	group := &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}
 	if err := db.UpsertGroup(ctx, group); err != nil {
@@ -4440,9 +4454,9 @@ func TestCmdUsage(t *testing.T) {
 			want:     []string{"No usage data found for any users."},
 		},
 		{
-			name:     "all users summary sorted by cost",
-			senderID: 42,
-			args:     "",
+			name:      "all users summary sorted by cost",
+			senderID:  42,
+			args:      "",
 			withCosts: true,
 			want: []string{
 				"Usage Report — All Users",
@@ -4452,9 +4466,9 @@ func TestCmdUsage(t *testing.T) {
 			},
 		},
 		{
-			name:     "per-user detail",
-			senderID: 42,
-			args:     "42",
+			name:      "per-user detail",
+			senderID:  42,
+			args:      "42",
 			withCosts: true,
 			want: []string{
 				"Usage Report — User 42",
@@ -5012,15 +5026,15 @@ func TestCommandHandler_Handle_ModelShortcutsAndAdminCommands(t *testing.T) {
 		wantReply string
 	}{
 		{
-			name:  "haiku shortcut sets model",
-			setup: func(t *testing.T, db *DB) { seedAdminAndGroup(t, db); seedSession(t, db) },
-			text:  "/haiku",
+			name:      "haiku shortcut sets model",
+			setup:     func(t *testing.T, db *DB) { seedAdminAndGroup(t, db); seedSession(t, db) },
+			text:      "/haiku",
 			wantReply: "Model set to: claude-haiku-4-5",
 		},
 		{
-			name:  "sonnet shortcut sets model",
-			setup: func(t *testing.T, db *DB) { seedAdminAndGroup(t, db); seedSession(t, db) },
-			text:  "/sonnet",
+			name:      "sonnet shortcut sets model",
+			setup:     func(t *testing.T, db *DB) { seedAdminAndGroup(t, db); seedSession(t, db) },
+			text:      "/sonnet",
 			wantReply: "Model set to: claude-sonnet-4-6",
 		},
 		{
@@ -5063,14 +5077,14 @@ func TestCommandHandler_Handle_ModelShortcutsAndAdminCommands(t *testing.T) {
 			wantReply: "Usage Report — User 42",
 		},
 		{
-			name:  "new routes without registration",
-			text:  "/new some topic",
+			name:      "new routes without registration",
+			text:      "/new some topic",
 			wantReply: "This group is not registered. Use /cwd <path> to register it.",
 		},
 		{
-			name:  "close routes with args",
-			setup: seedAdminAndGroup,
-			text:  "/close notanumber",
+			name:      "close routes with args",
+			setup:     seedAdminAndGroup,
+			text:      "/close notanumber",
 			wantReply: `Invalid thread_id "notanumber"`,
 		},
 	}
@@ -5108,6 +5122,7 @@ func TestCommandHandler_Handle_ModelShortcutsAndAdminCommands(t *testing.T) {
 			defer sender.Close()
 
 			h := NewCommandHandler(db, sender, srv.URL, nil, nil, "1.0.0", "abc123", "2024-01-01")
+			h.SetAdminUserID(42)
 			// Model shortcuts and /close need a thread; user-management
 			// commands need the General topic. Both use thread 10 only when a
 			// session was seeded; otherwise the update has no thread.

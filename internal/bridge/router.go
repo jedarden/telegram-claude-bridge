@@ -113,16 +113,7 @@ type Router struct {
 	db             *DB
 	rateLimiter    *rateLimiter
 	eventPublisher events.Publishable
-
-	// allowedChatID restricts routing to one Telegram chat when non-zero. A
-	// zero value preserves the documented "all chats" behavior.
-	allowedChatID int64
-
-	// adminUserID is the bootstrap administrator configured through
-	// ADMIN_USER_ID. It is allowed through even if an administrator's database
-	// allow-list row is accidentally removed; the chat restriction still
-	// applies.
-	adminUserID int64
+	authorizer     *Authorizer
 
 	// OnCommand is called for bot commands in the General topic.
 	OnCommand CommandHandlerFunc
@@ -142,32 +133,44 @@ type Router struct {
 // allowedChatID argument is intended for the bridge's ALLOWED_CHAT_ID setting;
 // omitting it or passing zero accepts updates from every chat.
 func NewRouter(db *DB, eventPublisher events.Publishable, allowedChatID ...int64) *Router {
+	configuredChatID := int64(0)
+	if len(allowedChatID) > 0 {
+		configuredChatID = allowedChatID[0]
+	}
 	r := &Router{
 		db:             db,
 		rateLimiter:    newRateLimiter(),
 		eventPublisher: eventPublisher,
-	}
-	if len(allowedChatID) > 0 {
-		r.allowedChatID = allowedChatID[0]
+		authorizer:     NewAuthorizer(db, configuredChatID, 0),
 	}
 	return r
+}
+
+// SetAuthorizer installs the process-wide authorization policy. It is used by
+// main so routing and command/session handlers evaluate the same identity and
+// chat boundary.
+func (r *Router) SetAuthorizer(authorizer *Authorizer) {
+	if authorizer != nil {
+		r.authorizer = authorizer
+	}
 }
 
 // SetAdminUserID configures the administrator bootstrapped by ADMIN_USER_ID.
 // Additional administrators remain controlled by the allowed_users table.
 func (r *Router) SetAdminUserID(userID int64) {
-	r.adminUserID = userID
+	r.authorizer.SetAdminUserID(userID)
 }
 
 // Route classifies update and dispatches it to the registered handler.
 //
 // Routing order:
 //  1. Drop updates from unauthorized users silently.
-//  2. Rate limiting for non-callback, non-service messages.
-//  3. callback_query → OnCallback
-//  4. service message → OnService
-//  5. General topic (thread_id nil or 1) + command → OnCommand
-//  6. Named topic (thread_id non-nil, non-1) → look up session, then OnSession;
+//  2. Drop callback queries from non-admin users silently.
+//  3. Rate limiting for non-callback, non-service messages.
+//  4. callback_query → OnCallback
+//  5. service message → OnService
+//  6. General topic (thread_id nil or 1) + command → OnCommand
+//  7. Named topic (thread_id non-nil, non-1) → look up session, then OnSession;
 //     if group is unregistered, drop silently.
 //
 // Non-command messages in the General topic are silently ignored.
@@ -176,18 +179,27 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 	// Apply the chat boundary before touching user authorization or dispatching
 	// any callback/service update. Rejected chats are intentionally silent so
 	// they cannot use the bot to enumerate its configured chat or users.
-	if r.allowedChatID != 0 && update.ChatID != r.allowedChatID {
-		return
-	}
-
-	// ── 2. User authorization ────────────────────────────────────────────────────
-	allowed, err := r.db.IsUserAllowed(ctx, update.FromUser.ID)
+	allowed, err := r.authorizer.CanReceiveUpdate(ctx, update)
 	if err != nil {
 		log.Printf("[router] auth check failed for user %d: %v", update.FromUser.ID, err)
 		return
 	}
-	if !allowed && (r.adminUserID <= 0 || update.FromUser.ID != r.adminUserID) {
+	if !allowed {
 		return // silently drop
+	}
+
+	// ── 2. Callback authorization ─────────────────────────────────────────────────
+	// Callback actions can approve tool use or submit transcribed content. They
+	// are privileged even when the originating user is otherwise allow-listed.
+	if update.Type == "callback_query" {
+		allowed, err := r.authorizer.CanApproveCallback(ctx, update)
+		if err != nil {
+			log.Printf("[router] callback auth check failed for user %d: %v", update.FromUser.ID, err)
+			return
+		}
+		if !allowed {
+			return // silently drop
+		}
 	}
 
 	// ── 3. Rate limiting ──────────────────────────────────────────────────────────
@@ -205,7 +217,7 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 		}
 	}
 
-	// ── 4. Callback query ────────────────────────────────────────────────────────
+	// ── 5. Callback query ────────────────────────────────────────────────────────
 	if update.Type == "callback_query" {
 		if r.OnCallback != nil {
 			r.OnCallback(ctx, update)
@@ -213,7 +225,7 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 		return
 	}
 
-	// ── 5. Service message ───────────────────────────────────────────────────────
+	// ── 6. Service message ───────────────────────────────────────────────────────
 	if update.Type == "service" {
 		if r.OnService != nil {
 			r.OnService(ctx, update)
@@ -221,7 +233,7 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 		return
 	}
 
-	// ── 6. General topic ─────────────────────────────────────────────────────────
+	// ── 7. General topic ─────────────────────────────────────────────────────────
 	isGeneral := update.ThreadID == nil || *update.ThreadID == generalTopicID
 	if isGeneral {
 		if update.Content != nil && update.Content.IsCommand() && r.OnCommand != nil {
@@ -252,7 +264,7 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 		return
 	}
 
-	// ── 7. Named topic ───────────────────────────────────────────────────────────
+	// ── 8. Named topic ───────────────────────────────────────────────────────────
 	tid := *update.ThreadID
 
 	// Publish message received event (Phase 6 format)

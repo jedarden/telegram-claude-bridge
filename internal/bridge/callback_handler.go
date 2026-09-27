@@ -15,11 +15,12 @@ import (
 // CallbackHandler handles callback_query updates from inline keyboard buttons.
 // It manages the tool approval flow when Claude runs in plan permission mode.
 type CallbackHandler struct {
-	db           *DB
-	sender       *Sender
-	proxyURL     string
-	client       *http.Client
-	sessionMgr   *SessionManager
+	db         *DB
+	sender     *Sender
+	proxyURL   string
+	client     *http.Client
+	sessionMgr *SessionManager
+	authorizer *Authorizer
 }
 
 // NewCallbackHandler creates a CallbackHandler with the given dependencies.
@@ -33,9 +34,30 @@ func NewCallbackHandler(db *DB, sender *Sender, proxyURL string, client *http.Cl
 	}
 }
 
+// SetAuthorizer installs the process-wide authorization policy. Router-level
+// admission is the primary boundary; this check protects the callback handler
+// if it is ever invoked directly by another bridge component.
+func (h *CallbackHandler) SetAuthorizer(authorizer *Authorizer) {
+	if authorizer != nil {
+		h.authorizer = authorizer
+	}
+}
+
 // Handle implements CallbackHandlerFunc. It processes callback_query updates
 // from inline keyboard buttons, handling tool approvals and denials.
 func (h *CallbackHandler) Handle(ctx context.Context, update contract.Update) {
+	if h.authorizer != nil {
+		allowed, err := h.authorizer.CanApproveCallback(ctx, update)
+		if err != nil {
+			log.Printf("[callback] authorization check failed for user %d: %v", update.FromUser.ID, err)
+			return
+		}
+		if !allowed {
+			log.Printf("[callback] unauthorized callback from user %d, dropping", update.FromUser.ID)
+			return
+		}
+	}
+
 	if update.Content == nil || update.Content.CallbackQueryID == nil || update.Content.Data == nil {
 		log.Printf("[callback] missing callback data, update %d", update.UpdateID)
 		return

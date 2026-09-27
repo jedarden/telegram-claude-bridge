@@ -147,7 +147,9 @@ func TestRouter_UnauthorizedUserDropped(t *testing.T) {
 
 func TestRouter_CallbackQuery(t *testing.T) {
 	db := openTestDB(t)
-	seedUser(t, db, 1)
+	if err := db.UpsertAllowedUser(context.Background(), &AllowedUser{UserID: 1, Role: "admin"}); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
 	r := NewRouter(db, nil)
 
 	var got *contract.Update
@@ -160,6 +162,20 @@ func TestRouter_CallbackQuery(t *testing.T) {
 	}
 	if got.Type != "callback_query" {
 		t.Fatalf("expected callback_query, got %q", got.Type)
+	}
+}
+
+func TestRouter_CallbackQuery_DropsAllowedNonAdmin(t *testing.T) {
+	db := openTestDB(t)
+	seedUser(t, db, 1)
+	r := NewRouter(db, nil)
+
+	called := false
+	r.OnCallback = func(context.Context, contract.Update) { called = true }
+	r.Route(context.Background(), callbackUpdate(1, 100))
+
+	if called {
+		t.Fatal("non-admin callback must be dropped before the callback handler")
 	}
 }
 
@@ -361,7 +377,9 @@ func TestRouter_NilHandlers_NoPanic(t *testing.T) {
 // subsequent command must complete without waiting for the summary.
 func TestRouter_CloseSummaryDoesNotBlockSubsequentUpdates(t *testing.T) {
 	db := openTestDB(t)
-	seedUser(t, db, 1)
+	if err := db.UpsertAllowedUser(context.Background(), &AllowedUser{UserID: 1, Role: "admin"}); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
 	seedGroup(t, db, 100)
 	seedSession(t, db, 100, 10)
 

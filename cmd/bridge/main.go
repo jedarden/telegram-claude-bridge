@@ -95,10 +95,19 @@ func main() {
 	}
 	defer events.StopPublisher(eventPublisher)
 
+	authorizer := bridge.NewAuthorizer(db, cfg.AllowedChatID, cfg.AdminUserID)
+	if cfg.AllowedChatID == 0 {
+		log.Printf("[bridge] WARNING: ALLOWED_CHAT_ID=0 accepts updates from every chat")
+	}
+	if cfg.AdminUserID == 0 {
+		log.Printf("[bridge] WARNING: ADMIN_USER_ID=0 disables bootstrap administrator access; only database admins can use privileged controls")
+	}
+
 	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL, upd, eventPublisher, Version, CommitSHA, BuildDate)
-	cmdHandler.SetAdminUserID(cfg.AdminUserID)
+	cmdHandler.SetAuthorizer(authorizer)
 	sessionMgr := bridge.NewSessionManager(db, sender, cfg.ProxyURL, eventPublisher, cfg.GlobalMaxWorkers)
 	defer sessionMgr.Shutdown()
+	sessionMgr.SetAuthorizer(authorizer)
 	cmdHandler.SetSessionManager(sessionMgr)
 
 	ptyMgr := sessionMgr.PTYManager()
@@ -120,6 +129,7 @@ func main() {
 
 	// Create callback handler for inline keyboard interactions
 	callbackHandler := bridge.NewCallbackHandler(db, sender, cfg.ProxyURL, &http.Client{Timeout: 10 * time.Second}, sessionMgr)
+	callbackHandler.SetAuthorizer(authorizer)
 
 	updates := make(chan contract.Update, 64)
 	poller := bridge.NewPoller(cfg.ProxyURL, cfg.PollTimeout, updates, db)
@@ -128,7 +138,7 @@ func main() {
 	checker.SetEventPublisher(eventPublisher)
 
 	router := bridge.NewRouter(db, eventPublisher, cfg.AllowedChatID)
-	router.SetAdminUserID(cfg.AdminUserID)
+	router.SetAuthorizer(authorizer)
 	router.OnCommand = cmdHandler.Handle
 	router.OnSession = sessionMgr.Handle
 	router.OnService = serviceHandler.Handle

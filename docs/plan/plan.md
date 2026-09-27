@@ -441,13 +441,13 @@ Processes bot commands. Commands are recognized in both the General topic and no
 | Command | Action |
 |---|---|
 | `/status` | List active sessions in this group with last activity time |
-| `/sessions` | List all sessions across all groups |
+| `/sessions` | List all sessions across all groups (admin only) |
 | `/cwd [path]` | View or set the default working directory for this group |
-| `/new [name]` | Create a new topic and Claude session |
-| `/close [topic]` | Close a topic and optionally end its Claude session |
-| `/model [name]` | View or set the default model for this group |
-| `/timeout [seconds]` | View or set the prompt timeout for this group |
-| `/budget [usd]` | View or set the max budget per session for this group |
+| `/new [name]` | Create a new topic and Claude session (admin only) |
+| `/close [topic]` | Close a topic and optionally end its Claude session (admin only) |
+| `/model [name]` | View the default model; changing it requires admin access |
+| `/timeout [seconds]` | View the prompt timeout; changing it requires admin access |
+| `/budget [usd]` | View the max budget; changing it requires admin access |
 | `/cost` | Show cost breakdown (group total / daily trend / per-topic / per-user) |
 | `/help` | Show available commands |
 | `/ping` | Health check — responds with latency to proxy and Claude |
@@ -458,19 +458,19 @@ Processes bot commands. Commands are recognized in both the General topic and no
 
 | Command | Action |
 |---|---|
-| `/model [name]` | View or set the model for this topic. Overrides group default. |
-| `/haiku` | Shortcut: set this topic to `claude-haiku-4-5` |
-| `/sonnet` | Shortcut: set this topic to `claude-sonnet-4-6` |
-| `/opus` | Shortcut: set this topic to `claude-opus-4-6` |
+| `/model [name]` | View the model; changing it requires admin access. Overrides group default. |
+| `/haiku` | Set this topic to `claude-haiku-4-5` (admin only) |
+| `/sonnet` | Set this topic to `claude-sonnet-4-6` (admin only) |
+| `/opus` | Set this topic to `claude-opus-4-6` (admin only) |
 | `/color [name]` | Set topic icon color (`active`, `complete`, `blocked`, `error`, `review`, `research`) |
 | `/notify [mode]` | Set notification mode (`live`, `summary`, `quiet`) |
 | `/context <thread_id>` | Inject context from another topic into this session |
 | `/snippet <name> <content>` | Save a named context snippet |
 | `/snippets` | List saved snippets |
 | `/info` | Show session info: model, cwd, session_id, cost, message count, notify mode, timeout |
-| `/dispatch [on|off|default]` | Toggle orchestrator mode |
-| `/timeout [N]` | Set per-topic timeout in seconds (0 = use group default) |
-| `/cancel` | Cancel the running request |
+| `/dispatch [on|off|default]` | Read dispatcher mode; changing it requires admin access |
+| `/timeout [N]` | Read the timeout; changing it requires admin access |
+| `/cancel` | Cancel the running request (admin only) |
 | `/parallel <prompts>` | Run up to 5 prompts in parallel (separate with `---`) |
 | `/bg <command>` | Run a shell command in the background and stream output to the topic |
 | `/jobs` | List background jobs |
@@ -714,11 +714,12 @@ CREATE TABLE processed_updates (
 #### User Authorization
 
 - `allowed_users` table is the allowlist. Only messages from authorized `from_user_id` values are processed.
-- `ALLOWED_CHAT_ID`, when non-zero, is an exact chat boundary enforced before user, service, callback, or command routing. A zero value accepts all chats and should be treated as an explicitly open deployment setting.
-- `ADMIN_USER_ID` is bootstrapped into `allowed_users` as an admin at startup and remains the administrator authorization source while the process runs. Other admins are managed through the `allowed_users` table.
-- Admin-only writes are `/cwd <path>`, `/permission <mode>`, `/config <setting> <value>`, and `/budget <amount>`. `/update`, `/adduser`, `/removeuser`, `/users`, and `/usage` are admin-only commands. Their read-only forms (`/cwd`, `/permission`, `/config`, and `/budget`) remain available to allowed users.
-- User-role accounts can send messages and use topic/session commands, including model, notification, timeout, dispatch, snippet, background-job, and parallel controls.
-- Unknown users and blocked chats are silently ignored (no error response to prevent enumeration).
+- `ALLOWED_CHAT_ID`, when non-zero, is an exact chat boundary enforced before user, service, callback, or command routing. A zero value accepts all chats, is logged as a warning, and should be treated as an explicitly open deployment setting.
+- `ADMIN_USER_ID` is bootstrapped into `allowed_users` as an admin at startup and remains the administrator authorization source while the process runs. A zero value disables bootstrap access; other admins must already be present in `allowed_users`.
+- Admin-only writes are `/cwd <path>`, `/permission <mode>`, `/config <setting> <value>`, `/budget <amount>`, model selection, topic/session creation, close/cancel, timeout, and dispatcher changes. `/sessions`, `/update`, `/adduser`, `/removeuser`, `/users`, and `/usage` are admin-only commands. Their read-only forms remain available to allowed users where documented.
+- User-role accounts can send messages and use non-administrative topic preferences, snippets, background-job, and parallel controls. They can inspect current model, permission, timeout, dispatcher, cwd, config, budget, and per-group status, but cannot change those settings.
+- Callback queries that approve tools or submit transcripts are administrator-only, even when the user is otherwise allow-listed.
+- Unknown users, blocked chats, and non-admin callbacks are silently ignored (no error response to prevent enumeration). Allowed users attempting an admin-only command receive a generic denial without a state change.
 
 #### Input Handling
 

@@ -152,3 +152,60 @@ func TestUntrustedUserCannotChangeBypassPermissionsDefault(t *testing.T) {
 		})
 	}
 }
+
+func TestCommandHandler_NonAdminCannotChangeModel(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 200, Role: "user"}); err != nil {
+		t.Fatalf("upsert user: %v", err)
+	}
+	group := &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+	threadID := int64(10)
+	if err := db.CreateSession(ctx, &Session{
+		ChatID: 100, ThreadID: threadID, SessionID: "session-10", Model: "claude-sonnet-4-6",
+		CWD: group.CWD, Status: "active", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	h := newTestCommandHandler(t, db)
+	reply, err := h.cmdModel(ctx, makeUpdate(100, &threadID, 1, "/model opus", 200), group, "opus")
+	if err != nil {
+		t.Fatalf("cmdModel: %v", err)
+	}
+	if !strings.Contains(reply, "Permission denied") {
+		t.Fatalf("non-admin model change reply = %q, want denial", reply)
+	}
+
+	stored, err := db.GetSession(ctx, 100, threadID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if stored.Model != "claude-sonnet-4-6" {
+		t.Fatalf("model = %q, want unchanged sonnet", stored.Model)
+	}
+}
+
+func TestCommandHandler_NonAdminCannotCreateSession(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 200, Role: "user"}); err != nil {
+		t.Fatalf("upsert user: %v", err)
+	}
+	group := &Group{ChatID: 100, CWD: t.TempDir(), CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	h := newTestCommandHandler(t, db)
+	reply, err := h.cmdNew(ctx, makeUpdate(100, nil, 1, "/new restricted", 200), group, "restricted")
+	if err != nil {
+		t.Fatalf("cmdNew: %v", err)
+	}
+	if !strings.Contains(reply, "Permission denied") {
+		t.Fatalf("non-admin session creation reply = %q, want denial", reply)
+	}
+}

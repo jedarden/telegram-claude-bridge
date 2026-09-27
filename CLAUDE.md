@@ -149,8 +149,8 @@ tmux integration:
 **`internal/bridge/commands.go`**
 
 Implements all `/` commands:
-- User commands: `/new`, `/cwd`, `/model`, `/haiku`, `/sonnet`, `/opus`, `/color`, `/notify`, `/context`, `/snippet`, `/snippets`, `/info`, `/status`, `/sessions`, `/close`, `/cancel`, `/dispatch`, `/timeout`, `/cost`, `/budget`, `/parallel`, `/bg`, `/jobs`, `/kill`, `/ping`, `/version`, `/help`
-- Admin commands: `/cwd` (set), `/permission`, `/config`, `/update`, `/adduser`, `/removeuser`, `/users`
+- User commands: `/cwd` (read), `/model` (read), `/color`, `/notify`, `/context`, `/snippet`, `/snippets`, `/info`, `/status`, `/cost`, `/budget` (read), `/parallel`, `/bg`, `/jobs`, `/kill`, `/ping`, `/version`, `/help`
+- Admin commands: `/new`, `/cwd` (set), `/permission`, `/config`, `/model` and model shortcuts, `/close`, `/cancel`, `/timeout` (set), `/dispatch` (set), `/budget` (set), `/sessions`, `/update`, `/adduser`, `/removeuser`, `/users`, `/usage`
 
 ### Router
 

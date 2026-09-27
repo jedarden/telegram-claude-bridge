@@ -20,12 +20,9 @@ import (
 const HelpText = `Available commands:
 
 User commands:
-/new <name> — create a new topic and start a Claude session
+/new <name> — create a new topic and start a Claude session (admin only)
 /cwd — show this group's working directory
-/model [name] — view or set model for this topic
-/haiku — quick switch to claude-haiku-4-5
-/sonnet — quick switch to claude-sonnet-4-6
-/opus — quick switch to claude-opus-4-6
+/model — view the model for this topic
 /color [name] — set topic icon color (active, complete, blocked, error, review, research)
 /notify [mode] — set notification mode (streaming, summary, quiet)
 /context <thread_id|topic_name> — fetch context from another topic and inject it
@@ -33,13 +30,13 @@ User commands:
 /snippets — list all context snippets for this chat
 /info — show session info (model, cwd, session_id, messages, notification mode)
 /status — list active sessions in this group
-/sessions — list all sessions across all groups
-/close <thread_id> — close a session by topic thread_id
-/cancel [thread_id] — cancel the running request in this topic or another topic
-/dispatch [on|off] — toggle dispatcher mode for this topic (orchestrator system prompt)
-	/timeout [N] — set per-topic timeout in seconds (0 = no limit)
+/sessions — list all sessions across all groups (admin only)
+/close <thread_id> — close a session by topic thread_id (admin only)
+/cancel [thread_id] — cancel the running request in this topic or another topic (admin only)
+/dispatch [on|off] — read or change dispatcher mode (changing requires admin access)
+/timeout [N] — read or set per-topic timeout in seconds (setting requires admin access)
 /cost — show cost information for this group or topic
-/budget [amount] — set group budget
+/budget [amount] — read or set group budget (setting requires admin access)
 /parallel — run up to 5 prompts in parallel (separate prompts with ---)
 /bg <command> — run a shell command in the background
 /jobs — list running background jobs for this topic
@@ -52,6 +49,10 @@ Admin commands:
 /cwd [path] — set this group's working directory
 /permission [mode] — set Claude's permission mode
 /config — view or set group configuration
+/model [name], /haiku, /sonnet, /opus — view or set the topic model
+/close, /cancel, /timeout, /dispatch — manage session state (admin only for changes)
+/sessions — list all sessions across all groups
+/budget [amount] — set the group budget
 /update [do] — check for updates or apply update now
 /adduser <telegram_user_id> [role] — add a user (role: admin|user)
 /removeuser <telegram_user_id> — remove a user
@@ -80,7 +81,7 @@ type CommandHandler struct {
 	bridgeVer           string
 	bridgeSHA           string
 	buildDate           string
-	adminUserID         int64
+	authorizer          *Authorizer
 
 	// closeWG tracks in-flight asynchronous close/summary goroutines
 	// started by cmdClose.
@@ -120,6 +121,7 @@ func NewCommandHandler(db *DB, sender *Sender, proxyURL string, updater UpdaterI
 		bridgeVer:      version,
 		bridgeSHA:      commitSHA,
 		buildDate:      buildDate,
+		authorizer:     NewAuthorizer(db, 0, 0),
 	}
 	h.summarizeSession = h.generateSessionSummary
 	return h
@@ -152,14 +154,20 @@ func (h *CommandHandler) SetBackgroundJobManager(mgr *BackgroundJobManager) {
 // is accidentally removed or changed. Other administrators are still managed
 // through the allowed_users table.
 func (h *CommandHandler) SetAdminUserID(userID int64) {
-	h.adminUserID = userID
+	h.authorizer.SetAdminUserID(userID)
+}
+
+// SetAuthorizer installs the process-wide authorization policy. The command
+// handler uses the same policy as the router and session manager so a caller
+// cannot reach a privileged mutation through a different entry point.
+func (h *CommandHandler) SetAuthorizer(authorizer *Authorizer) {
+	if authorizer != nil {
+		h.authorizer = authorizer
+	}
 }
 
 func (h *CommandHandler) isAdmin(ctx context.Context, userID int64) (bool, error) {
-	if h.adminUserID > 0 && userID == h.adminUserID {
-		return true, nil
-	}
-	return h.db.IsUserAdmin(ctx, userID)
+	return h.authorizer.IsAdmin(ctx, userID)
 }
 
 // Handle implements CommandHandlerFunc. It dispatches the update to the
@@ -200,7 +208,7 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 	case "/status":
 		reply, err = h.cmdStatus(ctx, update, group)
 	case "/sessions":
-		reply, err = h.cmdSessions(ctx)
+		reply, err = h.cmdSessions(ctx, update)
 	case "/close":
 		reply, err = h.cmdClose(ctx, update, group, args)
 	case "/update":
@@ -589,7 +597,16 @@ func (h *CommandHandler) cmdStatus(ctx context.Context, update contract.Update, 
 }
 
 // cmdSessions handles /sessions — lists all sessions across all groups.
-func (h *CommandHandler) cmdSessions(ctx context.Context) (string, error) {
+// Cross-group session visibility is administrator-only.
+func (h *CommandHandler) cmdSessions(ctx context.Context, update contract.Update) (string, error) {
+	isAdmin, err := h.isAdmin(ctx, update.FromUser.ID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can list all sessions.", nil
+	}
+
 	sessions, err := h.db.ListAllSessions(ctx)
 	if err != nil {
 		return "", fmt.Errorf("list sessions: %w", err)
@@ -641,6 +658,14 @@ func (h *CommandHandler) cmdSessions(ctx context.Context) (string, error) {
 // while the summary is in flight sees the "closing" status and is rejected,
 // so exactly one summary is produced per session.
 func (h *CommandHandler) cmdClose(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	isAdmin, err := h.isAdmin(ctx, update.FromUser.ID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can close sessions.", nil
+	}
+
 	if args == "" {
 		return "Usage: /close <thread_id>", nil
 	}
@@ -1130,6 +1155,14 @@ func (h *CommandHandler) closeTopic(ctx context.Context, chatID, threadID int64)
 // cmdNew handles /new <name> — creates a new forum topic, starts a Claude session,
 // sends an initial message, and pins it.
 func (h *CommandHandler) cmdNew(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	isAdmin, err := h.isAdmin(ctx, update.FromUser.ID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can create sessions.", nil
+	}
+
 	if args == "" {
 		return "Usage: /new <topic name>\n\nExample: /new fix auth middleware", nil
 	}
@@ -1293,6 +1326,14 @@ func (h *CommandHandler) cmdModel(ctx context.Context, update contract.Update, g
 			currentModel = defaultSessionModel
 		}
 		return fmt.Sprintf("Current model: %s\n\nShortcuts: opus, sonnet, haiku\nFull names: claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5", currentModel), nil
+	}
+
+	isAdmin, err := h.isAdmin(ctx, update.FromUser.ID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can change the model.", nil
 	}
 
 	// Accept any model name — the Claude CLI will reject invalid ones at invocation time.
@@ -2015,6 +2056,14 @@ func (h *CommandHandler) cmdSnippets(ctx context.Context, update contract.Update
 // In a named topic: cancels the current topic's request (no arg needed).
 // In general topic: requires thread_id argument to specify which topic to cancel.
 func (h *CommandHandler) cmdCancel(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
+	isAdmin, err := h.isAdmin(ctx, update.FromUser.ID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can cancel session requests.", nil
+	}
+
 	if group == nil {
 		return "This group is not registered. Use /cwd <path> to register it.", nil
 	}
@@ -2077,6 +2126,14 @@ func (h *CommandHandler) cmdTimeout(ctx context.Context, update contract.Update,
 			return fmt.Sprintf("Topic timeout: no limit (using group default of %d seconds)", group.TimeoutSec), nil
 		}
 		return fmt.Sprintf("Topic timeout: %d seconds", currentTimeout), nil
+	}
+
+	isAdmin, err := h.isAdmin(ctx, update.FromUser.ID)
+	if err != nil {
+		return "", fmt.Errorf("check admin status: %w", err)
+	}
+	if !isAdmin {
+		return "Permission denied. Only admins can change session timeouts.", nil
 	}
 
 	// Parse and validate the new timeout
@@ -2322,6 +2379,16 @@ func (h *CommandHandler) cmdDispatch(ctx context.Context, update contract.Update
 	}
 	if session == nil {
 		return "No session found for this topic.", nil
+	}
+
+	if strings.TrimSpace(args) != "" {
+		isAdmin, err := h.isAdmin(ctx, update.FromUser.ID)
+		if err != nil {
+			return "", fmt.Errorf("check admin status: %w", err)
+		}
+		if !isAdmin {
+			return "Permission denied. Only admins can change dispatcher mode.", nil
+		}
 	}
 
 	switch strings.ToLower(strings.TrimSpace(args)) {

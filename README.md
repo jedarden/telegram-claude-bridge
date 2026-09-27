@@ -9,6 +9,15 @@ A bridge that connects a Telegram bot to [Claude Code](https://github.com/anthro
 > and run it under an OS account that cannot access unrelated repositories or
 > credentials.
 
+These zero values are compatibility defaults, not a secure deployment: the
+bridge logs a warning when `ALLOWED_CHAT_ID=0`, and `ADMIN_USER_ID=0` disables
+the environment bootstrap administrator. With no bootstrap ID, only users
+already recorded with `role=admin` can perform administrator actions; an
+operator must seed that row out of band before `/cwd <path>` can register the
+first group. The `bypassPermissions` default remains in effect until an
+administrator changes it, so a non-admin cannot weaken or replace the default
+through a command.
+
 Authorization is enforced in the bridge before an update reaches a command,
 session, service, or callback handler. If `ALLOWED_CHAT_ID` is non-zero, the
 update's chat ID must match it exactly. The configured `ADMIN_USER_ID` is the
@@ -185,12 +194,12 @@ Verified self-updates are persisted in the `update_history` table (migration v27
 
 | Command | Description |
 |---------|-------------|
-| `/new <name>` | Create a new forum topic and start a Claude Code session |
+| `/new <name>` | Create a new forum topic and start a Claude Code session (admin only) |
 | `/cwd` | Show the current working directory for this session |
-| `/model [name]` | View or set the active model |
-| `/haiku` | Switch to Claude Haiku |
-| `/sonnet` | Switch to Claude Sonnet |
-| `/opus` | Switch to Claude Opus |
+| `/model [name]` | View the active model; setting it requires admin access |
+| `/haiku` | Switch to Claude Haiku (admin only) |
+| `/sonnet` | Switch to Claude Sonnet (admin only) |
+| `/opus` | Switch to Claude Opus (admin only) |
 | `/color [name]` | Set topic icon color (`active`, `complete`, `blocked`, `error`, `review`, `research`) |
 | `/notify [mode]` | Set notification mode (`live`, `summary`, `quiet`) |
 | `/context <thread_id>` | Inject context from another topic into this session |
@@ -198,13 +207,13 @@ Verified self-updates are persisted in the `update_history` table (migration v27
 | `/snippets` | List saved snippets |
 | `/info` | Show session details (model, cwd, session ID, message count, cost, notify mode, timeout) |
 | `/status` | List active sessions in this group |
-| `/sessions` | List all sessions across all groups |
-| `/close <thread_id>` | Close a session (generates and pins a summary) |
-| `/cancel [thread_id]` | Cancel the running request |
-| `/dispatch [on\|off\|default]` | Toggle orchestrator mode |
-| `/timeout [N]` | Set per-topic timeout in seconds (`0` = use group default) |
+| `/sessions` | List all sessions across all groups (admin only) |
+| `/close <thread_id>` | Close a session (admin only; generates and pins a summary) |
+| `/cancel [thread_id]` | Cancel the running request (admin only) |
+| `/dispatch [on\|off\|default]` | Read dispatcher mode; changing it requires admin access |
+| `/timeout [N]` | Read the per-topic timeout; changing it requires admin access |
 | `/cost` | Show cost breakdown (group total / daily trend / per-topic / per-user) |
-| `/budget [amount]` | View or set the group budget (one-time alerts are pushed to the topic at 80% and 100% usage; changing the budget re-arms them) |
+| `/budget [amount]` | View the group budget; changing it requires admin access (one-time alerts are pushed to the topic at 80% and 100% usage) |
 | `/parallel <prompts>` | Run up to 5 prompts in parallel (separate with `---` on its own line) |
 | `/bg <command>` | Run a shell command in the background and stream output to the topic |
 | `/jobs` | List background jobs |
@@ -220,7 +229,14 @@ Verified self-updates are persisted in the `update_history` table (migration v27
 | `/cwd <path>` | Set group working directory (also registers the group); `/cwd` is readable by all allowed users |
 | `/permission [mode]` | Read the permission mode; changing it requires admin access |
 | `/config [setting] [value]` | Read configuration; changing `permission_mode`, tool restrictions, or limits requires admin access |
+| `/model [name]`, `/haiku`, `/sonnet`, `/opus` | Read the current model; changing the topic model requires admin access |
+| `/new <name>` | Create a topic and Claude session |
+| `/close <thread_id>` | Close a session and its Telegram topic |
+| `/cancel [thread_id]` | Cancel a running session request |
+| `/timeout [N]` | Read the topic timeout; changing it requires admin access |
+| `/dispatch [on\|off\|default]` | Read dispatcher mode; changing it requires admin access |
 | `/budget [amount]` | Read the budget; changing it requires admin access |
+| `/sessions` | List sessions across all groups |
 | `/update [do]` | Check for or apply a self-update |
 | `/adduser <id> [role]` | Add an allowed user |
 | `/removeuser <id>` | Remove a user |
@@ -232,15 +248,23 @@ Verified self-updates are persisted in the `update_history` table (migration v27
 | Actor | Chat gate | User gate | Capabilities |
 |-------|-----------|-----------|--------------|
 | Unknown Telegram user | Must match `ALLOWED_CHAT_ID` | Rejected | No response; update is silently dropped |
-| Allowed user (`role=user`) | Must match `ALLOWED_CHAT_ID` | `allowed_users` row | Messages, sessions, topic controls, user commands, and read-only forms of `/cwd`, `/permission`, `/config`, and `/budget` |
-| Database admin (`role=admin`) | Must match `ALLOWED_CHAT_ID` | `allowed_users` row | Everything an allowed user can do, plus admin-only writes and `/update`, `/adduser`, `/removeuser`, `/users`, and `/usage` |
+| Allowed user (`role=user`) | Must match `ALLOWED_CHAT_ID` | `allowed_users` row | Claude messages, read-only status/configuration queries, and non-administrative topic preferences such as notification mode and snippets |
+| Database admin (`role=admin`) | Must match `ALLOWED_CHAT_ID` | `allowed_users` row | Everything an allowed user can do, plus group configuration, model/session controls, cross-group session listing, `/update`, `/adduser`, `/removeuser`, `/users`, and `/usage` |
 | `ADMIN_USER_ID` | Must match `ALLOWED_CHAT_ID` | Environment-configured bootstrap identity | All administrator capabilities; it is re-established as an admin on startup |
 
 `ADMIN_USER_ID` and database administrator status are checked for every
-privileged command. In particular, an allowed non-admin user cannot change the
-group permission mode through either `/permission <mode>` or
-`/config permission_mode <mode>`. The documented `bypassPermissions` default
-therefore remains unchanged unless an administrator explicitly changes it.
+privileged command. Administrator-only mutations include group configuration,
+working directory, permission mode, model selection, topic/session creation,
+closing, cancellation, timeout, and dispatcher controls. Read-only forms of
+those commands remain available where noted in the tables. Inline callback
+queries that approve tools or submit transcripts are administrator-only; an
+allow-listed non-admin cannot authorize work by pressing a callback button.
+
+Authorization is fail-closed at the update boundary: a blocked chat, unknown
+user, or non-admin callback is silently dropped before a handler runs. A
+privileged command from an allowed non-admin receives a generic permission
+denial and does not mutate state. This keeps the bot from disclosing its
+configured chat, user list, or session state to unauthorized senders.
 
 Rate limiting: 30 messages per minute per user.
 
