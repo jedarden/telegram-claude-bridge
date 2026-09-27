@@ -298,8 +298,12 @@ func TestIsGeneralTopic(t *testing.T) {
 		t.Error("expected IsGeneralTopic() true when ThreadID is nil")
 	}
 	u.ThreadID = ptr(int64(1))
+	if !u.IsGeneralTopic() {
+		t.Error("expected IsGeneralTopic() true for legacy General thread ID 1")
+	}
+	u.ThreadID = ptr(int64(2))
 	if u.IsGeneralTopic() {
-		t.Error("expected IsGeneralTopic() false when ThreadID is set")
+		t.Error("expected IsGeneralTopic() false for a named topic")
 	}
 }
 

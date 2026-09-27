@@ -16,11 +16,11 @@ Date: 2026-04-03
 
 - All timestamps are Unix epoch integers (matching Telegram API)
 - `chat_id` is a signed 64-bit integer (supergroups are negative)
-- `thread_id` is a positive integer (forum topic ID); `null` or absent means General topic
+- `thread_id` is a positive integer for a named forum topic; the canonical v1 envelope omits it for General. Telegram's raw General-topic ID (`1`) is normalized to omission.
 - `message_id` is a positive integer
 - `user_id` is a positive 64-bit integer
 - Empty optional fields are omitted (not sent as `null`)
-- The proxy never interprets message content — it is opaque bytes/JSON to the proxy
+- The proxy normalizes Telegram updates into the typed v1 envelope below; it does not expose raw Telegram field names to the bridge
 
 ## Error Response (all endpoints)
 
@@ -119,7 +119,7 @@ Every Telegram update is normalized into this envelope. The proxy strips all aut
 ```json
 {
   "update_id": 123456789,
-  "type": "message | edited_message | callback_query | service",
+  "type": "message",
   "chat_id": -1001234567890,
   "thread_id": 42,
   "from_user": {
@@ -129,27 +129,51 @@ Every Telegram update is normalized into this envelope. The proxy strips all aut
   },
   "message_id": 1001,
   "timestamp": 1712169600,
-  "content": { <ContentObject> },
-  "reply_to_message_id": 999,
-  "service": null
+  "content": {
+    "type": "text",
+    "text": "refactor the error handling in main.py",
+    "entities": [
+      { "type": "bot_command", "offset": 0, "length": 7 }
+    ]
+  },
+  "reply_to_message_id": 999
 }
 ```
+
+The canonical v1 fields are deliberately different from the earliest plan
+draft. The sender is always the `from_user` object, content is always a
+discriminated `content` object, and media metadata is part of that object
+rather than a top-level `media` array. A message, edited message, or callback
+query has `content`; a service update has `service` instead and omits
+`content`. Optional fields are omitted, not sent as `null`.
+
+General-topic normalization is also part of the contract: an absent raw
+`message_thread_id` and Telegram's explicit General ID (`1`) both produce an
+omitted `thread_id`. Named topic IDs are preserved. Consumers may accept
+`thread_id: 1` while mixed versions are being upgraded, but producers must
+emit the canonical omission.
+
+The old `from_user_id` and top-level `media` names are not aliases emitted by
+v1. They came from a pre-implementation plan example. A client still sending
+that shape must translate it to `from_user` and the typed `content` object
+before handing it to a v1 bridge; unknown legacy fields are not a supported
+compatibility mode.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `update_id` | integer | yes | Telegram update ID |
 | `type` | string | yes | One of: `message`, `edited_message`, `callback_query`, `service` |
 | `chat_id` | integer | yes | Telegram chat/group ID |
-| `thread_id` | integer \| null | no | Forum topic ID. `null` = General topic |
+| `thread_id` | integer | no | Named forum topic ID. Omitted = General topic; `1` is accepted only as a legacy input |
 | `from_user` | object | yes | Sender info |
 | `from_user.id` | integer | yes | Telegram user ID |
 | `from_user.first_name` | string | yes | User's first name |
 | `from_user.username` | string \| null | no | User's @username |
 | `message_id` | integer | yes | Telegram message ID (for replies/edits) |
 | `timestamp` | integer | yes | Unix epoch of the message |
-| `content` | object | yes | Message content (see Content types below) |
-| `reply_to_message_id` | integer \| null | no | Message ID this is replying to |
-| `service` | object \| null | no | Service message data (see Service types below) |
+| `content` | object | conditional | Required for `message`, `edited_message`, and `callback_query`; omitted for `service` |
+| `reply_to_message_id` | integer | no | Message ID this is replying to |
+| `service` | object | conditional | Required for `service`; omitted for other update types |
 
 #### Content types
 
@@ -164,8 +188,7 @@ The `content` object has a `type` discriminator field.
     {
       "type": "bot_command",
       "offset": 0,
-      "length": 7,
-      "extra": null
+      "length": 7
     }
   ]
 }
@@ -229,8 +252,7 @@ The proxy selects the best resolution that does not exceed 1280px on the long ed
   "duration": 240,
   "file_size": 3840000,
   "mime_type": "audio/mpeg",
-  "title": "meeting-notes.mp3",
-  "performer": null
+  "title": "meeting-notes.mp3"
 }
 ```
 
@@ -253,9 +275,7 @@ The proxy selects the best resolution that does not exceed 1280px on the long ed
   "height": 1080,
   "duration": 30,
   "file_size": 5242880,
-  "mime_type": "video/mp4",
-  "caption": null,
-  "caption_entities": []
+  "mime_type": "video/mp4"
 }
 ```
 
@@ -297,9 +317,7 @@ The proxy selects the best resolution that does not exceed 1280px on the long ed
   "file_id": "BQACAgIAAxk...",
   "file_name": "config.yaml",
   "mime_type": "text/yaml",
-  "file_size": 2048,
-  "caption": null,
-  "caption_entities": []
+  "file_size": 2048
 }
 ```
 
@@ -315,7 +333,8 @@ The proxy selects the best resolution that does not exceed 1280px on the long ed
 
 **Callback query (inline keyboard press):**
 
-When `type` is `callback_query`, the envelope differs slightly:
+When `type` is `callback_query`, the envelope uses the same envelope fields and
+places callback-specific data in the typed `content` object:
 
 ```json
 {
@@ -330,9 +349,7 @@ When `type` is `callback_query`, the envelope differs slightly:
     "type": "callback",
     "callback_query_id": "abc123def456",
     "data": "approve_tool_xyz"
-  },
-  "reply_to_message_id": null,
-  "service": null
+  }
 }
 ```
 
@@ -346,7 +363,7 @@ When `type` is `callback_query`, the envelope differs slightly:
 
 #### Service types
 
-When `type` is `service`, the `content` is `null` and the `service` field is populated:
+When `type` is `service`, `content` is omitted and the `service` field is populated:
 
 ```json
 {
@@ -356,7 +373,6 @@ When `type` is `service`, the `content` is `null` and the `service` field is pop
   "from_user": { "id": 789, "first_name": "Jed", "username": "jedarden" },
   "message_id": 1002,
   "timestamp": 1712169800,
-  "content": null,
   "service": {
     "type": "forum_topic_created",
     "name": "fix auth middleware",

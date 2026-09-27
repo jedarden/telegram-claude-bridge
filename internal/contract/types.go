@@ -263,9 +263,11 @@ const (
 const ContractVersion = "1.0"
 
 // IsGeneralTopic returns true when the update is in the General (main) topic.
-// The General topic has no thread_id (nil means General).
+// The canonical v1 envelope omits thread_id for General. A value of 1 is
+// accepted for compatibility with older bridge-facing envelopes and raw
+// Telegram-shaped data.
 func (u *Update) IsGeneralTopic() bool {
-	return u.ThreadID == nil
+	return u.ThreadID == nil || (u.ThreadID != nil && *u.ThreadID == 1)
 }
 
 // IsCommand returns true when the content is a text message beginning with a bot command.

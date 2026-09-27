@@ -6,6 +6,11 @@ import (
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
 )
 
+// telegramGeneralTopicID is Telegram's internal ID for the General topic.
+// The bridge-facing v1 envelope deliberately omits thread_id for General, so
+// this value is normalized away at the proxy boundary.
+const telegramGeneralTopicID int64 = 1
+
 // NormalizeUpdate converts a raw Telegram Update to a contract.Update.
 // Returns (nil, nil) for unknown update types — callers should skip these.
 func NormalizeUpdate(raw Update) (*contract.Update, error) {
@@ -28,7 +33,7 @@ func normalizeMessage(updateID int64, updateType string, msg *Message) (*contrac
 		UpdateID:  updateID,
 		Type:      updateType,
 		ChatID:    msg.Chat.ID,
-		ThreadID:  msg.MessageThreadID,
+		ThreadID:  normalizeThreadID(msg.MessageThreadID),
 		MessageID: msg.MessageID,
 		Timestamp: msg.Date,
 	}
@@ -71,7 +76,7 @@ func normalizeCallbackQuery(updateID int64, cq *CallbackQuery) (*contract.Update
 
 	if cq.Message != nil {
 		u.ChatID = cq.Message.Chat.ID
-		u.ThreadID = cq.Message.MessageThreadID
+		u.ThreadID = normalizeThreadID(cq.Message.MessageThreadID)
 		u.MessageID = cq.Message.MessageID
 		u.Timestamp = cq.Message.Date
 	}
@@ -82,6 +87,16 @@ func normalizeCallbackQuery(updateID int64, cq *CallbackQuery) (*contract.Update
 		Data:            cq.Data,
 	}
 	return u, nil
+}
+
+// normalizeThreadID maps Telegram's explicit General topic ID to the
+// canonical v1 representation: an omitted thread_id. Named topic IDs are
+// preserved. A nil input is already the canonical General representation.
+func normalizeThreadID(threadID *int64) *int64 {
+	if threadID != nil && *threadID == telegramGeneralTopicID {
+		return nil
+	}
+	return threadID
 }
 
 func normalizeServiceMessage(msg *Message) *contract.Service {

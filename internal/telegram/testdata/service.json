@@ -1,0 +1,41 @@
+{
+  "raw": {
+    "update_id": 1004,
+    "message": {
+      "message_id": 45,
+      "from": {
+        "id": 10,
+        "first_name": "Dana"
+      },
+      "chat": {
+        "id": -100123456789,
+        "type": "supergroup"
+      },
+      "date": 1700000300,
+      "message_thread_id": 99,
+      "forum_topic_created": {
+        "name": "New topic",
+        "icon_color": 7322096,
+        "icon_custom_emoji_id": "emoji-123"
+      }
+    }
+  },
+  "want": {
+    "update_id": 1004,
+    "type": "service",
+    "chat_id": -100123456789,
+    "thread_id": 99,
+    "from_user": {
+      "id": 10,
+      "first_name": "Dana"
+    },
+    "message_id": 45,
+    "timestamp": 1700000300,
+    "service": {
+      "type": "forum_topic_created",
+      "name": "New topic",
+      "icon_color": 7322096,
+      "icon_custom_emoji_id": "emoji-123"
+    }
+  }
+}

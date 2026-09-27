@@ -65,22 +65,27 @@ Returns the retained Telegram updates, stripped of any auth context. The optiona
   "type": "message",
   "chat_id": -1001234567890,
   "thread_id": 42,
-  "from_user_id": 789,
+  "from_user": {
+    "id": 789,
+    "first_name": "Jed",
+    "username": "jedarden"
+  },
   "message_id": 1001,
   "timestamp": 1712169600,
   "content": {
+    "type": "text",
     "text": "refactor the error handling",
     "entities": [...]
   },
-  "media": [],
-  "reply_to_message_id": null,
-  "service": null
+  "reply_to_message_id": 999
 }
 ```
 
-For media messages, the proxy downloads the file from Telegram (using the token) and either:
-- **Option A:** Streams the file bytes in the response (for small files <5MB)
-- **Option B:** Saves to a shared volume or returns a proxy-local URL the bridge can fetch
+This is the v1 envelope defined in [data-contract.md](data-contract.md#update-envelope). `from_user` is the sender object; there is no `from_user_id` field. `content` is a discriminated object, and media metadata such as `file_id`, dimensions, captions, and MIME type is nested in that object; there is no top-level `media` array. Optional fields are omitted rather than emitted as `null`.
+
+The proxy normalizes both an absent Telegram `message_thread_id` and Telegram's General-topic ID (`1`) to an omitted `thread_id`. Named topic IDs are preserved. The bridge still treats an incoming `thread_id: 1` as General for compatibility with an older proxy, but v1 producers must omit it. The earlier `from_user_id`/top-level `media` example was a pre-implementation draft and is not a supported v1 wire shape; a mixed deployment must use an adapter or upgrade both sides together.
+
+For media messages, the proxy keeps the Telegram file reference behind its token boundary. The normalized `content` object carries the proxy-scoped `file_id`; the bridge downloads bytes through the proxy's file endpoint:
 
 ```
 GET /file/<file_id>
@@ -251,7 +256,7 @@ func pollLoop(ctx context.Context, proxyURL string, router *Router) {
 
 Looks up `(chat_id, thread_id)` in the SQLite routing table:
 
-- **General topic (thread_id == 1 or None):** dispatch to Command Handler
+- **General topic (canonical `thread_id` omitted; legacy `thread_id == 1` also accepted):** dispatch to Command Handler
 - **Known topic:** dispatch to Session Manager with existing session
 - **Unknown topic:** create new session via Session Manager, register in routing table
 - **Callback queries:** dispatch to the session that sent the inline keyboard

@@ -1,0 +1,35 @@
+{
+  "raw": {
+    "update_id": 1002,
+    "edited_message": {
+      "message_id": 43,
+      "from": {
+        "id": 8,
+        "first_name": "Bob"
+      },
+      "chat": {
+        "id": -100123456789,
+        "type": "supergroup"
+      },
+      "date": 1700000100,
+      "message_thread_id": 42,
+      "text": "updated command"
+    }
+  },
+  "want": {
+    "update_id": 1002,
+    "type": "edited_message",
+    "chat_id": -100123456789,
+    "thread_id": 42,
+    "from_user": {
+      "id": 8,
+      "first_name": "Bob"
+    },
+    "message_id": 43,
+    "timestamp": 1700000100,
+    "content": {
+      "type": "text",
+      "text": "updated command"
+    }
+  }
+}
