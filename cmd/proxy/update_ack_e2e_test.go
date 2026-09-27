@@ -140,6 +140,93 @@ func TestUpdateAcknowledgements_EndToEnd(t *testing.T) {
 	}
 }
 
+// TestBridgePoller_CumulativeAcknowledgement_EndToEnd verifies that the real
+// bridge poller sends no acknowledgement for its initial fetch, then sends a
+// cumulative high-water mark only after every update in the batch has been
+// durably recorded. The proxy must persist that acknowledgement before the
+// retained batch disappears.
+func TestBridgePoller_CumulativeAcknowledgement_EndToEnd(t *testing.T) {
+	const firstUpdateID int64 = 1_200
+	telegramServer := mockTelegram(t, [][]telegram.Update{
+		{tgTextUpdate(firstUpdateID, 1), tgTextUpdate(firstUpdateID+1, 2), tgTextUpdate(firstUpdateID+2, 3)},
+	})
+	defer telegramServer.Close()
+
+	statePath := filepath.Join(t.TempDir(), "proxy-state.json")
+	proxy := telegram.NewPoller("test-token", telegramServer.URL, "test-version", "test-sha", statePath)
+	proxyCtx, stopProxy := context.WithCancel(context.Background())
+	defer stopProxy()
+	go proxy.Start(proxyCtx)
+
+	var ackMu sync.Mutex
+	var acks []string
+	proxyHandler := handleUpdates(proxy)
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/updates" {
+			ackMu.Lock()
+			acks = append(acks, r.URL.Query().Get("ack"))
+			ackMu.Unlock()
+		}
+		proxyHandler.ServeHTTP(w, r)
+	}))
+	defer proxyServer.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "bridge.db")
+	db, err := bridge.OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("open bridge database: %v", err)
+	}
+	defer db.Close()
+
+	output := make(chan contract.Update, 3)
+	bridgeCtx, stopBridge := context.WithCancel(context.Background())
+	defer stopBridge()
+	bridgePoller := bridge.NewPoller(proxyServer.URL, 1, output, db)
+	bridgePoller.Start(bridgeCtx)
+
+	var delivered []int64
+	deadline := time.After(3 * time.Second)
+	for len(delivered) < 3 {
+		select {
+		case update := <-output:
+			delivered = append(delivered, update.UpdateID)
+		case <-deadline:
+			t.Fatalf("bridge delivered %v, want [%d %d %d]", delivered, firstUpdateID, firstUpdateID+1, firstUpdateID+2)
+		}
+	}
+	if want := []int64{firstUpdateID, firstUpdateID + 1, firstUpdateID + 2}; !equalIDs(delivered, want) {
+		t.Fatalf("bridge delivered %v, want %v", delivered, want)
+	}
+
+	for _, updateID := range delivered {
+		waitForE2EProcessed(t, db, updateID)
+	}
+	waitForE2EAck(t, &ackMu, &acks, "1202")
+	waitForE2EProxyState(t, statePath, func(state e2eAckState) bool {
+		return state.Offset == firstUpdateID+3 && len(state.Unacked) == 0
+	})
+
+	seenAcks := snapshotE2EAcks(&ackMu, &acks)
+	if len(seenAcks) == 0 || seenAcks[0] != "" {
+		t.Fatalf("ack queries = %v, want initial poll without ack", seenAcks)
+	}
+	foundCumulative := false
+	for _, ack := range seenAcks {
+		if ack == "1202" {
+			foundCumulative = true
+			break
+		}
+	}
+	if !foundCumulative {
+		t.Fatalf("ack queries = %v, want cumulative ack=1202", seenAcks)
+	}
+
+	restarted := telegram.NewPoller("test-token", "", "test-version", "test-sha", statePath)
+	if got := restarted.PeekUpdates(context.Background(), 0); len(got) != 0 {
+		t.Fatalf("restarted proxy retained %d acknowledged updates, want none", len(got))
+	}
+}
+
 // TestUpdateAcknowledgements_NonMonotonicRetainedBuffer exercises cumulative
 // filtering on the persisted buffer itself. Replays can make the retained
 // order non-monotonic, so the proxy must filter every covered update rather
