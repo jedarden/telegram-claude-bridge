@@ -264,6 +264,135 @@ func TestProxyBridgeV1_UpdatesNormalizeCallbackAndServiceEnvelopes(t *testing.T)
 	assertV1JSONKeyAbsent(t, response.Updates[1], "content")
 }
 
+func TestProxyBridgeV1_UpdatesNormalizeForumTopicServices(t *testing.T) {
+	const chatID int64 = -100123456789
+	threadID := int64(43)
+	createdName := "created topic"
+	editedName := "renamed topic"
+	iconEmojiID := "emoji-🌍"
+
+	created := tgTextUpdate(7_300, 301)
+	created.Message.Date = 1_700_002_301
+	created.Message.MessageThreadID = &threadID
+	created.Message.Text = nil
+	created.Message.ForumTopicCreated = &telegram.ForumTopicCreated{
+		Name:              createdName,
+		IconColor:         contract.IconColorGreen,
+		IconCustomEmojiID: &iconEmojiID,
+	}
+
+	edited := tgTextUpdate(7_301, 302)
+	edited.Message.Date = 1_700_002_302
+	edited.Message.MessageThreadID = &threadID
+	edited.Message.Text = nil
+	edited.Message.ForumTopicEdited = &telegram.ForumTopicEdited{
+		Name:              &editedName,
+		IconCustomEmojiID: &iconEmojiID,
+	}
+
+	reopened := tgTextUpdate(7_302, 303)
+	reopened.Message.Date = 1_700_002_303
+	reopened.Message.MessageThreadID = &threadID
+	reopened.Message.Text = nil
+	reopened.Message.ForumTopicReopened = &telegram.ForumTopicReopened{}
+
+	telegramAPI := mockTelegram(t, [][]telegram.Update{{created, edited, reopened}})
+	defer telegramAPI.Close()
+	poller := telegram.NewPoller("test-token", telegramAPI.URL, "v1-test", "abc123", "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go poller.Start(ctx)
+
+	deadline := time.Now().Add(time.Second)
+	for !poller.Health().Polling && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !poller.Health().Polling {
+		t.Fatal("proxy poller did not start")
+	}
+
+	rec := httptest.NewRecorder()
+	proxyContractMux(poller, telegram.NewSender("test-token", telegramAPI.URL)).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/updates?timeout=1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /updates status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	assertJSONContentType(t, rec)
+	assertV1JSONHasNoNull(t, rec.Body.Bytes())
+
+	var response contract.UpdatesResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode updates response: %v", err)
+	}
+	if !response.OK || len(response.Updates) != 3 {
+		t.Fatalf("updates response = %+v, want three forum-topic services", response)
+	}
+
+	cases := []struct {
+		name        string
+		update      contract.Update
+		serviceType string
+		wantName    *string
+		wantColor   *int
+		wantEmoji   *string
+	}{
+		{
+			name:        "created",
+			update:      response.Updates[0],
+			serviceType: contract.ServiceTypeForumTopicCreated,
+			wantName:    &createdName,
+			wantColor:   intPointer(contract.IconColorGreen),
+			wantEmoji:   &iconEmojiID,
+		},
+		{
+			name:        "edited",
+			update:      response.Updates[1],
+			serviceType: contract.ServiceTypeForumTopicEdited,
+			wantName:    &editedName,
+			wantEmoji:   &iconEmojiID,
+		},
+		{
+			name:        "reopened",
+			update:      response.Updates[2],
+			serviceType: contract.ServiceTypeForumTopicReopened,
+		},
+	}
+
+	for index, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.update
+			if got.UpdateID != int64(7_300+index) || got.Type != "service" || got.ChatID != chatID || got.ThreadID == nil || *got.ThreadID != threadID {
+				t.Errorf("envelope = %+v, want service for signed chat %d/thread %d", got, chatID, threadID)
+			}
+			if got.MessageID != int64(301+index) || got.Timestamp != int64(1_700_002_301+index) {
+				t.Errorf("message metadata = message_id %d timestamp %d, want %d/%d", got.MessageID, got.Timestamp, 301+index, 1_700_002_301+index)
+			}
+			if got.Content != nil {
+				t.Errorf("service content = %+v, want omitted", got.Content)
+			}
+			if got.Service == nil {
+				t.Fatal("service payload is nil")
+			}
+			if got.Service.Type != tc.serviceType {
+				t.Errorf("service payload = %+v/content = %+v, want %q without content", got.Service, got.Content, tc.serviceType)
+			}
+			if got.Service.Name != nil && tc.wantName == nil || got.Service.Name == nil && tc.wantName != nil || tc.wantName != nil && *got.Service.Name != *tc.wantName {
+				t.Errorf("service name = %v, want %v", got.Service.Name, tc.wantName)
+			}
+			if got.Service.IconColor != nil && tc.wantColor == nil || got.Service.IconColor == nil && tc.wantColor != nil || tc.wantColor != nil && *got.Service.IconColor != *tc.wantColor {
+				t.Errorf("service icon_color = %v, want %v", got.Service.IconColor, tc.wantColor)
+			}
+			if got.Service.IconCustomEmojiID != nil && tc.wantEmoji == nil || got.Service.IconCustomEmojiID == nil && tc.wantEmoji != nil || tc.wantEmoji != nil && *got.Service.IconCustomEmojiID != *tc.wantEmoji {
+				t.Errorf("service icon_custom_emoji_id = %v, want %v", got.Service.IconCustomEmojiID, tc.wantEmoji)
+			}
+			body, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("encode %s service envelope: %v", tc.name, err)
+			}
+			assertV1JSONKeyAbsent(t, body, "content")
+		})
+	}
+}
+
 func TestProxyBridgeV1_MinimalJSONRequestsOmitOptionalFields(t *testing.T) {
 	cases := []struct {
 		name           string
