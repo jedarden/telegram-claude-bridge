@@ -2,7 +2,7 @@
 
 ## Problem
 
-The proxy pod stores the Telegram polling offset in an `emptyDir` volume at `/data/offset.json`. When the pod is rescheduled (ArgoCD sync, node drain, deletion), the `emptyDir` is wiped and the offset is lost. Telegram then re-delivers all unacknowledged updates, and the bridge has no idempotency to skip replayed updates, causing duplicate Claude prompt processing.
+At the time of this incident, the proxy pod stored only the Telegram polling offset in an `emptyDir` volume at `/data/offset.json`. When the pod was rescheduled (ArgoCD sync, node drain, deletion), the `emptyDir` was wiped. The current proxy protocol explicitly acknowledges updates upstream and retains a separate bridge-facing replay buffer, so losing this state can lose updates rather than relying on Telegram to redeliver them. Bridge-side idempotency remains necessary to absorb any replay that does occur and to prevent duplicate Claude prompt processing.
 
 ## Decision: Option 2 (Bridge-side Idempotency)
 

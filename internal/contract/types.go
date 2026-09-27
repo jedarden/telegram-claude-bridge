@@ -118,7 +118,9 @@ const (
 	ServiceTypeMyChatMember        = "my_chat_member"
 )
 
-// UpdatesResponse is the body of GET /updates.
+// UpdatesResponse is the body of GET /updates. Delivery is at-least-once;
+// callers acknowledge retained updates cumulatively with the request's
+// ?ack=<update_id> query parameter.
 type UpdatesResponse struct {
 	OK      bool     `json:"ok"`
 	Updates []Update `json:"updates"`

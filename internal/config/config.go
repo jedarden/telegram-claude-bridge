@@ -26,7 +26,8 @@ type ProxyConfig struct {
 
 	// OffsetFilePath is the path to the JSON state file persisting the Telegram
 	// polling offset and retained unacked updates.
-	// If empty, offset is not persisted and will be lost on restart.
+	// If empty, the offset and retained buffer are not persisted and will be
+	// lost on restart.
 	OffsetFilePath string
 
 	// OpenBaoAddr is the address of the OpenBao server (e.g., "http://openbao:8200").

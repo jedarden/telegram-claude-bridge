@@ -15,7 +15,15 @@ A bridge that connects a Telegram bot to [Claude Code](https://github.com/anthro
 
 The system is split into two processes:
 
-**Proxy** — A lightweight container that holds the Telegram bot token, long-polls the Telegram `getUpdates` endpoint, and exposes an internal HTTP API (`/updates`, `/send`, `/edit`, etc.) for the bridge to consume. It holds no session state — its only persisted state is the Telegram polling offset and the retained update buffer, both kept in a JSON file (`OFFSET_FILE_PATH`, default `/data/offset.json`). Update delivery mirrors Telegram's own offset protocol: the proxy acknowledges updates to Telegram as soon as they arrive, but keeps its copy in a retained buffer and re-delivers everything in that buffer on every `GET /updates` call until the bridge acknowledges it. The bridge sends `?ack=<update_id>` — the highest update_id it has durably recorded in its SQLite dedup table — and the proxy discards only the updates covered by that ack; anything the bridge fetched but never acked (crash mid-request, restart, deploy) is simply delivered again, and the bridge's deduplication absorbs the overlap. The retained buffer is bounded (10,000 updates by default; when the cap is exceeded during a bridge outage the oldest updates are dropped and logged — they are already acknowledged to Telegram and cannot be recovered, the cap exists to bound proxy memory) and is persisted alongside the Telegram offset, so it survives a proxy restart.
+**Proxy** — A lightweight container that holds the Telegram bot token, long-polls the Telegram `getUpdates` endpoint, and exposes an internal HTTP API (`/updates`, `/send`, `/edit`, etc.) for the bridge to consume. It holds no session state. Its persisted state is the Telegram polling offset and the retained update buffer, stored in a JSON file (`OFFSET_FILE_PATH`, default `/data/offset.json`).
+
+#### Update delivery and acknowledgement
+
+The proxy uses an explicit, cumulative acknowledgement protocol. `GET /updates` is at-least-once delivery: it returns every retained update, including updates returned by earlier calls, until the bridge acknowledges them. The first poll may omit the acknowledgement; subsequent polls send `?ack=<update_id>`, where the value is the highest update ID the bridge has durably recorded. The proxy discards retained updates with IDs up to and including that value before returning the next batch. There is no implicit acknowledgement when the next poll starts.
+
+If the bridge or its connection fails after a batch is returned but before the acknowledgement reaches the proxy, the batch is returned again. The bridge's SQLite update-ID deduplication makes that replay safe. The proxy persists the retained buffer with the Telegram offset, so a proxy restart replays anything not acknowledged through the API. The buffer is bounded at 10,000 updates by default; if it overflows during a bridge outage, the oldest updates are dropped and logged because Telegram has already acknowledged them and they cannot be recovered.
+
+This is the v1 protocol. A client that omits `ack` is accepted for an initial/legacy poll but does not acknowledge anything and will receive the retained batch repeatedly; clients written for implicit next-poll acknowledgement must be upgraded before relying on this API. A new bridge talking to an old proxy still works at the HTTP level because the old proxy ignores the unknown query parameter, but its crash-loss behavior is the old destructive-delivery behavior. Do not downgrade a proxy while its new state file contains retained updates: an old proxy ignores that buffer and can lose those updates.
 
 **Bridge** — The stateful brain, running as a systemd service on the bare-metal host. It polls the proxy, manages Claude Code sessions, spawns `claude` inside tmux panes (one pane per forum topic), streams responses back via the proxy, and stores session metadata in a local SQLite database.
 
@@ -118,7 +126,7 @@ The proxy runs as a Docker container and has no host-level dependencies beyond a
 |----------|---------|-------------|
 | `BOT_TOKEN` (or `TELEGRAM_TOKEN`) | — | **Required.** Telegram bot token. |
 | `PROXY_LISTEN_ADDR` | `:8080` | HTTP listen address |
-| `OFFSET_FILE_PATH` | `/data/offset.json` | JSON state file for the Telegram polling offset and retained unacked updates; the path must be writable or the offset is lost on restart |
+| `OFFSET_FILE_PATH` | `/data/offset.json` | JSON state file for the Telegram polling offset and retained unacked updates; the path must be writable or both are lost on restart |
 | `POLL_TIMEOUT` | `30` | Telegram long-poll timeout (seconds) |
 
 ### Bridge environment variables

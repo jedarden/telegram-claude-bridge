@@ -76,6 +76,7 @@ Long-polls Telegram and returns pending updates as normalized envelopes.
 | Param | Type | Default | Description |
 |---|---|---|---|
 | `timeout` | integer | 30 | Long-poll timeout in seconds. Proxy adds 5s to its Telegram poll to ensure the Telegram response arrives first. |
+| `ack` | integer | omitted | Cumulative acknowledgement: discard retained updates with `update_id` less than or equal to this value before returning the response. Omit on the first poll or when no update has been durably recorded. |
 
 **Response 200:**
 ```json
@@ -85,7 +86,31 @@ Long-polls Telegram and returns pending updates as normalized envelopes.
 }
 ```
 
-The bridge should call this in a loop. The proxy tracks `offset` internally — each call returns only new updates since the last acknowledged batch. Updates are acknowledged implicitly when the bridge fetches the next batch.
+The bridge should call this in a loop. The proxy tracks Telegram's upstream `offset` internally, but bridge-facing delivery is governed by an explicit cumulative acknowledgement. `GET /updates` is non-destructive: every retained update is returned on every call until the bridge sends `ack=<update_id>` on a later call. There is no implicit acknowledgement when the bridge fetches the next batch.
+
+#### Acknowledgement and delivery semantics
+
+The canonical v1 request sequence is:
+
+```text
+GET /updates?timeout=30
+GET /updates?timeout=30&ack=<highest-durably-recorded-update-id>
+```
+
+The `ack` value is a high-water mark. A valid positive value acknowledges every retained update whose `update_id` is less than or equal to it; it is not an acknowledgement of only one item. The bridge must advance it only after it has durably recorded responsibility for the covered updates. A missing, non-positive, or malformed value acknowledges nothing. The proxy acknowledges updates to Telegram when it receives them, then retains its normalized copy for this bridge-facing protocol.
+
+#### Crash and replay behavior
+
+- If the bridge crashes after receiving a response but before the next request carries the acknowledgement, the same updates are returned again.
+- If the acknowledgement request or its response is lost, retrying without a newer acknowledgement is safe; the replay is expected and the bridge deduplicates by `update_id`.
+- If the proxy restarts, its persisted `offset` and `unacked` buffer are reloaded from `OFFSET_FILE_PATH`, so unacknowledged updates remain eligible for replay.
+- The retained buffer is capped at 10,000 updates by default. On overflow, the proxy drops and logs the oldest retained updates; those updates cannot be recovered because they were already acknowledged upstream.
+
+#### Compatibility
+
+This explicit-ack behavior is the v1 contract; the old implicit-next-poll description was stale documentation, not a second supported mode. A client that omits `ack` can make an initial request, but it does not progress the buffer and is not compatible with reliable ongoing consumption. An old bridge that expects implicit acknowledgement will receive the same retained updates repeatedly and may duplicate work.
+
+An updated bridge can make requests to an old proxy because the old proxy ignores the new query parameter, but that mixed-version deployment retains the old destructive-delivery crash-loss behavior. An offset-only state file written by an older proxy remains readable by the new proxy, but it contains no retained replay buffer; updates already acknowledged upstream cannot be reconstructed. Do not downgrade a proxy while a new-format state file contains retained updates, because the old proxy ignores that field and may lose them.
 
 #### Update envelope
 

@@ -37,8 +37,10 @@ Hold the Telegram bot token and act as a dumb authenticated pipe. No routing, no
 
 The proxy long-polls Telegram using `getUpdates` with:
 - `timeout=30` (long-poll interval)
-- `offset` tracking (last `update_id + 1`)
+- `offset` tracking (last `update_id + 1`) for the Telegram API
 - `allowed_updates` filter to reduce noise (only `message`, `edited_message`, `callback_query`, `my_chat_member`, and forum topic service messages)
+
+The bridge-facing `/updates` endpoint uses a separate explicit cumulative acknowledgement. The proxy retains normalized updates after advancing Telegram's offset and returns the retained buffer until the bridge sends `ack=<update_id>` on a later poll. A poll without `ack` acknowledges nothing; this is at-least-once delivery, not implicit acknowledgement on the next poll. The retained buffer and offset are persisted together in `OFFSET_FILE_PATH`, with a bounded drop-oldest policy if the bridge is unavailable long enough to exceed the buffer cap. See the [data contract](data-contract.md#acknowledgement-and-delivery-semantics) for crash, replay, and mixed-version behavior.
 
 Long-polling chosen over webhooks because:
 - No public IP or HTTPS endpoint needed
@@ -52,10 +54,10 @@ Exposed only over Tailscale. No authentication on the proxy API itself — Tails
 #### Inbound (Telegram → Bridge)
 
 ```
-GET /updates?timeout=30
+GET /updates?timeout=30[&ack=<highest-durably-recorded-update-id>]
 ```
 
-Returns a JSON array of pending Telegram updates, stripped of any auth context. The proxy translates each Telegram Update object into a normalized envelope:
+Returns the retained Telegram updates, stripped of any auth context. The optional `ack` is cumulative and discards retained updates through the supplied `update_id` before returning the response. On the first call, omit it; on later calls, send the highest update ID durably recorded by the bridge. The proxy translates each Telegram Update object into a normalized envelope:
 
 ```json
 {
@@ -1738,7 +1740,7 @@ The bridge and proxy share a Go module (monorepo with `cmd/proxy/` and `cmd/brid
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Proxy pod restart loses polling offset | Missed messages | Store last `update_id` in a ConfigMap or PV; Telegram retains unacked updates for 24h |
+| Proxy pod restart loses polling state | Missed messages | Persist `OFFSET_FILE_PATH` on a ConfigMap or PV; the proxy acknowledges Telegram upstream and can recover only the retained bridge-facing buffer |
 | Claude session corruption | Lost conversation context | Sessions are stateless from bridge perspective — create new session, close old topic |
 | Whisper transcription errors | Garbled prompts | Send transcription to user for verification before prompting Claude (opt-in via `transcript_verify`) |
 | Telegram rate limiting (429) | Delayed responses | Respect `retry_after`, debounce edits, queue sends per chat |
