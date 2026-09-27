@@ -89,6 +89,10 @@ type BridgeConfig struct {
 	// Stale sessions are marked as inactive and optionally closed.
 	SessionTTL time.Duration
 
+	// ProcessedUpdatesTTL is how long processed Telegram update IDs are retained
+	// for bridge-side deduplication (default: 7 days).
+	ProcessedUpdatesTTL time.Duration
+
 	// CloseInactiveTopics controls whether to close Telegram topics for inactive sessions.
 	// If false, sessions are marked inactive but topics remain open for reference.
 	CloseInactiveTopics bool
@@ -333,6 +337,16 @@ func LoadBridgeConfig() (*BridgeConfig, error) {
 		cfg.SessionTTL = time.Duration(n) * time.Hour
 	} else {
 		cfg.SessionTTL = defaultTTL
+	}
+
+	if v := os.Getenv("PROCESSED_UPDATES_TTL_HOURS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("PROCESSED_UPDATES_TTL_HOURS must be a positive integer, got %q", v)
+		}
+		cfg.ProcessedUpdatesTTL = time.Duration(n) * time.Hour
+	} else {
+		cfg.ProcessedUpdatesTTL = defaultTTL
 	}
 
 	if v := os.Getenv("CLOSE_INACTIVE_TOPICS"); v != "" {

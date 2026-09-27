@@ -2120,6 +2120,30 @@ func (d *DB) MarkUpdateProcessed(ctx context.Context, updateID int64) error {
 	return err
 }
 
+// PruneProcessedUpdates removes update IDs older than ttl. The strict cutoff
+// keeps IDs within the deduplication window available for replay protection.
+// It returns the number of rows deleted.
+func (d *DB) PruneProcessedUpdates(ctx context.Context, ttl time.Duration) (int64, error) {
+	if ttl <= 0 {
+		return 0, fmt.Errorf("processed updates TTL must be positive, got %v", ttl)
+	}
+
+	seconds := int64(ttl / time.Second)
+	if seconds <= 0 {
+		return 0, fmt.Errorf("processed updates TTL must be at least one second, got %v", ttl)
+	}
+
+	result, err := d.db.ExecContext(ctx,
+		`DELETE FROM processed_updates
+		 WHERE processed_at < datetime('now', ?)`,
+		fmt.Sprintf("-%d seconds", seconds),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 // ── update_failures (persistent update failure tracking) ─────────────────────────────
 
 // RecordUpdateFailure records a failed update check. This surfaces silent updater

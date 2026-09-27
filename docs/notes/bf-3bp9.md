@@ -84,7 +84,7 @@ Unit test `TestPoller_DeduplicationFiltersDuplicateUpdateIDs` verifies:
 
 - **Database writes**: One `INSERT` per update (negligible; updates are already rate-limited to 30/min per user)
 - **Database reads**: One `SELECT` per update (indexed by primary key; very fast)
-- **Storage**: `update_id` is monotonically increasing; we may add periodic cleanup of old entries (e.g., >7 days) in a future bead
+- **Storage**: `update_id` is monotonically increasing; a startup cleanup and hourly periodic job prune entries older than the configurable `PROCESSED_UPDATES_TTL_HOURS` window (default: 7 days). The `processed_at` index keeps the delete targeted.
 
 ## Acceptance Criteria Met
 
@@ -94,11 +94,9 @@ Unit test `TestPoller_DeduplicationFiltersDuplicateUpdateIDs` verifies:
 
 ## Future Considerations
 
-1. **Periodic cleanup**: The `processed_updates` table will grow indefinitely. Consider adding a cleanup job to remove entries older than N days (since Telegram's update queue is relatively short-lived).
+1. **Option 1 still viable**: We may still implement Option 1 (PVC) in the future as a defense-in-depth measure, but it's no longer critical since Option 2 provides the core protection.
 
-2. **Option 1 still viable**: We may still implement Option 1 (PVC) in the future as a defense-in-depth measure, but it's no longer critical since Option 2 provides the core protection.
-
-3. **Monitoring**: Consider adding a metric for "duplicate updates skipped" to monitor replay frequency.
+2. **Monitoring**: Consider adding a metric for "duplicate updates skipped" to monitor replay frequency.
 
 ## Related Files
 

@@ -40,6 +40,64 @@ func TestOpenDB_Idempotent(t *testing.T) {
 	db2.Close()
 }
 
+func TestPruneProcessedUpdates(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	const ttl = 24 * time.Hour
+
+	for _, updateID := range []int64{1, 2, 3} {
+		if err := db.MarkUpdateProcessed(ctx, updateID); err != nil {
+			t.Fatalf("MarkUpdateProcessed(%d): %v", updateID, err)
+		}
+	}
+
+	// SQLite datetime values have second precision. Keep the cutoff row just
+	// past the TTL so the DELETE's strict older-than boundary is deterministic.
+	_, err := db.SqlDB().ExecContext(ctx, `
+		UPDATE processed_updates
+		SET processed_at = CASE update_id
+			WHEN 1 THEN datetime('now', '-25 hours')
+			WHEN 2 THEN datetime('now', '-24 hours', '-1 second')
+			WHEN 3 THEN datetime('now', '-23 hours')
+		END`)
+	if err != nil {
+		t.Fatalf("set processed_at fixtures: %v", err)
+	}
+
+	deleted, err := db.PruneProcessedUpdates(ctx, ttl)
+	if err != nil {
+		t.Fatalf("PruneProcessedUpdates: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("PruneProcessedUpdates deleted %d rows, want 2", deleted)
+	}
+
+	for _, updateID := range []int64{1, 2} {
+		processed, err := db.IsUpdateProcessed(ctx, updateID)
+		if err != nil {
+			t.Fatalf("IsUpdateProcessed(%d): %v", updateID, err)
+		}
+		if processed {
+			t.Errorf("update %d should have been pruned", updateID)
+		}
+	}
+	processed, err := db.IsUpdateProcessed(ctx, 3)
+	if err != nil {
+		t.Fatalf("IsUpdateProcessed(3): %v", err)
+	}
+	if !processed {
+		t.Error("newer update 3 should be retained")
+	}
+
+	deleted, err = db.PruneProcessedUpdates(ctx, ttl)
+	if err != nil {
+		t.Fatalf("idempotent PruneProcessedUpdates: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("second PruneProcessedUpdates deleted %d rows, want 0", deleted)
+	}
+}
+
 // ── groups ────────────────────────────────────────────────────────────────────
 
 func TestGroup_UpsertAndGet(t *testing.T) {

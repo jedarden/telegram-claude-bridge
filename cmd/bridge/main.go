@@ -93,6 +93,12 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	processedUpdatesCleanup := bridge.NewProcessedUpdatesCleanup(
+		db, cfg.ProcessedUpdatesTTL, bridge.DefaultProcessedUpdatesCleanupInterval,
+	)
+	processedUpdatesCleanup.Start(ctx)
+	defer processedUpdatesCleanup.Stop()
+
 	// Initialize event publisher for dashboard monitoring
 	eventPublisher := events.GetPublisher(cfg.EventPublishingEnabled, cfg.EventSocketPath, checker)
 	if pub, ok := eventPublisher.(*events.Publisher); ok {

@@ -394,7 +394,7 @@ func TestLoadBridgeConfig(t *testing.T) {
 			"POLL_TIMEOUT", "UPDATE_INTERVAL_MINUTES", "REPO_PATH",
 			"BINARY_PATH", "WORKSPACE_ROOTS", "ALLOWED_WORKSPACE_ROOTS",
 			"SESSION_CLEANUP_INTERVAL_MINUTES",
-			"SESSION_TTL_HOURS", "CLOSE_INACTIVE_TOPICS",
+			"SESSION_TTL_HOURS", "PROCESSED_UPDATES_TTL_HOURS", "CLOSE_INACTIVE_TOPICS",
 			"ADMIN_USER_ID", "EVENT_PUBLISHING_ENABLED",
 			"EVENT_SOCKET_PATH", "MAX_GLOBAL_WORKERS", "GLOBAL_MAX_WORKERS",
 			"ADMIN_CHAT_ID", "CANARY_ENABLED", "CANARY_INTERVAL_MINUTES",
@@ -459,6 +459,9 @@ func TestLoadBridgeConfig(t *testing.T) {
 		}
 		if cfg.SessionTTL != 7*24*time.Hour {
 			t.Errorf("SessionTTL = %v, want %v", cfg.SessionTTL, 7*24*time.Hour)
+		}
+		if cfg.ProcessedUpdatesTTL != 7*24*time.Hour {
+			t.Errorf("ProcessedUpdatesTTL = %v, want %v", cfg.ProcessedUpdatesTTL, 7*24*time.Hour)
 		}
 		if cfg.CloseInactiveTopics != false {
 			t.Errorf("CloseInactiveTopics = %v, want %v", cfg.CloseInactiveTopics, false)
@@ -670,6 +673,35 @@ func TestLoadBridgeConfig(t *testing.T) {
 		_, err := LoadBridgeConfig()
 		if err == nil {
 			t.Error("LoadBridgeConfig() expected error for negative SESSION_TTL_HOURS")
+		}
+	})
+
+	t.Run("PROCESSED_UPDATES_TTL_HOURS", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		os.Setenv("PROXY_URL", "http://localhost:8080")
+		os.Setenv("PROCESSED_UPDATES_TTL_HOURS", "48")
+
+		cfg, err := LoadBridgeConfig()
+		if err != nil {
+			t.Fatalf("LoadBridgeConfig() error = %v", err)
+		}
+		if cfg.ProcessedUpdatesTTL != 48*time.Hour {
+			t.Errorf("ProcessedUpdatesTTL = %v, want %v", cfg.ProcessedUpdatesTTL, 48*time.Hour)
+		}
+	})
+
+	t.Run("invalid PROCESSED_UPDATES_TTL_HOURS", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		os.Setenv("PROXY_URL", "http://localhost:8080")
+		os.Setenv("PROCESSED_UPDATES_TTL_HOURS", "0")
+
+		_, err := LoadBridgeConfig()
+		if err == nil {
+			t.Error("LoadBridgeConfig() expected error for zero PROCESSED_UPDATES_TTL_HOURS")
 		}
 	})
 
