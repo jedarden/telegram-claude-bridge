@@ -385,6 +385,22 @@ func TestPoller_AckDiscardsOnlyCoveredUpdates(t *testing.T) {
 	}
 }
 
+func TestPoller_AckFiltersCoveredIDsFromReplayedOutOfOrderBuffer(t *testing.T) {
+	p := NewPoller("test-token", "", "test-version", "test-sha", "")
+	p.updates = []contract.Update{
+		{UpdateID: 100},
+		{UpdateID: 200},
+		{UpdateID: 150},
+	}
+
+	if n := p.Ack(150); n != 2 {
+		t.Fatalf("Ack(150) discarded %d updates, want 2", n)
+	}
+	if got := updateIDs(p.updates); len(got) != 1 || got[0] != 200 {
+		t.Fatalf("retained IDs after Ack(150) = %v, want [200]", got)
+	}
+}
+
 // TestPoller_BufferCapBoundsRetention verifies the retained buffer stays at or
 // below the configured cap when nothing is acked, and that overflow drops the
 // oldest updates in favor of the newest.
@@ -533,5 +549,55 @@ func TestPoller_LoadOldOffsetFile(t *testing.T) {
 	offsets := getOffsets()
 	if len(offsets) == 0 || offsets[0] != 555 {
 		t.Errorf("first getUpdates offset = %v, want [555] (loaded from legacy file)", offsets)
+	}
+}
+
+func TestPoller_PersistsOffsetWhenBatchHasNoBridgeEnvelope(t *testing.T) {
+	offsetPath := filepath.Join(t.TempDir(), "state.json")
+	var mu sync.Mutex
+	var offsets []int64
+	first := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
+		mu.Lock()
+		offsets = append(offsets, offset)
+		serveBatch := first
+		first = false
+		mu.Unlock()
+
+		var result []Update
+		if serveBatch {
+			// No message/callback fields: normalization skips this update, but
+			// Telegram's offset still advanced and must be persisted.
+			result = []Update{{UpdateID: 700}}
+		}
+		_ = json.NewEncoder(w).Encode(GetUpdatesResponse{OK: true, Result: result})
+	}))
+	defer srv.Close()
+
+	p := NewPoller("test-token", srv.URL, "test-version", "test-sha", offsetPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	go p.Start(ctx)
+	waitForStateFile(t, offsetPath, `"offset":701`)
+	cancel()
+	deadline := time.Now().Add(2 * time.Second)
+	for p.Health().Polling && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if p.Health().Polling {
+		t.Fatal("first poller did not stop before restart")
+	}
+
+	p2 := NewPoller("test-token", srv.URL, "test-version", "test-sha", offsetPath)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel2()
+	go p2.Start(ctx2)
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	gotOffsets := append([]int64(nil), offsets...)
+	mu.Unlock()
+	if len(gotOffsets) < 2 || gotOffsets[1] != 701 {
+		t.Fatalf("restart offsets = %v, want second request at 701", gotOffsets)
 	}
 }

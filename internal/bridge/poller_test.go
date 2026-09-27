@@ -361,3 +361,57 @@ func TestPoller_SendsAckAfterProcessing(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// TestPoller_DoesNotAckPastInterruptedBatch verifies that an interruption in
+// the middle of one response leaves the acknowledgement at the previous
+// contiguous high-water mark. A later restart may replay the already-forwarded
+// prefix, but it must not let the proxy discard the unfinished suffix.
+func TestPoller_DoesNotAckPastInterruptedBatch(t *testing.T) {
+	var mu sync.Mutex
+	var acks []string
+	var calls int
+	batch := []contract.Update{makePollerUpdate(800), makePollerUpdate(801)}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		acks = append(acks, r.URL.Query().Get("ack"))
+		calls++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(contract.UpdatesResponse{OK: true, Updates: batch})
+	}))
+	defer srv.Close()
+
+	ch := make(chan contract.Update)
+	p := NewPoller(srv.URL, 1, ch, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx)
+
+	select {
+	case update := <-ch:
+		if update.UpdateID != 800 {
+			t.Fatalf("first forwarded update = %d, want 800", update.UpdateID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("poller did not forward the first update")
+	}
+	cancel()
+
+	// The second send is blocked on the unbuffered channel. Once cancellation
+	// wins that select, the poll loop exits without publishing a partial ack.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.currentAck() == 0 {
+			mu.Lock()
+			seen := len(acks)
+			mu.Unlock()
+			if seen == 1 {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	t.Fatalf("partial batch advanced ack: ack=%d calls=%d requests=%v", p.currentAck(), calls, acks)
+}

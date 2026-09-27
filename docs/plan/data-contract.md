@@ -97,13 +97,13 @@ GET /updates?timeout=30
 GET /updates?timeout=30&ack=<highest-durably-recorded-update-id>
 ```
 
-The `ack` value is a high-water mark. A valid positive value acknowledges every retained update whose `update_id` is less than or equal to it; it is not an acknowledgement of only one item. The bridge must advance it only after it has durably recorded responsibility for the covered updates. A missing, non-positive, or malformed value acknowledges nothing. The proxy acknowledges updates to Telegram when it receives them, then retains its normalized copy for this bridge-facing protocol.
+The `ack` value is a cumulative high-water mark. A valid positive value acknowledges every retained update whose `update_id` is less than or equal to it; it is not an acknowledgement of only one item, and the proxy applies it to the whole retained buffer even if a replay made that buffer temporarily non-monotonic. The bridge must advance it only through the contiguous portion of the response it has durably recorded; it must not send the maximum ID from a partially handled batch. A missing, non-positive, or malformed value acknowledges nothing. The proxy acknowledges updates to Telegram when it receives them, then retains its normalized copy for this bridge-facing protocol.
 
 #### Crash and replay behavior
 
 - If the bridge crashes after receiving a response but before the next request carries the acknowledgement, the same updates are returned again.
 - If the acknowledgement request or its response is lost, retrying without a newer acknowledgement is safe; the replay is expected and the bridge deduplicates by `update_id`.
-- If the proxy restarts, its persisted `offset` and `unacked` buffer are reloaded from `OFFSET_FILE_PATH`, so unacknowledged updates remain eligible for replay.
+- If the proxy restarts, its persisted `offset` and `unacked` buffer are reloaded from `OFFSET_FILE_PATH`, so unacknowledged updates remain eligible for replay. The pair is written as one fsynced temporary JSON file followed by an atomic rename; a restart sees the previous complete pair or the next complete pair.
 - The retained buffer is capped at 10,000 updates by default. On overflow, the proxy drops and logs the oldest retained updates; those updates cannot be recovered because they were already acknowledged upstream.
 
 #### Compatibility

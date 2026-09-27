@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jedarden/telegram-claude-bridge/internal/contract"
@@ -29,9 +30,10 @@ type Poller struct {
 	// ack is the highest update_id this bridge has durably taken
 	// responsibility for (recorded in the dedup table when db != nil). It is
 	// sent as ?ack= on each poll so the proxy can discard the updates behind
-	// it; everything newer is re-delivered until acked. Only pollLoop touches
-	// it, so no locking is needed.
-	ack int64
+	// it; everything newer is re-delivered until acked. The mutex protects
+	// inspection by tests and future health reporting.
+	ack   int64
+	ackMu sync.Mutex
 }
 
 // NewPoller creates a Poller that sends received updates to updates.
@@ -95,11 +97,20 @@ func (p *Poller) pollLoop(ctx context.Context) {
 		}
 		backoff = backoffMin // reset on success
 
-		// batchAck tracks the highest update_id this poll has durably recorded
-		// (or, with no db, forwarded). It is sent on the next poll so the
-		// proxy can discard everything up to it; newer updates are re-delivered.
-		batchAck := p.ack
+		// Only update p.ack after this response has been handled. If handling
+		// stops part-way through a response, the next request must not use a
+		// high-water mark that skips the unfinished suffix.
+		baseAck := p.currentAck()
+		maxCompleted := baseAck
+		var firstIncomplete int64
 		for _, u := range updates {
+			if u.UpdateID <= baseAck {
+				// The proxy may replay an update already covered by the previous
+				// acknowledgement (for example after its offset is recovered).
+				continue
+			}
+
+			completed := false
 			// Skip if this update was already processed (deduplication).
 			// This protects against replay when the proxy re-delivers.
 			if p.db != nil {
@@ -108,29 +119,46 @@ func (p *Poller) pollLoop(ctx context.Context) {
 					log.Printf("[bridge/poller] dedup check failed for update %d: %v — processing anyway", u.UpdateID, err)
 				} else if alreadyProcessed {
 					log.Printf("[bridge/poller] skipping duplicate update %d", u.UpdateID)
-					batchAck = max(batchAck, u.UpdateID)
-					continue
+					completed = true
 				}
 			}
 
-			// Forward to channel for routing.
-			select {
-			case p.updates <- u:
-				// Mark as processed only after successful send. The update is
-				// routed at this point regardless, so even a failed mark
-				// still advances the ack — re-delivering it would only
-				// duplicate work the dedup table can no longer catch.
-				if p.db != nil {
-					if err := p.db.MarkUpdateProcessed(ctx, u.UpdateID); err != nil {
-						log.Printf("[bridge/poller] failed to mark update %d as processed: %v", u.UpdateID, err)
+			if !completed {
+				// Forward to channel for routing.
+				select {
+				case p.updates <- u:
+					// Mark as processed only after successful send. If the durable
+					// mark fails, do not acknowledge past this update: replay is
+					// safer than silently losing responsibility for it.
+					if p.db != nil {
+						if err := p.db.MarkUpdateProcessed(ctx, u.UpdateID); err != nil {
+							log.Printf("[bridge/poller] failed to mark update %d as processed: %v", u.UpdateID, err)
+						} else {
+							completed = true
+						}
+					} else {
+						completed = true
 					}
+				case <-ctx.Done():
+					return
 				}
-				batchAck = max(batchAck, u.UpdateID)
-			case <-ctx.Done():
-				return
+			}
+
+			if completed {
+				maxCompleted = max(maxCompleted, u.UpdateID)
+			} else if firstIncomplete == 0 || u.UpdateID < firstIncomplete {
+				firstIncomplete = u.UpdateID
 			}
 		}
-		p.ack = batchAck
+
+		if firstIncomplete == 0 {
+			p.setAck(maxCompleted)
+		} else if firstIncomplete > baseAck+1 {
+			// Updates can legitimately have gaps in Telegram's numeric IDs.
+			// Advance only through the largest safe contiguous high-water mark;
+			// never leap over the first update that was not durably recorded.
+			p.setAck(firstIncomplete - 1)
+		}
 	}
 }
 
@@ -142,8 +170,8 @@ func (p *Poller) pollLoop(ctx context.Context) {
 // failure or non-200 status.
 func (p *Poller) fetchUpdates(ctx context.Context) ([]contract.Update, error) {
 	url := fmt.Sprintf("%s/updates?timeout=%d", p.proxyURL, p.pollTimeout)
-	if p.ack > 0 {
-		url += fmt.Sprintf("&ack=%d", p.ack)
+	if ack := p.currentAck(); ack > 0 {
+		url += fmt.Sprintf("&ack=%d", ack)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -172,4 +200,16 @@ func (p *Poller) fetchUpdates(ctx context.Context) ([]contract.Update, error) {
 	}
 
 	return body.Updates, nil
+}
+
+func (p *Poller) currentAck() int64 {
+	p.ackMu.Lock()
+	defer p.ackMu.Unlock()
+	return p.ack
+}
+
+func (p *Poller) setAck(ack int64) {
+	p.ackMu.Lock()
+	p.ack = ack
+	p.ackMu.Unlock()
 }

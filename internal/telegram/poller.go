@@ -82,7 +82,11 @@ func NewPoller(token, apiBase, version, commitSHA, offsetPath string) *Poller {
 			p.offset = offset
 		}
 		if len(unacked) > 0 {
-			p.updates = unacked
+			var dropped int
+			p.updates, dropped = trimToCap(unacked, p.bufferCap)
+			if dropped > 0 {
+				log.Printf("poller: persisted unacked buffer exceeded cap (%d) — dropped %d oldest updates; they cannot be re-delivered", p.bufferCap, dropped)
+			}
 		}
 		if offset > 0 || len(unacked) > 0 {
 			log.Printf("poller: loaded offset %d and %d unacked updates from %s", offset, len(unacked), offsetPath)
@@ -101,7 +105,13 @@ func (p *Poller) SetUpdateBufferCap(n int) {
 	}
 	p.mu.Lock()
 	p.bufferCap = n
+	var dropped int
+	p.updates, dropped = trimToCap(p.updates, n)
 	p.mu.Unlock()
+	if dropped > 0 {
+		log.Printf("poller: unacked update buffer cap reduced to %d — dropped %d oldest updates; they cannot be re-delivered", n, dropped)
+		p.saveState()
+	}
 }
 
 // Start runs the long-polling loop until ctx is cancelled. Call in a goroutine.
@@ -123,7 +133,7 @@ func (p *Poller) Start(ctx context.Context) {
 			return
 		}
 
-		updates, err := p.getUpdates(ctx)
+		updates, nextOffset, err := p.getUpdates(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -142,10 +152,6 @@ func (p *Poller) Start(ctx context.Context) {
 
 		backoff = time.Second // reset on success
 
-		if len(updates) == 0 {
-			continue
-		}
-
 		normalized := make([]contract.Update, 0, len(updates))
 		for _, raw := range updates {
 			u, err := NormalizeUpdate(raw)
@@ -160,17 +166,18 @@ func (p *Poller) Start(ctx context.Context) {
 			normalized = append(normalized, *u)
 		}
 
+		p.mu.Lock()
+		// Commit the upstream offset and bridge-facing buffer in memory as one
+		// state transition. saveState below writes this pair with one atomic
+		// rename, so a restart observes either the old pair or the new pair,
+		// never an offset without its retained updates.
+		if nextOffset != 0 {
+			p.offset = nextOffset
+		}
 		if len(normalized) > 0 {
-			p.mu.Lock()
 			p.updates = append(p.updates, normalized...)
-			if over := len(p.updates) - p.bufferCap; over > 0 {
-				// Overflow policy: drop the oldest retained updates (see
-				// DefaultUpdateBufferCap). They are already acknowledged to
-				// Telegram, so they cannot be re-delivered — keep the newest.
-				trimmed := make([]contract.Update, 0, p.bufferCap)
-				trimmed = append(trimmed, p.updates[over:]...)
-				p.updates = trimmed
-				log.Printf("poller: unacked update buffer cap (%d) exceeded — dropped %d oldest updates; they cannot be re-delivered", p.bufferCap, over)
+			if dropped := p.trimBufferLocked(); dropped > 0 {
+				log.Printf("poller: unacked update buffer cap (%d) exceeded — dropped %d oldest updates; they cannot be re-delivered", p.bufferCap, dropped)
 			}
 			id := normalized[len(normalized)-1].UpdateID
 			p.lastID = &id
@@ -207,19 +214,26 @@ func (p *Poller) Start(ctx context.Context) {
 					}
 				}
 			}
+		}
+		p.mu.Unlock()
 
-			p.mu.Unlock()
+		if len(updates) == 0 {
+			// Empty Telegram responses do not change state, but saving here is
+			// intentionally harmless and retries a previous failed write.
+			p.saveState()
+			continue
+		}
 
+		// Persist even when normalization produced no bridge update. Telegram's
+		// upstream offset still advanced and must be kept with the buffer state.
+		p.saveState()
+
+		if len(normalized) > 0 {
 			select {
 			case p.newData <- struct{}{}:
 			default:
 			}
 		}
-
-		// getUpdates advanced the offset (and the buffer may have grown) —
-		// persist both so a restart cannot lose unacked updates. Unreachable
-		// for empty batches (early continue above).
-		p.saveState()
 	}
 }
 
@@ -265,23 +279,22 @@ func (p *Poller) Ack(through int64) int {
 	}
 
 	p.mu.Lock()
-	cut := 0
-	// Updates are retained in ascending update_id order (Telegram's ordering),
-	// so the covered set is a prefix.
-	for cut < len(p.updates) && p.updates[cut].UpdateID <= through {
-		cut++
+	retained := make([]contract.Update, 0, len(p.updates))
+	for _, update := range p.updates {
+		if update.UpdateID > through {
+			retained = append(retained, update)
+		}
 	}
-	if cut == 0 {
+	discarded := len(p.updates) - len(retained)
+	if discarded == 0 {
 		p.mu.Unlock()
 		return 0
 	}
-	rest := make([]contract.Update, len(p.updates)-cut)
-	copy(rest, p.updates[cut:])
-	p.updates = rest
+	p.updates = retained
 	p.mu.Unlock()
 
 	p.saveState()
-	return cut
+	return discarded
 }
 
 // Health returns the current health status of the poller.
@@ -341,8 +354,8 @@ func (p *Poller) loadState() (int64, []contract.Update) {
 }
 
 // saveState writes the current offset and retained unacked updates to disk
-// atomically using a temp file + rename. Errors are logged but don't stop
-// polling (we'll retry on the next getUpdates).
+// atomically using a temp file + fsync + rename. Errors are logged but don't
+// stop polling; the next successful poll retries the complete snapshot.
 func (p *Poller) saveState() {
 	if p.offsetPath == "" {
 		return
@@ -372,22 +385,53 @@ func (p *Poller) saveState() {
 		return
 	}
 
-	// Write to temp file first, then rename for atomicity
-	tmpPath := p.offsetPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	// Write to a unique temp file first, then rename for atomicity. A unique
+	// name also prevents a stale process or a test-created second Poller from
+	// unlinking the active writer's temp file.
+	file, err := os.CreateTemp(filepath.Dir(p.offsetPath), filepath.Base(p.offsetPath)+".tmp-")
+	if err != nil {
 		log.Printf("poller: error writing state temp file: %v", err)
+		return
+	}
+	tmpPath := file.Name()
+	cleanupTemp := func() { _ = os.Remove(tmpPath) }
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		cleanupTemp()
+		log.Printf("poller: error writing state temp file: %v", err)
+		return
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		cleanupTemp()
+		log.Printf("poller: error syncing state temp file: %v", err)
+		return
+	}
+	if err := file.Close(); err != nil {
+		cleanupTemp()
+		log.Printf("poller: error closing state temp file: %v", err)
 		return
 	}
 
 	if err := os.Rename(tmpPath, p.offsetPath); err != nil {
 		log.Printf("poller: error renaming state file: %v", err)
-		os.Remove(tmpPath) // clean up temp file
+		cleanupTemp()
 		return
+	}
+	if dir, err := os.Open(filepath.Dir(p.offsetPath)); err == nil {
+		if err := dir.Sync(); err != nil {
+			log.Printf("poller: error syncing state directory: %v", err)
+		}
+		_ = dir.Close()
+	} else {
+		log.Printf("poller: error opening state directory for sync: %v", err)
 	}
 }
 
-// getUpdates calls the Telegram getUpdates API with offset and a 30-second timeout.
-func (p *Poller) getUpdates(ctx context.Context) ([]Update, error) {
+// getUpdates calls the Telegram getUpdates API with offset and a 30-second
+// timeout. It returns the next offset separately so Start can commit the
+// offset and retained bridge buffer together.
+func (p *Poller) getUpdates(ctx context.Context) ([]Update, int64, error) {
 	p.mu.Lock()
 	offset := p.offset
 	p.mu.Unlock()
@@ -402,18 +446,18 @@ func (p *Poller) getUpdates(ctx context.Context) ([]Update, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, 0, fmt.Errorf("build request: %w", err)
 	}
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("http: %s", redactToken(err.Error(), p.token))
+		return nil, 0, fmt.Errorf("http: %s", redactToken(err.Error(), p.token))
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, 0, fmt.Errorf("read body: %w", err)
 	}
 
 	if resp.StatusCode == http.StatusConflict {
@@ -422,7 +466,7 @@ func (p *Poller) getUpdates(ctx context.Context) ([]Update, error) {
 
 	var result GetUpdatesResponse
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
+		return nil, 0, fmt.Errorf("decode: %w", err)
 	}
 
 	if !result.OK {
@@ -434,17 +478,30 @@ func (p *Poller) getUpdates(ctx context.Context) ([]Update, error) {
 		if result.ErrorCode != nil {
 			code = *result.ErrorCode
 		}
-		return nil, fmt.Errorf("telegram error %d: %s", code, desc)
+		return nil, 0, fmt.Errorf("telegram error %d: %s", code, desc)
 	}
 
+	nextOffset := int64(0)
 	if len(result.Result) > 0 {
 		lastID := result.Result[len(result.Result)-1].UpdateID
-		p.mu.Lock()
-		p.offset = lastID + 1
-		p.mu.Unlock()
-		// The offset advance and any new buffer contents are persisted by the
-		// caller (Start) once the batch has been appended.
+		nextOffset = lastID + 1
 	}
 
-	return result.Result, nil
+	return result.Result, nextOffset, nil
+}
+
+func (p *Poller) trimBufferLocked() int {
+	trimmed, dropped := trimToCap(p.updates, p.bufferCap)
+	p.updates = trimmed
+	return dropped
+}
+
+func trimToCap(updates []contract.Update, cap int) ([]contract.Update, int) {
+	if len(updates) <= cap {
+		return updates, 0
+	}
+	dropped := len(updates) - cap
+	trimmed := make([]contract.Update, cap)
+	copy(trimmed, updates[dropped:])
+	return trimmed, dropped
 }
