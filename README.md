@@ -12,14 +12,14 @@ A bridge that connects a Telegram bot to [Claude Code](https://github.com/anthro
 These zero values are compatibility defaults, not a secure deployment: the
 bridge logs a warning when `ALLOWED_CHAT_ID=0`, and `ADMIN_USER_ID=0` disables
 the environment bootstrap administrator. With no bootstrap ID, only users
-already recorded with `role=admin` can perform administrator actions; an
-operator must seed that row out of band before `/cwd <path>` can register the
-first group. `/cwd` is limited to the configured `WORKSPACE_ROOTS` allowlist;
-paths are canonicalized before storage, and traversal, symlink escapes, and
-credential/configuration directories are rejected. The `bypassPermissions`
-default remains in effect until an
-administrator changes it, so a non-admin cannot weaken or replace the default
-through a command.
+recorded with `role=admin` can perform administrator actions; use the
+[administrator allowlist workflow](#administrator-allowlist-workflow) to seed
+the first row before `/cwd <path>` can register the first group. `/cwd` is
+limited to the configured `WORKSPACE_ROOTS` allowlist; paths are canonicalized
+before storage, and traversal, symlink escapes, and credential/configuration
+directories are rejected. The `bypassPermissions` default remains in effect
+until an administrator changes it, so a non-admin cannot weaken or replace the
+default through a command.
 
 Authorization is enforced in the bridge before an update reaches a command,
 session, service, or callback handler. If `ALLOWED_CHAT_ID` is non-zero, the
@@ -242,9 +242,9 @@ Verified self-updates are persisted in the `update_history` table (migration v27
 | `/budget [amount]` | Read the budget; changing it requires admin access |
 | `/sessions` | List sessions across all groups |
 | `/update [do]` | Check for or apply a self-update |
-| `/adduser <id> [role]` | Add an allowed user |
-| `/removeuser <id>` | Remove a user |
-| `/users` | List allowed users |
+| `/adduser <id> [role]` | Add or change an allowed user (admin only; the last admin cannot be demoted) |
+| `/removeuser <id>` | Remove a user (admin only; the last admin cannot be removed) |
+| `/users` | Audit the allowlist and roles (admin only) |
 | `/usage [user_id]` | Show per-user cost usage |
 
 ### Authorization matrix
@@ -271,6 +271,62 @@ denial and does not mutate state. This keeps the bot from disclosing its
 configured chat, user list, or session state to unauthorized senders.
 
 Rate limiting: 30 messages per minute per user.
+
+### Administrator allowlist workflow
+
+The bridge stores database administrators in `allowed_users` with
+`role=admin`. `ADMIN_USER_ID` is a separate, optional bootstrap identity: a
+positive value is re-established as an administrator at every startup, while
+`ADMIN_USER_ID=0` means that the database must already contain an admin row.
+The database and the environment identity are both checked for every
+privileged command.
+
+#### Bootstrap the first administrator with `ADMIN_USER_ID=0`
+
+Run the bootstrap from the deployment checkout, using the exact database path
+configured by `BRIDGE_DB_PATH` (the default is `bridge.db` in the service's
+working directory). Stop the bridge first so there is only one writer:
+
+```bash
+DB_PATH=/home/coding/.telegram-claude-bridge-deploy/bridge.db
+sudo systemctl stop telegram-claude-bridge
+ADMIN_USER_ID=0 ./scripts/manage-admins.sh --db "$DB_PATH" bootstrap <telegram-user-id>
+ADMIN_USER_ID=0 ./scripts/manage-admins.sh --db "$DB_PATH" audit
+sudo systemctl start telegram-claude-bridge
+```
+
+Replace `<telegram-user-id>` with the numeric ID of the account that should
+own the bridge. The script refuses to bootstrap if `ADMIN_USER_ID` is non-zero
+or if an administrator row already exists. Every mutating command creates a
+new SQLite backup beside the database; use `--backup /path/to/backup.sqlite3`
+to choose the destination. Do not run a mutating command while the service is
+running, and do not hand-edit the SQLite file.
+
+If the database has no admin rows and the service cannot be started, this is
+the recovery path as well. After the service starts, the bootstrapped account
+can use `/cwd <path>` to register the first group.
+
+#### Add, remove, and audit roles
+
+Once an administrator can use the bot, perform normal changes in the General
+topic:
+
+```text
+/adduser <telegram-user-id> user
+/adduser <telegram-user-id> admin
+/removeuser <telegram-user-id>
+/users
+```
+
+`/users` is the in-band audit of every allowlisted user, role, and added time.
+For an offline audit, or to verify the bootstrap state during maintenance,
+run `./scripts/manage-admins.sh --db "$DB_PATH" audit`. The bridge refuses to
+demote or remove the last database administrator and refuses self-removal;
+add and verify a replacement administrator before changing an existing admin
+role. An environment bootstrap administrator remains authorized even if its
+database row is accidentally removed, but keeping a database admin row makes
+the allowlist auditable and provides a recovery path if the environment is
+later changed to `ADMIN_USER_ID=0`.
 
 ---
 
@@ -350,7 +406,7 @@ The bridge implements `sd_notify` (`Type=notify`) with a 60 s watchdog, so syste
 2. Enable **Groups** and **Group Admin** permissions for the bot.
 3. In your Telegram group, enable **Topics** (Supergroup setting).
 4. Add the bot to the group and promote it so it can manage topics and pin messages.
-5. Set `ADMIN_USER_ID` to your Telegram user ID to bootstrap the initial admin on first start.
+5. Set `ADMIN_USER_ID` to your Telegram user ID to bootstrap the initial admin on first start, or follow the [administrator allowlist workflow](#administrator-allowlist-workflow) when `ADMIN_USER_ID=0`.
 6. Send `/cwd <path>` from the admin account to register the group and set the working directory.
 
 ---

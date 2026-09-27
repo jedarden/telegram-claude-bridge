@@ -1348,6 +1348,17 @@ func (d *DB) IsUserAdmin(ctx context.Context, userID int64) (bool, error) {
 	return role == "admin", nil
 }
 
+// CountAdminUsers returns the number of database-backed administrators.
+// ADMIN_USER_ID is intentionally not included: it is an environment-backed
+// bootstrap identity, not an allowlist row.
+func (d *DB) CountAdminUsers(ctx context.Context) (int, error) {
+	var count int
+	err := d.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM allowed_users WHERE role = 'admin'`,
+	).Scan(&count)
+	return count, err
+}
+
 // GetAllowedUser returns the allowed user record, or (nil, nil) if not found.
 func (d *DB) GetAllowedUser(ctx context.Context, userID int64) (*AllowedUser, error) {
 	row := d.db.QueryRowContext(ctx,

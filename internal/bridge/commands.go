@@ -1823,6 +1823,27 @@ func (h *CommandHandler) cmdAddUser(ctx context.Context, update contract.Update,
 	}
 
 	// Add the user
+	// Do not let an administrator demote themselves or remove the only
+	// database-backed administrator. With ADMIN_USER_ID=0 this would otherwise
+	// lock every administrator command out until an operator edits the database
+	// again.
+	existing, err := h.db.GetAllowedUser(ctx, targetUserID)
+	if err != nil {
+		return "", fmt.Errorf("get existing user: %w", err)
+	}
+	if existing != nil && existing.Role == "admin" && role == "user" {
+		if targetUserID == userID {
+			return "You cannot demote yourself from the administrator role.", nil
+		}
+		adminCount, err := h.db.CountAdminUsers(ctx)
+		if err != nil {
+			return "", fmt.Errorf("count administrators: %w", err)
+		}
+		if adminCount <= 1 {
+			return "Cannot demote the last administrator. Add another administrator first.", nil
+		}
+	}
+
 	user := &AllowedUser{
 		UserID:  targetUserID,
 		Role:    role,
@@ -1867,6 +1888,20 @@ func (h *CommandHandler) cmdRemoveUser(ctx context.Context, update contract.Upda
 	// Prevent removing yourself
 	if targetUserID == userID {
 		return "You cannot remove yourself from the allowed users list.", nil
+	}
+
+	existing, err := h.db.GetAllowedUser(ctx, targetUserID)
+	if err != nil {
+		return "", fmt.Errorf("get existing user: %w", err)
+	}
+	if existing != nil && existing.Role == "admin" {
+		adminCount, err := h.db.CountAdminUsers(ctx)
+		if err != nil {
+			return "", fmt.Errorf("count administrators: %w", err)
+		}
+		if adminCount <= 1 {
+			return "Cannot remove the last administrator. Add another administrator first.", nil
+		}
 	}
 
 	// Remove the user

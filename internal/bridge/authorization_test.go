@@ -67,6 +67,100 @@ func TestRouter_AdminUserIDCanRouteWithoutAllowListRow(t *testing.T) {
 	}
 }
 
+func TestAuthorizer_NoBootstrapRequiresDatabaseAdministrator(t *testing.T) {
+	db := openTestDB(t)
+	authorizer := NewAuthorizer(db, 100, 0)
+	ctx := context.Background()
+
+	allowed, err := authorizer.CanReceiveUpdate(ctx, commandTextUpdate(9001, 100, 1, "/help"))
+	if err != nil {
+		t.Fatalf("unknown user authorization: %v", err)
+	}
+	if allowed {
+		t.Fatal("ADMIN_USER_ID=0 must not authorize an unknown user")
+	}
+
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 9001, Role: "user"}); err != nil {
+		t.Fatalf("seed non-admin user: %v", err)
+	}
+	isAdmin, err := authorizer.IsAdmin(ctx, 9001)
+	if err != nil {
+		t.Fatalf("check non-admin role: %v", err)
+	}
+	if isAdmin {
+		t.Fatal("an allowlisted user role must not become an administrator without a bootstrap identity")
+	}
+
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 9001, Role: "admin"}); err != nil {
+		t.Fatalf("promote database user: %v", err)
+	}
+	isAdmin, err = authorizer.IsAdmin(ctx, 9001)
+	if err != nil {
+		t.Fatalf("check database admin role: %v", err)
+	}
+	if !isAdmin {
+		t.Fatal("a database role=admin row must authorize an administrator with no bootstrap ID")
+	}
+}
+
+func TestCommandHandler_NoBootstrapRejectsUnauthorizedAdminMutation(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 200, Role: "user"}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+
+	h := newTestCommandHandler(t, db)
+	reply, err := h.cmdAddUser(ctx, commandTextUpdate(200, 100, 1, "/adduser 300 admin"), "300 admin")
+	if err != nil {
+		t.Fatalf("cmdAddUser: %v", err)
+	}
+	if !strings.Contains(reply, "Permission denied") {
+		t.Fatalf("unauthorized admin mutation reply = %q, want generic denial", reply)
+	}
+	created, err := db.GetAllowedUser(ctx, 300)
+	if err != nil {
+		t.Fatalf("look up unauthorized target: %v", err)
+	}
+	if created != nil {
+		t.Fatalf("unauthorized user created allowlist entry: %+v", created)
+	}
+}
+
+func TestCommandHandler_AdminRoleChangesCannotRemoveLastAdministrator(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 42, Role: "admin"}); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
+
+	h := newTestCommandHandler(t, db)
+	h.SetAdminUserID(9001)
+	removeReply, err := h.cmdRemoveUser(ctx, makeUpdate(100, nil, 1, "/removeuser 42", 9001), "42")
+	if err != nil {
+		t.Fatalf("cmdRemoveUser: %v", err)
+	}
+	if !strings.Contains(removeReply, "last administrator") {
+		t.Fatalf("last admin removal reply = %q, want protection", removeReply)
+	}
+
+	demoteReply, err := h.cmdAddUser(ctx, makeUpdate(100, nil, 1, "/adduser 42 user", 9001), "42 user")
+	if err != nil {
+		t.Fatalf("cmdAddUser demotion: %v", err)
+	}
+	if !strings.Contains(demoteReply, "last administrator") {
+		t.Fatalf("last admin demotion reply = %q, want protection", demoteReply)
+	}
+
+	admin, err := db.GetAllowedUser(ctx, 42)
+	if err != nil {
+		t.Fatalf("look up protected admin: %v", err)
+	}
+	if admin == nil || admin.Role != "admin" {
+		t.Fatalf("last admin row after rejected mutations = %+v, want role=admin", admin)
+	}
+}
+
 func TestRouter_AdminUserIDStillRespectsAllowedChatID(t *testing.T) {
 	db := openTestDB(t)
 	r := NewRouter(db, nil, 100)
