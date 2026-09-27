@@ -67,6 +67,112 @@ func TestRouter_AdminUserIDCanRouteWithoutAllowListRow(t *testing.T) {
 	}
 }
 
+func TestAuthorizer_BlockedChatIsRejectedBeforeUserLookup(t *testing.T) {
+	// A blocked chat must not reach the user database at all. Keeping the DB
+	// nil makes a user lookup an immediate test failure while still allowing
+	// the chat gate itself to be exercised.
+	authorizer := NewAuthorizer(nil, 100, 9001)
+
+	allowed, err := authorizer.CanReceiveUpdate(context.Background(), commandTextUpdate(300, 999, 1, "/config"))
+	if err != nil {
+		t.Fatalf("blocked chat authorization: %v", err)
+	}
+	if allowed {
+		t.Fatal("update from a blocked chat was authorized")
+	}
+}
+
+func TestRouter_AllowedChatIDRequiresAnExactMatch(t *testing.T) {
+	db := openTestDB(t)
+	seedUser(t, db, 200)
+	r := NewRouter(db, nil, 100)
+
+	var calls int
+	r.OnCommand = func(context.Context, contract.Update, *Group) { calls++ }
+
+	for _, chatID := range []int64{99, 101} {
+		r.Route(context.Background(), commandTextUpdate(200, chatID, 1, "/help"))
+	}
+	if calls != 0 {
+		t.Fatalf("commands from adjacent chats reached a handler %d times", calls)
+	}
+
+	r.Route(context.Background(), commandTextUpdate(200, 100, 1, "/help"))
+	if calls != 1 {
+		t.Fatalf("command from the configured chat reached handler %d times, want 1", calls)
+	}
+}
+
+func TestRouter_BootstrapAdministratorReachesEveryHandlerType(t *testing.T) {
+	db := openTestDB(t)
+	seedGroup(t, db, 100)
+	seedSession(t, db, 100, 5)
+
+	r := NewRouter(db, nil, 100)
+	r.SetAdminUserID(9001)
+
+	var commandCalls, sessionCalls, serviceCalls, callbackCalls int
+	r.OnCommand = func(context.Context, contract.Update, *Group) { commandCalls++ }
+	r.OnSession = func(context.Context, contract.Update, *Session, *Group) { sessionCalls++ }
+	r.OnService = func(context.Context, contract.Update) { serviceCalls++ }
+	r.OnCallback = func(context.Context, contract.Update) { callbackCalls++ }
+
+	threadID := int64(5)
+	updates := []contract.Update{
+		commandTextUpdate(9001, 100, 1, "/help"),
+		textUpdate(9001, 100, &threadID, "hello", false),
+		serviceUpdate(9001, 100, &threadID, contract.ServiceTypeForumTopicCreated),
+		callbackUpdate(9001, 100),
+	}
+	for _, update := range updates {
+		r.Route(context.Background(), update)
+	}
+
+	if commandCalls != 1 || sessionCalls != 1 || serviceCalls != 1 || callbackCalls != 1 {
+		t.Fatalf("bootstrap handler calls = command:%d session:%d service:%d callback:%d, want one each", commandCalls, sessionCalls, serviceCalls, callbackCalls)
+	}
+}
+
+func TestRouter_RejectedCommandsDoNotDiscloseConfiguration(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: 9001, Role: "admin"}); err != nil {
+		t.Fatalf("seed administrator: %v", err)
+	}
+	if err := db.UpsertGroup(ctx, &Group{
+		ChatID:         100,
+		CWD:            "/sensitive/project",
+		DefaultModel:   "claude-opus-4-6",
+		PermissionMode: "dontAsk",
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed group: %v", err)
+	}
+
+	sender, recorder := newRecordingProxy(t)
+	h := NewCommandHandler(db, sender, "http://unused", nil, nil, "v1.0.0", "test", "test")
+	authorizer := NewAuthorizer(db, 100, 0)
+	r := NewRouter(db, nil, 100)
+	r.SetAuthorizer(authorizer)
+	r.OnCommand = func(ctx context.Context, update contract.Update, group *Group) {
+		h.Handle(ctx, update, group)
+	}
+
+	// /config would expose the configured working directory and model if it
+	// reached the command handler. Test both an unknown user in the configured
+	// chat and an allow-listed user in a different chat.
+	for _, update := range []contract.Update{
+		commandTextUpdate(300, 100, 1, "/config"),
+		commandTextUpdate(9001, 999, 2, "/config"),
+	} {
+		r.Route(ctx, update)
+	}
+
+	if sends := recorder.all(); len(sends) != 0 {
+		t.Fatalf("rejected configuration commands produced proxy responses: %+v", sends)
+	}
+}
+
 func TestAuthorizer_NoBootstrapRequiresDatabaseAdministrator(t *testing.T) {
 	db := openTestDB(t)
 	authorizer := NewAuthorizer(db, 100, 0)
