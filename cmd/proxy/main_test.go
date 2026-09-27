@@ -73,6 +73,25 @@ func callUpdates(t *testing.T, handler http.HandlerFunc, query string) []contrac
 	return resp.Updates
 }
 
+func callUpdatesWithContext(t *testing.T, handler http.HandlerFunc, ctx context.Context, query string) []contract.Update {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/updates?"+query, nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /updates?%s: status %d, want 200", query, rec.Code)
+	}
+	var resp contract.UpdatesResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("GET /updates?%s: decode: %v", query, err)
+	}
+	if !resp.OK {
+		t.Fatalf("GET /updates?%s: ok=false", query)
+	}
+	return resp.Updates
+}
+
 func ids(updates []contract.Update) []int64 {
 	out := make([]int64, len(updates))
 	for i, u := range updates {
@@ -137,6 +156,37 @@ func TestHandleUpdates_AckSemantics(t *testing.T) {
 	full := callUpdates(t, handler, "timeout=1&ack=502")
 	if len(full) != 0 {
 		t.Fatalf("ids after ack=502 = %v, want none", ids(full))
+	}
+}
+
+// TestHandleUpdates_RedeliversAfterInterruptedRequest models a bridge process
+// receiving a response and then disappearing before it can send the ack. The
+// proxy must retain the response so the next bridge request gets the update
+// again.
+func TestHandleUpdates_RedeliversAfterInterruptedRequest(t *testing.T) {
+	tg := mockTelegram(t, [][]telegram.Update{
+		{tgTextUpdate(550, 1)},
+	})
+	defer tg.Close()
+
+	poller := telegram.NewPoller("test-token", tg.URL, "test-version", "test-sha", "")
+	handler := handleUpdates(poller)
+
+	pollCtx, cancelPoller := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelPoller()
+	go poller.Start(pollCtx)
+
+	requestCtx, interrupt := context.WithCancel(context.Background())
+	first := callUpdatesWithContext(t, handler, requestCtx, "timeout=1")
+	if got := ids(first); !equalIDs(got, []int64{550}) {
+		t.Fatalf("first response ids = %v, want [550]", got)
+	}
+	// The request/bridge is interrupted before it can acknowledge the update.
+	interrupt()
+
+	second := callUpdates(t, handler, "timeout=1")
+	if got := ids(second); !equalIDs(got, []int64{550}) {
+		t.Fatalf("redelivery ids = %v, want [550]", got)
 	}
 }
 

@@ -1,8 +1,10 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -419,6 +421,48 @@ func TestPoller_BufferCapBoundsRetention(t *testing.T) {
 	want := []int64{302, 303, 304} // two oldest (300, 301) dropped
 	if len(got) == 3 && (got[0] != want[0] || got[1] != want[1] || got[2] != want[2]) {
 		t.Errorf("retained ids = %v, want %v (oldest dropped)", got, want)
+	}
+}
+
+// TestPoller_DefaultBufferCapDropsOldestAndLogs verifies the production cap,
+// not just the configurable small-cap behavior above. Once the 10,000-update
+// limit is exceeded, the oldest updates are dropped and the loss is visible in
+// the poller log.
+func TestPoller_DefaultBufferCapDropsOldestAndLogs(t *testing.T) {
+	if DefaultUpdateBufferCap != 10_000 {
+		t.Fatalf("DefaultUpdateBufferCap = %d, want 10000", DefaultUpdateBufferCap)
+	}
+
+	const firstID int64 = 10_000
+	batch := make([]Update, DefaultUpdateBufferCap+1)
+	for i := range batch {
+		batch[i] = makeTextUpdate(firstID+int64(i), int64(i)+1)
+	}
+	srv, _ := mockTelegramServer(t, [][]Update{batch})
+	defer srv.Close()
+
+	var logs bytes.Buffer
+	previousWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousWriter) })
+
+	p := NewPoller("test-token", srv.URL, "test-version", "test-sha", "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.Start(ctx)
+
+	got := p.PeekUpdates(ctx, 3*time.Second)
+	if len(got) != DefaultUpdateBufferCap {
+		t.Fatalf("retained %d updates, want %d", len(got), DefaultUpdateBufferCap)
+	}
+	if got[0].UpdateID != firstID+1 {
+		t.Errorf("oldest retained update_id = %d, want %d", got[0].UpdateID, firstID+1)
+	}
+	if got[len(got)-1].UpdateID != firstID+int64(DefaultUpdateBufferCap) {
+		t.Errorf("newest retained update_id = %d, want %d", got[len(got)-1].UpdateID, firstID+int64(DefaultUpdateBufferCap))
+	}
+	if !strings.Contains(logs.String(), "dropped 1 oldest updates") {
+		t.Errorf("drop log = %q, want a dropped-oldest diagnostic", logs.String())
 	}
 }
 
