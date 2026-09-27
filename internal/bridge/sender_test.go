@@ -677,6 +677,72 @@ func TestSender_NonRetryableAPIError_NoRetry(t *testing.T) {
 	}
 }
 
+func TestSender_TransientProxyFailuresRetryAndRecover(t *testing.T) {
+	for _, status := range []int{
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	} {
+		t.Run(fmt.Sprintf("HTTP_%d", status), func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(status)
+					_ = json.NewEncoder(w).Encode(contract.ErrorResponse{
+						ErrorCode:   status,
+						Description: fmt.Sprintf("temporary proxy failure %d", status),
+					})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(contract.OKResponse{OK: true})
+			}))
+			defer srv.Close()
+
+			s := newTestSender(t, srv.URL)
+			s.wait = func(context.Context, time.Duration) error { return nil }
+			if err := s.EditMessage(context.Background(), -100, 1, "text"); err != nil {
+				t.Fatalf("transient HTTP %d should recover: %v", status, err)
+			}
+			if got := calls.Load(); got != 2 {
+				t.Fatalf("HTTP %d calls = %d, want 2", status, got)
+			}
+		})
+	}
+}
+
+func TestSender_TransientProxyFailuresExhaustRetryBudget(t *testing.T) {
+	const status = http.StatusServiceUnavailable
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(contract.ErrorResponse{
+			ErrorCode:   status,
+			Description: "proxy remains unavailable",
+		})
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, srv.URL)
+	s.wait = func(context.Context, time.Duration) error { return nil }
+	err := s.EditMessage(context.Background(), -100, 1, "text")
+	if err == nil {
+		t.Fatal("expected exhausted retry error")
+	}
+	if got := calls.Load(); got != senderMaxRetries+1 {
+		t.Fatalf("calls = %d, want %d attempts", got, senderMaxRetries+1)
+	}
+	var apiErr *contract.ErrorResponse
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %T %v, want wrapped proxy error", err, err)
+	}
+	if apiErr.ErrorCode != status {
+		t.Fatalf("final error code = %d, want %d", apiErr.ErrorCode, status)
+	}
+}
+
 func TestSender_RateLimit_WaitsForRetryAfter(t *testing.T) {
 	// 429 with retry_after=60: postWithRetry must wait the full 60s unless the
 	// context expires first. A 300ms deadline means exactly one attempt.

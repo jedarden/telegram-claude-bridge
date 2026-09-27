@@ -177,6 +177,70 @@ func TestPoller_Backoff502(t *testing.T) {
 	}
 }
 
+func TestPoller_TransientProxyFailuresRecoverBeforeAcknowledgement(t *testing.T) {
+	var mu sync.Mutex
+	var acks []string
+	var calls int
+	statuses := []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, http.StatusOK}
+	const updateID int64 = 750
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		index := calls
+		calls++
+		acks = append(acks, r.URL.Query().Get("ack"))
+		mu.Unlock()
+
+		status := statuses[len(statuses)-1]
+		if index < len(statuses) {
+			status = statuses[index]
+		}
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		updates := []contract.Update(nil)
+		if index == len(statuses)-1 {
+			updates = []contract.Update{makePollerUpdate(updateID)}
+		}
+		_ = json.NewEncoder(w).Encode(contract.UpdatesResponse{OK: true, Updates: updates})
+	}))
+	defer srv.Close()
+
+	ch := make(chan contract.Update, 1)
+	p := NewPoller(srv.URL, 1, ch, nil)
+	p.wait = func(context.Context, time.Duration) error { return nil }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	p.Start(ctx)
+
+	got := collect(t, ch, 1, time.Second)
+	if len(got) != 1 || got[0].UpdateID != updateID {
+		t.Fatalf("recovered updates = %v, want update %d", got, updateID)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		seen := append([]string(nil), acks...)
+		mu.Unlock()
+		if len(seen) >= len(statuses)+1 {
+			for i := range statuses {
+				if seen[i] != "" {
+					t.Fatalf("request %d carried ack %q before update processing", i+1, seen[i])
+				}
+			}
+			if seen[len(statuses)] == "750" {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("poller did not send the durable acknowledgement after recovery")
+}
+
 func TestPoller_ContextCancelShutdown(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Simulate a long-running poll.
@@ -414,4 +478,90 @@ func TestPoller_DoesNotAckPastInterruptedBatch(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	t.Fatalf("partial batch advanced ack: ack=%d calls=%d requests=%v", p.currentAck(), calls, acks)
+}
+
+func TestPoller_RestartReplaysUnacknowledgedSuffixSafely(t *testing.T) {
+	tmpDB := t.TempDir() + "/bridge.db"
+	db, err := OpenDB(tmpDB)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+
+	const firstUpdateID int64 = 900
+	batch := []contract.Update{makePollerUpdate(firstUpdateID), makePollerUpdate(firstUpdateID + 1)}
+	var mu sync.Mutex
+	var acks []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		acks = append(acks, r.URL.Query().Get("ack"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(contract.UpdatesResponse{OK: true, Updates: batch})
+	}))
+	defer srv.Close()
+
+	firstOutput := make(chan contract.Update)
+	firstCtx, stopFirst := context.WithCancel(context.Background())
+	first := NewPoller(srv.URL, 1, firstOutput, db)
+	first.Start(firstCtx)
+
+	select {
+	case update := <-firstOutput:
+		if update.UpdateID != firstUpdateID {
+			t.Fatalf("first forwarded update = %d, want %d", update.UpdateID, firstUpdateID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first poller did not forward the first update")
+	}
+
+	processed, err := db.IsUpdateProcessed(context.Background(), firstUpdateID)
+	if err != nil {
+		t.Fatalf("check first processed update: %v", err)
+	}
+	if !processed {
+		t.Fatal("first update was not durably recorded")
+	}
+	stopFirst()
+	select {
+	case <-first.Done():
+	case <-time.After(time.Second):
+		t.Fatal("first poller did not stop after cancellation")
+	}
+	_ = db.Close()
+
+	restartedDB, err := OpenDB(tmpDB)
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer restartedDB.Close()
+
+	replayed := make(chan contract.Update, 1)
+	restartedCtx, stopRestarted := context.WithTimeout(context.Background(), time.Second)
+	defer stopRestarted()
+	restarted := NewPoller(srv.URL, 1, replayed, restartedDB)
+	restarted.wait = func(context.Context, time.Duration) error { return nil }
+	restarted.Start(restartedCtx)
+
+	select {
+	case update := <-replayed:
+		if update.UpdateID != firstUpdateID+1 {
+			t.Fatalf("replayed update = %d, want %d", update.UpdateID, firstUpdateID+1)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("restarted poller did not forward the unacknowledged suffix")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		seen := append([]string(nil), acks...)
+		mu.Unlock()
+		for _, ack := range seen {
+			if ack == "901" {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("restarted poller never acknowledged the replayed suffix")
 }

@@ -32,6 +32,7 @@ type Sender struct {
 	client         *http.Client
 	db             *sql.DB
 	eventPublisher events.Publishable
+	wait           func(context.Context, time.Duration) error
 	mu             sync.RWMutex
 }
 
@@ -50,6 +51,7 @@ func NewSender(proxyURL, dbPath string) (*Sender, error) {
 		proxyURL: proxyURL,
 		client:   &http.Client{Timeout: 15 * time.Second},
 		db:       db,
+		wait:     waitForRetryDelay,
 	}, nil
 }
 
@@ -1004,8 +1006,10 @@ func runeByteLen(s string, n int) int {
 	return len(s)
 }
 
-// postWithRetry POSTs to the proxy with exponential backoff on connection
-// errors and respects the retry_after delay on 429 responses.
+// postWithRetry POSTs to the proxy with a bounded exponential backoff on
+// transport failures and transient proxy responses (502, 503, and 504). It
+// respects the retry_after delay on 429 responses without consuming the
+// bounded retry budget.
 func (s *Sender) postWithRetry(ctx context.Context, path string, body, out any) error {
 	backoff := senderBackoffMin
 	for attempt := 0; attempt <= senderMaxRetries; attempt++ {
@@ -1030,20 +1034,27 @@ func (s *Sender) postWithRetry(ctx context.Context, path string, body, out any) 
 			continue
 		}
 
-		// Non-retryable API error (e.g. bad request).
-		if _, ok := err.(*contract.ErrorResponse); ok {
-			return err
+		// Non-retryable API error (e.g. bad request). Proxy upstream failures
+		// are safe to retry because the request has not been accepted by the
+		// bridge-facing endpoint.
+		if !isTransientProxyError(err) {
+			if _, ok := err.(*contract.ErrorResponse); ok {
+				return err
+			}
 		}
 
-		// Connection error — apply exponential backoff.
+		// Connection error or transient proxy response — apply exponential
+		// backoff, then return the final error once the retry budget is spent.
 		if attempt == senderMaxRetries {
 			return fmt.Errorf("gave up after %d retries: %w", senderMaxRetries, err)
 		}
 		log.Printf("[bridge/sender] attempt %d failed for %s: %v, retrying in %s", attempt+1, path, err, backoff)
-		select {
-		case <-time.After(backoff):
-		case <-ctx.Done():
-			return ctx.Err()
+		wait := s.wait
+		if wait == nil {
+			wait = waitForRetryDelay
+		}
+		if err := wait(ctx, backoff); err != nil {
+			return err
 		}
 		backoff = min(backoff*2, senderBackoffMax)
 	}

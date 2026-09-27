@@ -26,6 +26,8 @@ type Poller struct {
 	updates     chan<- contract.Update
 	client      *http.Client
 	db          *DB // For update deduplication
+	wait        func(context.Context, time.Duration) error
+	done        chan struct{}
 
 	// ack is the highest update_id this bridge has durably taken
 	// responsibility for (recorded in the dedup table when db != nil). It is
@@ -49,12 +51,26 @@ func NewPoller(proxyURL string, pollTimeout int, updates chan<- contract.Update,
 		client: &http.Client{
 			Timeout: time.Duration(pollTimeout+5) * time.Second,
 		},
+		wait: waitForRetryDelay,
+		done: make(chan struct{}),
 	}
 }
 
 // Start launches the polling goroutine. It runs until ctx is cancelled.
 func (p *Poller) Start(ctx context.Context) {
-	go p.pollLoop(ctx)
+	go func() {
+		defer func() {
+			if p.done != nil {
+				close(p.done)
+			}
+		}()
+		p.pollLoop(ctx)
+	}()
+}
+
+// Done returns a channel that is closed when the polling goroutine exits.
+func (p *Poller) Done() <-chan struct{} {
+	return p.done
 }
 
 func (p *Poller) pollLoop(ctx context.Context) {
@@ -76,10 +92,12 @@ func (p *Poller) pollLoop(ctx context.Context) {
 				log.Printf("[bridge/poller] disconnected from proxy: %v", err)
 				connected = false
 			}
-			select {
-			case <-ctx.Done():
+			wait := p.wait
+			if wait == nil {
+				wait = waitForRetryDelay
+			}
+			if err := wait(ctx, backoff); err != nil {
 				return
-			case <-time.After(backoff):
 			}
 			backoff = min(backoff*2, backoffMax)
 			continue
@@ -188,7 +206,7 @@ func (p *Poller) fetchUpdates(ctx context.Context) ([]contract.Update, error) {
 	switch resp.StatusCode {
 	case http.StatusOK:
 		// expected — fall through
-	case http.StatusBadGateway, http.StatusServiceUnavailable:
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return nil, fmt.Errorf("proxy unavailable (HTTP %d)", resp.StatusCode)
 	default:
 		return nil, fmt.Errorf("unexpected status %d from proxy", resp.StatusCode)
