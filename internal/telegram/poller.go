@@ -86,6 +86,9 @@ func NewPoller(token, apiBase, version, commitSHA, offsetPath string) *Poller {
 			p.updates, dropped = trimToCap(unacked, p.bufferCap)
 			if dropped > 0 {
 				log.Printf("poller: persisted unacked buffer exceeded cap (%d) — dropped %d oldest updates; they cannot be re-delivered", p.bufferCap, dropped)
+				if err := p.saveState(); err != nil {
+					log.Printf("poller: could not persist trimmed unacked buffer: %v", err)
+				}
 			}
 		}
 		if offset > 0 || len(unacked) > 0 {
@@ -110,7 +113,9 @@ func (p *Poller) SetUpdateBufferCap(n int) {
 	p.mu.Unlock()
 	if dropped > 0 {
 		log.Printf("poller: unacked update buffer cap reduced to %d — dropped %d oldest updates; they cannot be re-delivered", n, dropped)
-		p.saveState()
+		if err := p.saveState(); err != nil {
+			log.Printf("poller: could not persist reduced unacked buffer: %v", err)
+		}
 	}
 }
 
@@ -217,16 +222,14 @@ func (p *Poller) Start(ctx context.Context) {
 		}
 		p.mu.Unlock()
 
-		if len(updates) == 0 {
-			// Empty Telegram responses do not change state, but saving here is
-			// intentionally harmless and retries a previous failed write.
-			p.saveState()
-			continue
-		}
-
 		// Persist even when normalization produced no bridge update. Telegram's
 		// upstream offset still advanced and must be kept with the buffer state.
-		p.saveState()
+		// Do not ask Telegram for another batch until this snapshot is durable:
+		// Telegram will not return these updates again once the next offset is
+		// used, so continuing after a failed state write would lose them.
+		if err := p.ensureStateSaved(ctx); err != nil {
+			return
+		}
 
 		if len(normalized) > 0 {
 			select {
@@ -272,13 +275,37 @@ func (p *Poller) PeekUpdates(ctx context.Context, timeout time.Duration) []contr
 // it has durably taken responsibility for everything up to and including
 // `through` (e.g. written it to its own database); discarded updates are never
 // re-delivered. Returns the number of updates discarded. Passing through <= 0
-// is a no-op.
+// is a no-op. If the state file cannot be persisted, the updates remain
+// retained and Ack returns zero; callers that need to report the failure should
+// use AckDurably.
 func (p *Poller) Ack(through int64) int {
-	if through <= 0 {
+	discarded, err := p.AckDurably(through)
+	if err != nil {
+		log.Printf("poller: could not persist acknowledgement through %d: %v", through, err)
 		return 0
 	}
+	return discarded
+}
 
+// AckDurably applies a cumulative acknowledgement only after the resulting
+// offset/buffer snapshot has been atomically persisted. This ordering is
+// important for the HTTP protocol: a successful response must never tell the
+// bridge that an acknowledgement was accepted when a restart could still
+// restore the pre-ack buffer.
+func (p *Poller) AckDurably(through int64) (int, error) {
+	if through <= 0 {
+		return 0, nil
+	}
+
+	// Keep the state mutex held while writing the candidate snapshot so a
+	// concurrent Telegram batch cannot create a newer in-memory state between
+	// the snapshot and the commit. Lock saveMu first, matching saveState's lock
+	// order.
+	p.saveMu.Lock()
+	defer p.saveMu.Unlock()
 	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	retained := make([]contract.Update, 0, len(p.updates))
 	for _, update := range p.updates {
 		if update.UpdateID > through {
@@ -287,14 +314,19 @@ func (p *Poller) Ack(through int64) int {
 	}
 	discarded := len(p.updates) - len(retained)
 	if discarded == 0 {
-		p.mu.Unlock()
-		return 0
+		return 0, nil
 	}
-	p.updates = retained
-	p.mu.Unlock()
 
-	p.saveState()
-	return discarded
+	sf := stateFile{Offset: p.offset}
+	if len(retained) > 0 {
+		sf.Unacked = append([]contract.Update(nil), retained...)
+	}
+	if err := p.writeState(sf); err != nil {
+		return 0, err
+	}
+
+	p.updates = retained
+	return discarded, nil
 }
 
 // Health returns the current health status of the poller.
@@ -354,11 +386,12 @@ func (p *Poller) loadState() (int64, []contract.Update) {
 }
 
 // saveState writes the current offset and retained unacked updates to disk
-// atomically using a temp file + fsync + rename. Errors are logged but don't
-// stop polling; the next successful poll retries the complete snapshot.
-func (p *Poller) saveState() {
+// atomically using a temp file + fsync + rename. The caller decides whether a
+// failure is retryable; Start must not continue polling after one because the
+// next Telegram request can make the updates unrecoverable upstream.
+func (p *Poller) saveState() error {
 	if p.offsetPath == "" {
-		return
+		return nil
 	}
 
 	p.saveMu.Lock()
@@ -372,17 +405,50 @@ func (p *Poller) saveState() {
 		sf.Unacked = append([]contract.Update(nil), p.updates...)
 	}
 	p.mu.Unlock()
+	return p.writeState(sf)
+}
+
+// ensureStateSaved blocks Telegram polling until the current offset/buffer
+// snapshot is persisted or the context is cancelled. This is deliberately
+// separate from saveState so a transient filesystem failure cannot turn into
+// silent update loss.
+func (p *Poller) ensureStateSaved(ctx context.Context) error {
+	backoff := time.Second
+	for {
+		if err := p.saveState(); err == nil {
+			return nil
+		} else {
+			log.Printf("poller: state persistence failed: %v — retrying in %s", err, backoff)
+		}
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+func (p *Poller) writeState(sf stateFile) error {
+	if p.offsetPath == "" {
+		return nil
+	}
 
 	// Ensure directory exists
 	if err := os.MkdirAll(filepath.Dir(p.offsetPath), 0755); err != nil {
-		log.Printf("poller: error creating state directory: %v", err)
-		return
+		return fmt.Errorf("create state directory: %w", err)
 	}
 
 	data, err := json.Marshal(sf)
 	if err != nil {
-		log.Printf("poller: error marshaling state: %v", err)
-		return
+		return fmt.Errorf("marshal state: %w", err)
 	}
 
 	// Write to a unique temp file first, then rename for atomicity. A unique
@@ -390,42 +456,39 @@ func (p *Poller) saveState() {
 	// unlinking the active writer's temp file.
 	file, err := os.CreateTemp(filepath.Dir(p.offsetPath), filepath.Base(p.offsetPath)+".tmp-")
 	if err != nil {
-		log.Printf("poller: error writing state temp file: %v", err)
-		return
+		return fmt.Errorf("create state temp file: %w", err)
 	}
 	tmpPath := file.Name()
 	cleanupTemp := func() { _ = os.Remove(tmpPath) }
 	if _, err := file.Write(data); err != nil {
 		_ = file.Close()
 		cleanupTemp()
-		log.Printf("poller: error writing state temp file: %v", err)
-		return
+		return fmt.Errorf("write state temp file: %w", err)
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
 		cleanupTemp()
-		log.Printf("poller: error syncing state temp file: %v", err)
-		return
+		return fmt.Errorf("sync state temp file: %w", err)
 	}
 	if err := file.Close(); err != nil {
 		cleanupTemp()
-		log.Printf("poller: error closing state temp file: %v", err)
-		return
+		return fmt.Errorf("close state temp file: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, p.offsetPath); err != nil {
-		log.Printf("poller: error renaming state file: %v", err)
 		cleanupTemp()
-		return
+		return fmt.Errorf("rename state file: %w", err)
 	}
 	if dir, err := os.Open(filepath.Dir(p.offsetPath)); err == nil {
 		if err := dir.Sync(); err != nil {
-			log.Printf("poller: error syncing state directory: %v", err)
+			_ = dir.Close()
+			return fmt.Errorf("sync state directory: %w", err)
 		}
 		_ = dir.Close()
 	} else {
-		log.Printf("poller: error opening state directory for sync: %v", err)
+		return fmt.Errorf("open state directory for sync: %w", err)
 	}
+	return nil
 }
 
 // getUpdates calls the Telegram getUpdates API with offset and a 30-second

@@ -552,6 +552,91 @@ func TestPoller_LoadOldOffsetFile(t *testing.T) {
 	}
 }
 
+func TestPoller_DoesNotAdvanceTelegramAfterStatePersistenceFailure(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	if err := os.Mkdir(statePath, 0o755); err != nil {
+		t.Fatalf("make unwritable state target: %v", err)
+	}
+
+	var mu sync.Mutex
+	var calls int
+	secondRequest := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		if call == 2 {
+			close(secondRequest)
+		}
+
+		result := []Update(nil)
+		if call == 1 {
+			result = []Update{makeTextUpdate(950, 95)}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(GetUpdatesResponse{OK: true, Result: result})
+	}))
+	defer srv.Close()
+
+	p := NewPoller("test-token", srv.URL, "test-version", "test-sha", statePath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.Start(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := updateIDs(p.PeekUpdates(context.Background(), 0)); len(got) == 1 && got[0] == 950 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := updateIDs(p.PeekUpdates(context.Background(), 0)); len(got) != 1 || got[0] != 950 {
+		t.Fatalf("retained updates after failed state write = %v, want [950]", got)
+	}
+
+	// The failed rename must pause Telegram polling. If the poller used the
+	// next offset anyway, Telegram would consider update 950 consumed while no
+	// durable proxy state contained its retained copy.
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	gotCalls := calls
+	mu.Unlock()
+	if gotCalls != 1 {
+		t.Fatalf("Telegram request count while state write failed = %d, want 1", gotCalls)
+	}
+
+	if err := os.Remove(statePath); err != nil {
+		t.Fatalf("remove failed state target: %v", err)
+	}
+	select {
+	case <-secondRequest:
+	case <-time.After(3 * time.Second):
+		t.Fatal("poller did not resume Telegram polling after state persistence recovered")
+	}
+	cancel()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for p.Health().Polling && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if p.Health().Polling {
+		t.Fatal("poller did not stop after cancellation")
+	}
+
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read recovered state: %v", err)
+	}
+	var state stateFile
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("decode recovered state: %v", err)
+	}
+	if state.Offset != 951 || len(state.Unacked) != 1 || state.Unacked[0].UpdateID != 950 {
+		t.Fatalf("recovered state = offset %d, unacked %v; want offset 951 and update 950", state.Offset, updateIDs(state.Unacked))
+	}
+}
+
 func TestPoller_PersistsOffsetWhenBatchHasNoBridgeEnvelope(t *testing.T) {
 	offsetPath := filepath.Join(t.TempDir(), "state.json")
 	var mu sync.Mutex

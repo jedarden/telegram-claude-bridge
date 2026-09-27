@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -224,5 +226,56 @@ func TestHandleUpdates_EmptyAckParamIgnored(t *testing.T) {
 	}
 	if got := callUpdates(t, handler, "timeout=1&ack=-5"); !equalIDs(ids(got), []int64{600}) {
 		t.Fatalf("ids after ack=-5 = %v, want [600]", ids(got))
+	}
+}
+
+func TestHandleUpdates_AckPersistenceFailureRetainsUpdates(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	initial := e2eAckState{
+		Offset: 10,
+		Unacked: []contract.Update{
+			{UpdateID: 1},
+			{UpdateID: 2},
+		},
+	}
+	data, err := json.Marshal(initial)
+	if err != nil {
+		t.Fatalf("encode initial state: %v", err)
+	}
+	if err := os.WriteFile(statePath, data, 0o644); err != nil {
+		t.Fatalf("write initial state: %v", err)
+	}
+
+	poller := telegram.NewPoller("test-token", "", "test-version", "test-sha", statePath)
+	if err := os.Remove(statePath); err != nil {
+		t.Fatalf("remove state file: %v", err)
+	}
+	if err := os.Mkdir(statePath, 0o755); err != nil {
+		t.Fatalf("make state target unwritable: %v", err)
+	}
+	handler := handleUpdates(poller)
+
+	req := httptest.NewRequest(http.MethodGet, "/updates?timeout=1&ack=1", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("ack with failed persistence status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	if got := ids(poller.PeekUpdates(context.Background(), 0)); !equalIDs(got, []int64{1, 2}) {
+		t.Fatalf("retained ids after failed ack = %v, want [1 2]", got)
+	}
+
+	if err := os.Remove(statePath); err != nil {
+		t.Fatalf("remove failed state target: %v", err)
+	}
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cleared := callUpdatesWithContext(t, handler, requestCtx, "timeout=1&ack=1")
+	if got, want := ids(cleared), []int64{2}; !equalIDs(got, want) {
+		t.Fatalf("ids after recovered ack = %v, want [2]", got)
+	}
+	state := readE2EAckState(t, statePath)
+	if got := ids(state.Unacked); !equalIDs(got, []int64{2}) {
+		t.Fatalf("persisted ids after recovered ack = %v, want [2]", got)
 	}
 }

@@ -117,7 +117,10 @@ func handleUpdates(p *telegram.Poller) http.HandlerFunc {
 		// re-delivered on subsequent calls.
 		if v := r.URL.Query().Get("ack"); v != "" {
 			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-				p.Ack(n)
+				if _, err := p.AckDurably(n); err != nil {
+					writeProxyError(w, http.StatusInternalServerError, 500, "could not persist acknowledgement: "+err.Error())
+					return
+				}
 			}
 		}
 
