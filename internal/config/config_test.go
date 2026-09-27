@@ -528,6 +528,55 @@ func TestLoadBridgeConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("workspace roots reject empty entries", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		os.Setenv("PROXY_URL", "http://proxy:9090")
+		os.Setenv("WORKSPACE_ROOTS", "/srv/project-a"+string(os.PathListSeparator))
+
+		_, err := LoadBridgeConfig()
+		if err == nil || err.Error() != "WORKSPACE_ROOTS contains an empty root" {
+			t.Fatalf("LoadBridgeConfig() error = %v, want empty-root validation error", err)
+		}
+	})
+
+	t.Run("workspace roots alias is accepted", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		os.Setenv("PROXY_URL", "http://proxy:9090")
+		os.Setenv("REPO_PATH", "/srv/bridge-deploy")
+		os.Unsetenv("WORKSPACE_ROOTS")
+		os.Setenv("ALLOWED_WORKSPACE_ROOTS", "/srv/project")
+
+		cfg, err := LoadBridgeConfig()
+		if err != nil {
+			t.Fatalf("LoadBridgeConfig() error = %v", err)
+		}
+		if len(cfg.WorkspaceRoots) != 1 || cfg.WorkspaceRoots[0] != "/srv/project" {
+			t.Errorf("WorkspaceRoots = %#v, want alias root", cfg.WorkspaceRoots)
+		}
+	})
+
+	t.Run("workspace roots default to repo path", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		os.Setenv("PROXY_URL", "http://proxy:9090")
+		os.Setenv("REPO_PATH", "/srv/bridge-deploy")
+		os.Unsetenv("WORKSPACE_ROOTS")
+		os.Unsetenv("ALLOWED_WORKSPACE_ROOTS")
+
+		cfg, err := LoadBridgeConfig()
+		if err != nil {
+			t.Fatalf("LoadBridgeConfig() error = %v", err)
+		}
+		if len(cfg.WorkspaceRoots) != 1 || cfg.WorkspaceRoots[0] != cfg.RepoPath {
+			t.Errorf("WorkspaceRoots = %#v, want repo path %q", cfg.WorkspaceRoots, cfg.RepoPath)
+		}
+	})
+
 	t.Run("ALLOWED_CHAT_ID", func(t *testing.T) {
 		saved := saveEnv()
 		defer restoreEnv(saved)

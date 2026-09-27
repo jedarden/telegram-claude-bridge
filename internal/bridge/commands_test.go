@@ -3,9 +3,12 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -471,6 +474,62 @@ func TestCmdCWD_SetPath_Success(t *testing.T) {
 	}
 	if updated.CWD != tempDir {
 		t.Errorf("CWD in DB = %q, want %q", updated.CWD, tempDir)
+	}
+}
+
+func TestCmdCWD_PersistsCanonicalAcceptedPathAndRejectsOutsideRoot(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	root := t.TempDir()
+	project := filepath.Join(root, "project")
+	alias := filepath.Join(root, "project-alias")
+	outside := t.TempDir()
+	if err := os.Mkdir(project, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	if err := os.Symlink(project, alias); err != nil {
+		t.Fatalf("symlink project: %v", err)
+	}
+
+	admin := &AllowedUser{UserID: 12345, Role: "admin", AddedAt: time.Now().UTC()}
+	if err := db.UpsertAllowedUser(ctx, admin); err != nil {
+		t.Fatalf("upsert admin: %v", err)
+	}
+	group := &Group{ChatID: 100, CWD: root, CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	policy, err := NewWorkingDirectoryPolicy(root)
+	if err != nil {
+		t.Fatalf("NewWorkingDirectoryPolicy: %v", err)
+	}
+	h := newTestCommandHandler(t, db)
+	h.SetWorkingDirectoryPolicy(policy)
+	update := makeUpdate(100, nil, 100, "/cwd "+alias, 12345)
+
+	if _, err := h.cmdCWD(ctx, update, group, alias); err != nil {
+		t.Fatalf("cmdCWD accepted symlink: %v", err)
+	}
+	updated, err := db.GetGroup(ctx, 100)
+	if err != nil {
+		t.Fatalf("get updated group: %v", err)
+	}
+	if updated.CWD != project {
+		t.Fatalf("persisted CWD = %q, want canonical path %q", updated.CWD, project)
+	}
+
+	_, err = h.cmdCWD(ctx, update, updated, outside)
+	if !errors.Is(err, ErrWorkingDirectoryNotAllowed) {
+		t.Fatalf("cmdCWD outside root error = %v, want %v", err, ErrWorkingDirectoryNotAllowed)
+	}
+	unchanged, err := db.GetGroup(ctx, 100)
+	if err != nil {
+		t.Fatalf("get unchanged group: %v", err)
+	}
+	if unchanged.CWD != project {
+		t.Fatalf("rejected path changed persisted CWD to %q, want %q", unchanged.CWD, project)
 	}
 }
 
