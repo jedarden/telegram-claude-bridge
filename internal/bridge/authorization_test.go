@@ -209,3 +209,194 @@ func TestCommandHandler_NonAdminCannotCreateSession(t *testing.T) {
 		t.Fatalf("non-admin session creation reply = %q, want denial", reply)
 	}
 }
+
+func TestRouter_AuthorizationBoundary(t *testing.T) {
+	const (
+		configuredChat = int64(100)
+		otherChat      = int64(999)
+		adminUser      = int64(9001)
+		allowedUser    = int64(200)
+		unknownUser    = int64(300)
+	)
+
+	tests := []struct {
+		name          string
+		allowedChatID int64
+		chatID        int64
+		userID        int64
+		allowlisted   bool
+		admin         bool
+		wantHandler   bool
+	}{
+		{
+			name:          "configured chat mismatch is silently dropped even for admin",
+			allowedChatID: configuredChat,
+			chatID:        otherChat,
+			userID:        adminUser,
+			admin:         true,
+		},
+		{
+			name:          "zero allowed chat accepts allowlisted user from any chat",
+			allowedChatID: 0,
+			chatID:        otherChat,
+			userID:        allowedUser,
+			allowlisted:   true,
+			wantHandler:   true,
+		},
+		{
+			name:          "non-allowlisted user is silently dropped",
+			allowedChatID: configuredChat,
+			chatID:        configuredChat,
+			userID:        unknownUser,
+		},
+		{
+			name:          "bootstrap admin is authorized in configured chat",
+			allowedChatID: configuredChat,
+			chatID:        configuredChat,
+			userID:        adminUser,
+			admin:         true,
+			wantHandler:   true,
+		},
+		{
+			name:          "allowlisted user reaches command handler",
+			allowedChatID: configuredChat,
+			chatID:        configuredChat,
+			userID:        allowedUser,
+			allowlisted:   true,
+			wantHandler:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			if tc.allowlisted {
+				seedUser(t, db, tc.userID)
+			}
+
+			sender, recorder := newRecordingProxy(t)
+			h := NewCommandHandler(db, sender, "http://unused", nil, nil, "v1.0.0", "test", "test")
+			authorizer := NewAuthorizer(db, tc.allowedChatID, 0)
+			if tc.admin {
+				authorizer.SetAdminUserID(tc.userID)
+			}
+
+			r := NewRouter(db, nil, tc.allowedChatID)
+			r.SetAuthorizer(authorizer)
+			var handlerCalls int
+			r.OnCommand = func(ctx context.Context, update contract.Update, group *Group) {
+				handlerCalls++
+				h.Handle(ctx, update, group)
+			}
+
+			r.Route(context.Background(), commandTextUpdate(tc.userID, tc.chatID, 1, "/help"))
+
+			if got := handlerCalls > 0; got != tc.wantHandler {
+				t.Fatalf("handler called = %t, want %t", got, tc.wantHandler)
+			}
+			if sends := recorder.all(); tc.wantHandler && len(sends) != 1 {
+				t.Fatalf("proxy sends = %d, want one handler reply: %+v", len(sends), sends)
+			} else if !tc.wantHandler && len(sends) != 0 {
+				t.Fatalf("unauthorized update produced proxy sends, want silent drop: %+v", sends)
+			}
+		})
+	}
+}
+
+func TestCommandHandler_AdminCommandsRequireAdministrator(t *testing.T) {
+	const (
+		adminUser   = int64(9001)
+		regularUser = int64(200)
+	)
+
+	tests := []struct {
+		name       string
+		invoke     func(context.Context, *CommandHandler, contract.Update, *Group) (string, error)
+		adminReply string
+	}{
+		{
+			name: "adduser",
+			invoke: func(ctx context.Context, h *CommandHandler, update contract.Update, _ *Group) (string, error) {
+				return h.cmdAddUser(ctx, update, "300")
+			},
+			adminReply: "Added user 300",
+		},
+		{
+			name: "removeuser",
+			invoke: func(ctx context.Context, h *CommandHandler, update contract.Update, _ *Group) (string, error) {
+				return h.cmdRemoveUser(ctx, update, "300")
+			},
+			adminReply: "Removed user 300",
+		},
+		{
+			name: "users",
+			invoke: func(ctx context.Context, h *CommandHandler, update contract.Update, _ *Group) (string, error) {
+				return h.cmdUsers(ctx, update)
+			},
+			adminReply: "Allowed users (1)",
+		},
+		{
+			name: "config",
+			invoke: func(ctx context.Context, h *CommandHandler, update contract.Update, group *Group) (string, error) {
+				return h.cmdConfig(ctx, update, group, "permission_mode plan")
+			},
+			adminReply: "Permission mode set to: plan",
+		},
+		{
+			name: "update",
+			invoke: func(ctx context.Context, h *CommandHandler, update contract.Update, _ *Group) (string, error) {
+				return h.cmdUpdate(ctx, update, "")
+			},
+			adminReply: "No updates available",
+		},
+		{
+			name: "permission",
+			invoke: func(ctx context.Context, h *CommandHandler, update contract.Update, group *Group) (string, error) {
+				return h.cmdPermission(ctx, update, group, "plan")
+			},
+			adminReply: "Permission mode set to: plan",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			ctx := context.Background()
+			seedUser(t, db, regularUser)
+			group := &Group{
+				ChatID:         100,
+				CWD:            t.TempDir(),
+				PermissionMode: defaultPermissionMode,
+				CreatedAt:      time.Now().UTC(),
+			}
+			if err := db.UpsertGroup(ctx, group); err != nil {
+				t.Fatalf("upsert group: %v", err)
+			}
+
+			h := newTestCommandHandler(t, db)
+			h.SetAdminUserID(adminUser)
+			if tc.name == "update" {
+				h.updater = &mockUpdaterImpl{}
+			}
+
+			regularReply, err := tc.invoke(ctx, h, makeUpdate(100, nil, 1, "/"+tc.name, regularUser), group)
+			if err != nil {
+				t.Fatalf("regular user command: %v", err)
+			}
+			if !strings.Contains(regularReply, "Permission denied") {
+				t.Fatalf("regular user reply = %q, want permission denial", regularReply)
+			}
+
+			adminReply, err := tc.invoke(ctx, h, makeUpdate(100, nil, 2, "/"+tc.name, adminUser), group)
+			if err != nil {
+				t.Fatalf("bootstrap admin command: %v", err)
+			}
+			if strings.Contains(adminReply, "Permission denied") {
+				t.Fatalf("bootstrap admin was denied: %q", adminReply)
+			}
+			if !strings.Contains(adminReply, tc.adminReply) {
+				t.Fatalf("bootstrap admin reply = %q, want %q", adminReply, tc.adminReply)
+			}
+		})
+	}
+}
