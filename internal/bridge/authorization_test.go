@@ -27,6 +27,9 @@ func TestRouter_AllowedChatIDDropsEveryUpdateTypeFromOtherChats(t *testing.T) {
 		serviceUpdate(1, 999, int64Ptr(5), contract.ServiceTypeForumTopicCreated),
 		callbackUpdate(1, 999),
 	}
+	edited := textUpdate(1, 999, int64Ptr(5), "edited", false)
+	edited.Type = "edited_message"
+	updates = append(updates, edited)
 	for _, update := range updates {
 		r.Route(context.Background(), update)
 	}
@@ -189,6 +192,40 @@ func TestCommandHandler_NonAdminCannotChangeModel(t *testing.T) {
 	}
 }
 
+func TestCommandHandler_NonAdminCannotChangeWorkspace(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	const userID = int64(200)
+	seedUser(t, db, userID)
+
+	originalCWD := t.TempDir()
+	newCWD := t.TempDir()
+	group := &Group{ChatID: 100, CWD: originalCWD, CreatedAt: time.Now().UTC()}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("upsert group: %v", err)
+	}
+
+	h := newTestCommandHandler(t, db)
+	reply, err := h.cmdCWD(ctx, makeUpdate(100, nil, 1, "/cwd "+newCWD, userID), group, newCWD)
+	if err != nil {
+		t.Fatalf("cmdCWD: %v", err)
+	}
+	if !strings.Contains(reply, "Permission denied") {
+		t.Fatalf("non-admin workspace change reply = %q, want denial", reply)
+	}
+	if group.CWD != originalCWD {
+		t.Fatalf("in-memory workspace = %q, want unchanged %q", group.CWD, originalCWD)
+	}
+
+	stored, err := db.GetGroup(ctx, 100)
+	if err != nil {
+		t.Fatalf("get group: %v", err)
+	}
+	if stored.CWD != originalCWD {
+		t.Fatalf("stored workspace = %q, want unchanged %q", stored.CWD, originalCWD)
+	}
+}
+
 func TestCommandHandler_NonAdminCannotCreateSession(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -300,6 +337,112 @@ func TestRouter_AuthorizationBoundary(t *testing.T) {
 				t.Fatalf("unauthorized update produced proxy sends, want silent drop: %+v", sends)
 			}
 		})
+	}
+}
+
+func TestRouter_AuthorizedUpdateTypesReachHandlers(t *testing.T) {
+	db := openTestDB(t)
+	seedUser(t, db, 200)
+	if err := db.UpsertAllowedUser(context.Background(), &AllowedUser{UserID: 9001, Role: "admin"}); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
+	seedGroup(t, db, 100)
+	seedSession(t, db, 100, 5)
+
+	r := NewRouter(db, nil, 100)
+	var messageCalls, callbackCalls, serviceCalls int
+	r.OnSession = func(context.Context, contract.Update, *Session, *Group) { messageCalls++ }
+	r.OnCallback = func(context.Context, contract.Update) { callbackCalls++ }
+	r.OnService = func(context.Context, contract.Update) { serviceCalls++ }
+
+	message := textUpdate(200, 100, int64Ptr(5), "hello", false)
+	edited := message
+	edited.Type = "edited_message"
+	r.Route(context.Background(), message)
+	r.Route(context.Background(), edited)
+	r.Route(context.Background(), callbackUpdate(9001, 100))
+	r.Route(context.Background(), serviceUpdate(200, 100, int64Ptr(5), contract.ServiceTypeForumTopicCreated))
+
+	if messageCalls != 2 {
+		t.Fatalf("message handlers called %d times, want 2 for message and edited_message", messageCalls)
+	}
+	if callbackCalls != 1 {
+		t.Fatalf("callback handler called %d times, want 1", callbackCalls)
+	}
+	if serviceCalls != 1 {
+		t.Fatalf("service handler called %d times, want 1", serviceCalls)
+	}
+}
+
+func TestRouter_UnauthorizedUpdateTypesAreSilentlyRejected(t *testing.T) {
+	db := openTestDB(t)
+	r := NewRouter(db, nil, 100)
+
+	var calls int
+	r.OnCommand = func(context.Context, contract.Update, *Group) { calls++ }
+	r.OnSession = func(context.Context, contract.Update, *Session, *Group) { calls++ }
+	r.OnCallback = func(context.Context, contract.Update) { calls++ }
+	r.OnService = func(context.Context, contract.Update) { calls++ }
+
+	message := textUpdate(300, 100, int64Ptr(5), "hello", false)
+	edited := message
+	edited.Type = "edited_message"
+	updates := []contract.Update{
+		message,
+		edited,
+		callbackUpdate(300, 100),
+		serviceUpdate(300, 100, int64Ptr(5), contract.ServiceTypeForumTopicCreated),
+	}
+	for _, update := range updates {
+		r.Route(context.Background(), update)
+	}
+
+	if calls != 0 {
+		t.Fatalf("unauthorized update handlers called %d times, want silent rejection", calls)
+	}
+}
+
+func TestAuthorizer_AdminUserIDZeroDoesNotAuthorizeUserZero(t *testing.T) {
+	db := openTestDB(t)
+	authorizer := NewAuthorizer(db, 100, 0)
+	ctx := context.Background()
+
+	admin, err := authorizer.IsAdmin(ctx, 0)
+	if err != nil {
+		t.Fatalf("IsAdmin: %v", err)
+	}
+	if admin {
+		t.Fatal("ADMIN_USER_ID=0 must not bootstrap user 0 as an administrator")
+	}
+
+	for _, update := range []contract.Update{
+		textUpdate(0, 100, nil, "/help", true),
+		callbackUpdate(0, 100),
+	} {
+		allowed, err := authorizer.CanReceiveUpdate(ctx, update)
+		if err != nil {
+			t.Fatalf("CanReceiveUpdate(%q): %v", update.Type, err)
+		}
+		if allowed {
+			t.Fatalf("ADMIN_USER_ID=0 unexpectedly authorized %q", update.Type)
+		}
+	}
+}
+
+func TestRouter_DatabaseAdminRemainsAuthorizedWithZeroBootstrapID(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.UpsertAllowedUser(context.Background(), &AllowedUser{UserID: 9001, Role: "admin"}); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
+	r := NewRouter(db, nil, 100)
+	r.SetAdminUserID(0)
+
+	called := false
+	r.OnCallback = func(context.Context, contract.Update) { called = true }
+	r.Route(context.Background(), callbackUpdate(9001, 100))
+
+	if !called {
+		t.Fatal("database administrator should remain authorized when ADMIN_USER_ID=0")
 	}
 }
 
