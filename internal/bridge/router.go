@@ -114,6 +114,16 @@ type Router struct {
 	rateLimiter    *rateLimiter
 	eventPublisher events.Publishable
 
+	// allowedChatID restricts routing to one Telegram chat when non-zero. A
+	// zero value preserves the documented "all chats" behavior.
+	allowedChatID int64
+
+	// adminUserID is the bootstrap administrator configured through
+	// ADMIN_USER_ID. It is allowed through even if an administrator's database
+	// allow-list row is accidentally removed; the chat restriction still
+	// applies.
+	adminUserID int64
+
 	// OnCommand is called for bot commands in the General topic.
 	OnCommand CommandHandlerFunc
 
@@ -128,13 +138,25 @@ type Router struct {
 }
 
 // NewRouter returns a Router backed by db.
-// eventPublisher may be nil if event publishing is disabled.
-func NewRouter(db *DB, eventPublisher events.Publishable) *Router {
-	return &Router{
+// eventPublisher may be nil if event publishing is disabled. The optional
+// allowedChatID argument is intended for the bridge's ALLOWED_CHAT_ID setting;
+// omitting it or passing zero accepts updates from every chat.
+func NewRouter(db *DB, eventPublisher events.Publishable, allowedChatID ...int64) *Router {
+	r := &Router{
 		db:             db,
 		rateLimiter:    newRateLimiter(),
 		eventPublisher: eventPublisher,
 	}
+	if len(allowedChatID) > 0 {
+		r.allowedChatID = allowedChatID[0]
+	}
+	return r
+}
+
+// SetAdminUserID configures the administrator bootstrapped by ADMIN_USER_ID.
+// Additional administrators remain controlled by the allowed_users table.
+func (r *Router) SetAdminUserID(userID int64) {
+	r.adminUserID = userID
 }
 
 // Route classifies update and dispatches it to the registered handler.
@@ -150,17 +172,25 @@ func NewRouter(db *DB, eventPublisher events.Publishable) *Router {
 //
 // Non-command messages in the General topic are silently ignored.
 func (r *Router) Route(ctx context.Context, update contract.Update) {
-	// ── 1. Authorization ────────────────────────────────────────────────────────
+	// ── 1. Chat authorization ────────────────────────────────────────────────────
+	// Apply the chat boundary before touching user authorization or dispatching
+	// any callback/service update. Rejected chats are intentionally silent so
+	// they cannot use the bot to enumerate its configured chat or users.
+	if r.allowedChatID != 0 && update.ChatID != r.allowedChatID {
+		return
+	}
+
+	// ── 2. User authorization ────────────────────────────────────────────────────
 	allowed, err := r.db.IsUserAllowed(ctx, update.FromUser.ID)
 	if err != nil {
 		log.Printf("[router] auth check failed for user %d: %v", update.FromUser.ID, err)
 		return
 	}
-	if !allowed {
+	if !allowed && (r.adminUserID <= 0 || update.FromUser.ID != r.adminUserID) {
 		return // silently drop
 	}
 
-	// ── 2. Rate limiting ──────────────────────────────────────────────────────────
+	// ── 3. Rate limiting ──────────────────────────────────────────────────────────
 	// Apply rate limits to non-callback, non-service messages
 	if update.Type != "callback_query" && update.Type != "service" {
 		if !r.rateLimiter.check(update.FromUser.ID) {
@@ -175,7 +205,7 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 		}
 	}
 
-	// ── 3. Callback query ────────────────────────────────────────────────────────
+	// ── 4. Callback query ────────────────────────────────────────────────────────
 	if update.Type == "callback_query" {
 		if r.OnCallback != nil {
 			r.OnCallback(ctx, update)
@@ -183,7 +213,7 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 		return
 	}
 
-	// ── 4. Service message ───────────────────────────────────────────────────────
+	// ── 5. Service message ───────────────────────────────────────────────────────
 	if update.Type == "service" {
 		if r.OnService != nil {
 			r.OnService(ctx, update)
@@ -191,7 +221,7 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 		return
 	}
 
-	// ── 5. General topic ─────────────────────────────────────────────────────────
+	// ── 6. General topic ─────────────────────────────────────────────────────────
 	isGeneral := update.ThreadID == nil || *update.ThreadID == generalTopicID
 	if isGeneral {
 		if update.Content != nil && update.Content.IsCommand() && r.OnCommand != nil {
@@ -222,7 +252,7 @@ func (r *Router) Route(ctx context.Context, update contract.Update) {
 		return
 	}
 
-	// ── 6. Named topic ───────────────────────────────────────────────────────────
+	// ── 7. Named topic ───────────────────────────────────────────────────────────
 	tid := *update.ThreadID
 
 	// Publish message received event (Phase 6 format)

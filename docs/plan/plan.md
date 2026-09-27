@@ -709,9 +709,11 @@ CREATE TABLE processed_updates (
 #### User Authorization
 
 - `allowed_users` table is the allowlist. Only messages from authorized `from_user_id` values are processed.
-- Admin role can use `/cwd`, `/model`, `/budget`, `/timeout`, and manage group settings.
-- User role can send messages to topics and use `/status`, `/help`, `/new`, `/close`, and all topic-level commands.
-- Unknown users are silently ignored (no error response to prevent enumeration).
+- `ALLOWED_CHAT_ID`, when non-zero, is an exact chat boundary enforced before user, service, callback, or command routing. A zero value accepts all chats and should be treated as an explicitly open deployment setting.
+- `ADMIN_USER_ID` is bootstrapped into `allowed_users` as an admin at startup and remains the administrator authorization source while the process runs. Other admins are managed through the `allowed_users` table.
+- Admin-only writes are `/cwd <path>`, `/permission <mode>`, `/config <setting> <value>`, and `/budget <amount>`. `/update`, `/adduser`, `/removeuser`, `/users`, and `/usage` are admin-only commands. Their read-only forms (`/cwd`, `/permission`, `/config`, and `/budget`) remain available to allowed users.
+- User-role accounts can send messages and use topic/session commands, including model, notification, timeout, dispatch, snippet, background-job, and parallel controls.
+- Unknown users and blocked chats are silently ignored (no error response to prevent enumeration).
 
 #### Input Handling
 
@@ -723,7 +725,7 @@ CREATE TABLE processed_updates (
 - **Runtime behavior:** The stored `permission_mode` is wired to CLI flags at every Claude spawn site via `resolvePermissionArgs()` in `internal/bridge/session_manager.go` (the source of truth):
   - `bypassPermissions` → `--dangerously-skip-permissions`
   - `acceptEdits`, `plan`, `dontAsk` → `--permission-mode <mode>`
-- **Permission modes:** `acceptEdits`, `bypassPermissions`, `plan`, `dontAsk` — configurable per group and per topic via `/permission` or `/config permission_mode`, and applied at the next spawn. The `groups.permission_mode` column defaults to `acceptEdits`; if it is empty, the Go-side fallback (`defaultPermissionMode`) is `bypassPermissions`.
+- **Permission modes:** `acceptEdits`, `bypassPermissions`, `plan`, `dontAsk` — configurable per group and per topic via `/permission` or `/config permission_mode`, and applied at the next spawn. New groups created by `/cwd <path>` use the documented Go-side default (`defaultPermissionMode`), `bypassPermissions`; an empty mode also falls back to that value. Only an administrator can change this setting.
 - **Spawn sites covered:** topic panes (`session_manager.go`), workers (`worker_pool.go`), `/parallel` subtasks (`subtask_orchestrator.go`), command-driven spawns (`commands.go`), and the service handler (`service_handler.go`).
 - `--allowed-tools` and `--disallowed-tools` are configurable per group to restrict what Claude can do.
 - **Not implemented:** interactive per-tool approval from Telegram. Only the CLI flag reflects the configured mode — there is no PTY-output prompt detection, so a `plan`-mode approval prompt is never surfaced as an inline keyboard. `SendToolApprovalPrompt` in `sender.go` and the `approve_tool`/`deny_tool` callback handlers exist but are unreachable.

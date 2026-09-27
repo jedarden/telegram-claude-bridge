@@ -60,10 +60,10 @@ Admin commands:
 
 // validPermissionModes lists the --permission-mode values accepted by Claude CLI.
 var validPermissionModes = map[string]bool{
-	"acceptEdits":        true,
-	"bypassPermissions":  true,
-	"plan":               true,
-	"dontAsk":            true,
+	"acceptEdits":       true,
+	"bypassPermissions": true,
+	"plan":              true,
+	"dontAsk":           true,
 }
 
 // CommandHandler dispatches bot commands sent in the General topic.
@@ -73,13 +73,14 @@ type CommandHandler struct {
 	proxyURL            string
 	client              *http.Client
 	updater             UpdaterInterface
-	sessionMgr          *SessionManager // optional, for context commands
-	subtaskOrchestrator *SubtaskOrchestrator // optional, for parallel commands
+	sessionMgr          *SessionManager       // optional, for context commands
+	subtaskOrchestrator *SubtaskOrchestrator  // optional, for parallel commands
 	bgJobMgr            *BackgroundJobManager // optional, for background job commands
-	eventPublisher      events.Publishable // optional, for dashboard events
+	eventPublisher      events.Publishable    // optional, for dashboard events
 	bridgeVer           string
 	bridgeSHA           string
 	buildDate           string
+	adminUserID         int64
 
 	// closeWG tracks in-flight asynchronous close/summary goroutines
 	// started by cmdClose.
@@ -146,6 +147,21 @@ func (h *CommandHandler) SetBackgroundJobManager(mgr *BackgroundJobManager) {
 	h.bgJobMgr = mgr
 }
 
+// SetAdminUserID configures the administrator bootstrapped by ADMIN_USER_ID.
+// This identity remains an administrator even if its database allow-list row
+// is accidentally removed or changed. Other administrators are still managed
+// through the allowed_users table.
+func (h *CommandHandler) SetAdminUserID(userID int64) {
+	h.adminUserID = userID
+}
+
+func (h *CommandHandler) isAdmin(ctx context.Context, userID int64) (bool, error) {
+	if h.adminUserID > 0 && userID == h.adminUserID {
+		return true, nil
+	}
+	return h.db.IsUserAdmin(ctx, userID)
+}
+
 // Handle implements CommandHandlerFunc. It dispatches the update to the
 // appropriate command function and sends the reply via the sender.
 func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, group *Group) {
@@ -210,7 +226,7 @@ func (h *CommandHandler) Handle(ctx context.Context, update contract.Update, gro
 	case "/cancel":
 		reply, err = h.cmdCancel(ctx, update, group, args)
 	case "/timeout":
-			reply, err = h.cmdTimeout(ctx, update, group, args)
+		reply, err = h.cmdTimeout(ctx, update, group, args)
 	case "/parallel":
 		reply, err = h.cmdParallel(ctx, update, group, args)
 	case "/bg":
@@ -257,7 +273,7 @@ func (h *CommandHandler) cmdCWD(ctx context.Context, update contract.Update, gro
 
 	// Setting the working directory requires admin access
 	userID := update.FromUser.ID
-	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	isAdmin, err := h.isAdmin(ctx, userID)
 	if err != nil {
 		return "", fmt.Errorf("check admin status: %w", err)
 	}
@@ -325,7 +341,7 @@ func (h *CommandHandler) cmdPermission(ctx context.Context, update contract.Upda
 
 	// Setting permission mode requires admin access
 	userID := update.FromUser.ID
-	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	isAdmin, err := h.isAdmin(ctx, userID)
 	if err != nil {
 		return "", fmt.Errorf("check admin status: %w", err)
 	}
@@ -416,7 +432,7 @@ func (h *CommandHandler) cmdConfig(ctx context.Context, update contract.Update, 
 
 	// Check admin access for setting values
 	userID := update.FromUser.ID
-	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	isAdmin, err := h.isAdmin(ctx, userID)
 	if err != nil {
 		return "", fmt.Errorf("check admin status: %w", err)
 	}
@@ -852,7 +868,7 @@ func (h *CommandHandler) cmdUpdate(ctx context.Context, update contract.Update, 
 
 	// Check for update requires admin access
 	userID := update.FromUser.ID
-	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	isAdmin, err := h.isAdmin(ctx, userID)
 	if err != nil {
 		return "", fmt.Errorf("check admin status: %w", err)
 	}
@@ -1506,7 +1522,7 @@ func (h *CommandHandler) cmdCost(ctx context.Context, update contract.Update, gr
 func (h *CommandHandler) cmdUsage(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
 	// Check if the user is an admin
 	userID := update.FromUser.ID
-	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	isAdmin, err := h.isAdmin(ctx, userID)
 	if err != nil {
 		return "", fmt.Errorf("check admin status: %w", err)
 	}
@@ -1673,7 +1689,7 @@ func (h *CommandHandler) cmdBudget(ctx context.Context, update contract.Update, 
 
 	// Set new budget - requires admin check
 	userID := update.FromUser.ID
-	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	isAdmin, err := h.isAdmin(ctx, userID)
 	if err != nil {
 		return "", fmt.Errorf("check admin status: %w", err)
 	}
@@ -1719,7 +1735,7 @@ func (h *CommandHandler) cmdAddUser(ctx context.Context, update contract.Update,
 
 	// Check if the user is an admin
 	userID := update.FromUser.ID
-	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	isAdmin, err := h.isAdmin(ctx, userID)
 	if err != nil {
 		return "", fmt.Errorf("check admin status: %w", err)
 	}
@@ -1770,7 +1786,7 @@ func (h *CommandHandler) cmdRemoveUser(ctx context.Context, update contract.Upda
 
 	// Check if the user is an admin
 	userID := update.FromUser.ID
-	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	isAdmin, err := h.isAdmin(ctx, userID)
 	if err != nil {
 		return "", fmt.Errorf("check admin status: %w", err)
 	}
@@ -1812,7 +1828,7 @@ func (h *CommandHandler) cmdUsers(ctx context.Context, update contract.Update) (
 
 	// Check if the user is an admin
 	userID := update.FromUser.ID
-	isAdmin, err := h.db.IsUserAdmin(ctx, userID)
+	isAdmin, err := h.isAdmin(ctx, userID)
 	if err != nil {
 		return "", fmt.Errorf("check admin status: %w", err)
 	}
@@ -1888,7 +1904,8 @@ func (h *CommandHandler) cmdContext(ctx context.Context, update contract.Update,
 
 // cmdSnippet handles /snippet <name> <content> — saves a context snippet.
 // Usage: /snippet <name> <content> — create or update a snippet
-//         /snippet delete <name> — remove a snippet
+//
+//	/snippet delete <name> — remove a snippet
 func (h *CommandHandler) cmdSnippet(ctx context.Context, update contract.Update, group *Group, args string) (string, error) {
 	if group == nil {
 		return "This group is not registered. Use /cwd <path> to register it.", nil

@@ -52,7 +52,8 @@ type BridgeConfig struct {
 	ProxyURL string
 
 	// AllowedChatID restricts the bridge to a single Telegram chat/supergroup.
-	// Zero means all chats are accepted.
+	// Zero means all chats are accepted. The bridge enforces this boundary
+	// before routing updates to any handler.
 	AllowedChatID int64
 
 	// DBPath is the path to the SQLite database file.
@@ -86,8 +87,9 @@ type BridgeConfig struct {
 	CloseInactiveTopics bool
 
 	// AdminUserID is the Telegram user ID of the initial admin user.
-	// This user is automatically granted admin access on startup if not already in the database.
-	// Set to 0 to disable auto-admin bootstrapping.
+	// This user is automatically granted admin access on startup and remains
+	// authorized for privileged commands while the bridge is running.
+	// Set to 0 to disable bootstrap-admin authorization.
 	AdminUserID int64
 
 	// EventPublishingEnabled enables event publishing to the Unix socket for the dashboard.
@@ -322,6 +324,9 @@ func LoadBridgeConfig() (*BridgeConfig, error) {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("ADMIN_USER_ID must be an integer, got %q", v)
+		}
+		if n < 0 {
+			return nil, fmt.Errorf("ADMIN_USER_ID must be a non-negative integer, got %q", v)
 		}
 		cfg.AdminUserID = n
 	}

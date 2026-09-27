@@ -9,6 +9,13 @@ A bridge that connects a Telegram bot to [Claude Code](https://github.com/anthro
 > and run it under an OS account that cannot access unrelated repositories or
 > credentials.
 
+Authorization is enforced in the bridge before an update reaches a command,
+session, service, or callback handler. If `ALLOWED_CHAT_ID` is non-zero, the
+update's chat ID must match it exactly. The configured `ADMIN_USER_ID` is the
+bootstrap administrator and remains authorized in that chat; other users must
+be present in the database allowlist. Unauthorized users and chats are dropped
+silently so the bot does not disclose its configuration.
+
 ---
 
 ## How it works
@@ -210,13 +217,30 @@ Verified self-updates are persisted in the `update_history` table (migration v27
 
 | Command | Description |
 |---------|-------------|
-| `/cwd <path>` | Set group working directory (also registers the group) |
-| `/permission [mode]` | Set Claude permission mode |
-| `/config [setting] [value]` | View or set `permission_mode`, `allowed_tools`, or `disallowed_tools` |
+| `/cwd <path>` | Set group working directory (also registers the group); `/cwd` is readable by all allowed users |
+| `/permission [mode]` | Read the permission mode; changing it requires admin access |
+| `/config [setting] [value]` | Read configuration; changing `permission_mode`, tool restrictions, or limits requires admin access |
+| `/budget [amount]` | Read the budget; changing it requires admin access |
 | `/update [do]` | Check for or apply a self-update |
 | `/adduser <id> [role]` | Add an allowed user |
 | `/removeuser <id>` | Remove a user |
 | `/users` | List allowed users |
+| `/usage [user_id]` | Show per-user cost usage |
+
+### Authorization matrix
+
+| Actor | Chat gate | User gate | Capabilities |
+|-------|-----------|-----------|--------------|
+| Unknown Telegram user | Must match `ALLOWED_CHAT_ID` | Rejected | No response; update is silently dropped |
+| Allowed user (`role=user`) | Must match `ALLOWED_CHAT_ID` | `allowed_users` row | Messages, sessions, topic controls, user commands, and read-only forms of `/cwd`, `/permission`, `/config`, and `/budget` |
+| Database admin (`role=admin`) | Must match `ALLOWED_CHAT_ID` | `allowed_users` row | Everything an allowed user can do, plus admin-only writes and `/update`, `/adduser`, `/removeuser`, `/users`, and `/usage` |
+| `ADMIN_USER_ID` | Must match `ALLOWED_CHAT_ID` | Environment-configured bootstrap identity | All administrator capabilities; it is re-established as an admin on startup |
+
+`ADMIN_USER_ID` and database administrator status are checked for every
+privileged command. In particular, an allowed non-admin user cannot change the
+group permission mode through either `/permission <mode>` or
+`/config permission_mode <mode>`. The documented `bypassPermissions` default
+therefore remains unchanged unless an administrator explicitly changes it.
 
 Rate limiting: 30 messages per minute per user.
 

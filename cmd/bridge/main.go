@@ -96,6 +96,7 @@ func main() {
 	defer events.StopPublisher(eventPublisher)
 
 	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL, upd, eventPublisher, Version, CommitSHA, BuildDate)
+	cmdHandler.SetAdminUserID(cfg.AdminUserID)
 	sessionMgr := bridge.NewSessionManager(db, sender, cfg.ProxyURL, eventPublisher, cfg.GlobalMaxWorkers)
 	defer sessionMgr.Shutdown()
 	cmdHandler.SetSessionManager(sessionMgr)
@@ -126,7 +127,8 @@ func main() {
 	// Wire event publisher to health checker for health status events
 	checker.SetEventPublisher(eventPublisher)
 
-	router := bridge.NewRouter(db, eventPublisher)
+	router := bridge.NewRouter(db, eventPublisher, cfg.AllowedChatID)
+	router.SetAdminUserID(cfg.AdminUserID)
 	router.OnCommand = cmdHandler.Handle
 	router.OnSession = sessionMgr.Handle
 	router.OnService = serviceHandler.Handle

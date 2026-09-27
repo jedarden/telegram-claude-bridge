@@ -723,6 +723,19 @@ func TestLoadBridgeConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("negative ADMIN_USER_ID", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		os.Setenv("PROXY_URL", "http://localhost:8080")
+		os.Setenv("ADMIN_USER_ID", "-1")
+
+		_, err := LoadBridgeConfig()
+		if err == nil {
+			t.Error("LoadBridgeConfig() expected error for negative ADMIN_USER_ID")
+		}
+	})
+
 	t.Run("EVENT_PUBLISHING_ENABLED true values", func(t *testing.T) {
 		saved := saveEnv()
 		defer restoreEnv(saved)
