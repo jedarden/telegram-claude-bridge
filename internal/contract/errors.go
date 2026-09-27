@@ -4,10 +4,11 @@ import "fmt"
 
 // ErrorResponse is the JSON error body returned by all endpoints on failure.
 type ErrorResponse struct {
-	OK          bool   `json:"ok"`           // always false
+	OK          bool   `json:"ok"` // always false
 	ErrorCode   int    `json:"error_code"`
 	Description string `json:"description"`
 	RetryAfter  *int   `json:"retry_after,omitempty"` // set on 429
+	HTTPStatus  int    `json:"-"`                     // HTTP status used by the bridge retry policy
 }
 
 func (e *ErrorResponse) Error() string {

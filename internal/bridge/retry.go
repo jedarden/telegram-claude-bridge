@@ -22,7 +22,14 @@ func isTransientProxyStatus(status int) bool {
 
 func isTransientProxyError(err error) bool {
 	var apiErr *contract.ErrorResponse
-	return errors.As(err, &apiErr) && isTransientProxyStatus(apiErr.ErrorCode)
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	status := apiErr.HTTPStatus
+	if status == 0 {
+		status = apiErr.ErrorCode
+	}
+	return isTransientProxyStatus(status)
 }
 
 // waitForRetryDelay sleeps without making cancellation wait for the full

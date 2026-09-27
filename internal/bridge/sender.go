@@ -1092,6 +1092,7 @@ func (s *Sender) postJSON(ctx context.Context, path string, body, out any) error
 	if resp.StatusCode != http.StatusOK {
 		var errResp contract.ErrorResponse
 		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		errResp.HTTPStatus = resp.StatusCode
 		if errResp.ErrorCode == 0 {
 			errResp.ErrorCode = resp.StatusCode
 		}
