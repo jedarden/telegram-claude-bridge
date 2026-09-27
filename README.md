@@ -34,7 +34,7 @@ silently so the bot does not disclose its configuration.
 
 The system is split into two processes:
 
-**Proxy** — A lightweight container that holds the Telegram bot token, long-polls the Telegram `getUpdates` endpoint, and exposes an internal HTTP API (`/updates`, `/send`, `/edit`, etc.) for the bridge to consume. It holds no session state. Its persisted state is the Telegram polling offset and the retained update buffer, stored in a JSON file (`OFFSET_FILE_PATH`, default `/data/offset.json`).
+**Proxy** — A lightweight container that holds the Telegram bot token, long-polls the Telegram `getUpdates` endpoint, and exposes an internal HTTP API (`/updates`, `/send`, `/edit`, media, file-download, and topic-management endpoints) for the bridge to consume. It holds no session state. Its persisted state is the Telegram polling offset and the retained update buffer, stored in a JSON file (`OFFSET_FILE_PATH`, default `/data/offset.json`). The complete request/response schemas, content types, thread routing, error mapping, retry policy, and limits are in the [Proxy ↔ Bridge data contract](docs/plan/data-contract.md).
 
 #### Update delivery and acknowledgement
 

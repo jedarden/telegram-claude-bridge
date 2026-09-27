@@ -1,14 +1,16 @@
 # Proxy ↔ Bridge Data Contract
 
 Version: 1.0  
-Date: 2026-04-03
+Reviewed: 2026-09-27
 
 ## Transport
 
 - **Protocol:** HTTP/1.1 over Tailscale
 - **Base URL:** `http://telegram-proxy:8080` (Tailscale hostname)
-- **Content-Type:** `application/json` for all JSON endpoints
-- **Media uploads:** `multipart/form-data`
+- **JSON requests:** `application/json` for `/send`, `/edit`, and topic-management requests
+- **JSON responses:** `application/json` for every successful JSON endpoint and every proxy-generated JSON error
+- **Media uploads:** `multipart/form-data` with a boundary; the file is one named part and metadata is made up of text parts
+- **File downloads:** `GET /file/{file_id}` returns raw bytes on success, not JSON
 - **Auth:** None — Tailscale ACLs restrict access to the EX44 node only
 - **Encoding:** UTF-8
 
@@ -22,7 +24,23 @@ Date: 2026-04-03
 - Empty optional fields are omitted (not sent as `null`)
 - The proxy normalizes Telegram updates into the typed v1 envelope below; it does not expose raw Telegram field names to the bridge
 
-## Error Response (all endpoints)
+### Thread routing
+
+`thread_id` is the bridge-facing name for Telegram's
+`message_thread_id`. For `/send`, `/send_chat_action`, and the media upload
+endpoints, the proxy forwards it to Telegram to route the message into that
+forum topic. Omit it for the General topic; named topics must carry their
+positive thread ID. The proxy does not infer a topic from `chat_id`, and it
+does not validate or rewrite outbound `thread_id` values. The raw Telegram
+General ID (`1`) may be forwarded by older clients, but new clients should
+use omission to match the canonical v1 envelope.
+
+`/edit` identifies the target by `chat_id` and `message_id`; it has no
+`thread_id` field. Topic-management endpoints use `thread_id` to identify an
+existing topic in the supplied chat. The `reply_to_message_id` field is
+forwarded unchanged and should refer to a message in the same chat/topic.
+
+## Error behavior
 
 ```json
 {
@@ -32,13 +50,30 @@ Date: 2026-04-03
 }
 ```
 
-`error_code` mirrors the Telegram API error code when the error originates from Telegram. Proxy-internal errors use:
+For errors produced by a JSON or multipart handler, the body is an
+`ErrorResponse` with `ok: false`, `error_code`, and `description`. Telegram
+errors preserve Telegram's `error_code`, `description`, and (for 429)
+`retry_after`, but the HTTP status is mapped by the proxy. In particular,
+Telegram 400/401/403/409 responses are returned as HTTP 502 with their
+original error code in the JSON body; do not use the HTTP status alone to
+identify the Telegram error.
 
-| Code | Meaning |
+The common HTTP mappings are:
+
+| HTTP status / `error_code` | Meaning |
 |---|---|
-| 502 | Telegram API unreachable |
+| 400 | Malformed JSON or multipart form, missing/invalid media `chat_id`, or missing file part |
+| 404 | File ID/path is unavailable or expired (file endpoint only) |
+| 413 | Media upload or file download exceeds the proxy limit |
+| 429 | Telegram rate limit; `retry_after` is seconds when Telegram supplies it |
+| 502 | Telegram API unreachable, invalid upstream response, or a Telegram error such as 400/401/403/409 (the body keeps Telegram's original `error_code`) |
 | 503 | Proxy not connected to Telegram (polling not started) |
 | 504 | Telegram API timeout |
+
+HTTP 405 method errors are emitted by `net/http` as a plain-text response;
+they are not `ErrorResponse` JSON. A missing route also uses the standard
+`net/http` response. JSON/multipart validation errors and all mapped Telegram
+errors use the JSON shape above.
 
 ---
 
@@ -396,6 +431,11 @@ When `type` is `service`, `content` is omitted and the `service` field is popula
 
 Download a file that was referenced in an update's `file_id` field.
 
+The proxy first calls Telegram `getFile`, then streams the resolved file path
+from Telegram's file CDN. It does not cache the bytes or expose the bot token
+to the bridge. The request has no body and does not require a
+`Content-Type` header.
+
 **Path parameters:**
 
 | Param | Type | Description |
@@ -404,8 +444,8 @@ Download a file that was referenced in an update's `file_id` field.
 
 **Response 200:**
 - `Content-Type`: the file's MIME type (e.g., `image/jpeg`, `audio/ogg`, `application/pdf`)
-- `Content-Length`: file size in bytes
-- `Content-Disposition`: `attachment; filename="<original_filename>"` (if available)
+- `Content-Length`: copied when the CDN supplies it
+- `Content-Disposition`: `attachment; filename="<basename of Telegram's file_path>"`
 - Body: raw file bytes
 
 **Response 404:**
@@ -413,7 +453,7 @@ Download a file that was referenced in an update's `file_id` field.
 {
   "ok": false,
   "error_code": 404,
-  "description": "File not found or expired"
+  "description": "file not found or expired"
 }
 ```
 
@@ -422,11 +462,15 @@ Download a file that was referenced in an update's `file_id` field.
 {
   "ok": false,
   "error_code": 413,
-  "description": "File exceeds 20MB download limit"
+  "description": "file exceeds 20MB limit"
 }
 ```
 
-Note: Telegram file links expire after ~1 hour. The proxy fetches from Telegram on each request — it does not cache files. The bridge should download files promptly after receiving the update.
+The proxy returns 404 when Telegram rejects the file ID, does not return a
+`file_path`, or the CDN returns 404. A Telegram-reported file size over 20 MiB
+is rejected before the CDN request with 413. Telegram file links expire after
+about one hour, so the bridge should download files promptly after receiving
+the update. The proxy does not retry `getFile` or the CDN request.
 
 ---
 
@@ -441,10 +485,13 @@ Send a text message.
   "thread_id": 42,
   "text": "Here is the refactored code...",
   "parse_mode": "HTML",
-  "reply_to_message_id": 1001,
-  "reply_markup": null
+  "reply_to_message_id": 1001
 }
 ```
+
+Send the request with `Content-Type: application/json`. Optional fields that
+are not used should be omitted; `null` is accepted by Go's JSON decoder for
+pointer fields but is not forwarded to Telegram.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -463,7 +510,8 @@ Send a text message.
 }
 ```
 
-The proxy returns the `message_id` of the sent message. The bridge stores this for subsequent edits.
+The response has `Content-Type: application/json` and contains the
+`message_id` of the sent message. The bridge stores this for subsequent edits.
 
 ---
 
@@ -477,10 +525,12 @@ Edit an existing text message. Used for progressive streaming.
   "chat_id": -1001234567890,
   "message_id": 2001,
   "text": "Updated response content...",
-  "parse_mode": "HTML",
-  "reply_markup": null
+  "parse_mode": "HTML"
 }
 ```
+
+Send the request with `Content-Type: application/json`. `/edit` routes by
+`chat_id` and `message_id`; it does not accept `thread_id`.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -488,7 +538,7 @@ Edit an existing text message. Used for progressive streaming.
 | `message_id` | integer | yes | Message to edit |
 | `text` | string | yes | New text (1–4096 chars) |
 | `parse_mode` | string | no | `"HTML"` or `"MarkdownV2"` |
-| `reply_markup` | object | no | Updated inline keyboard, or `null` to remove |
+| `reply_markup` | object | no | Inline keyboard; omit to leave the existing markup unchanged, or send an empty keyboard to remove it |
 
 **Response 200:**
 ```json
@@ -498,7 +548,7 @@ Edit an existing text message. Used for progressive streaming.
 }
 ```
 
-**Response 400 (text unchanged):**
+**Telegram no-op (text unchanged):**
 ```json
 {
   "ok": false,
@@ -507,7 +557,9 @@ Edit an existing text message. Used for progressive streaming.
 }
 ```
 
-The bridge should treat this as a no-op, not an error.
+Because this is a Telegram-originated 400, the proxy sends the body above with
+HTTP 502. Consumers should inspect `error_code` and `description` and treat
+this specific response as a no-op. Other Telegram 400 errors are failures.
 
 ---
 
@@ -515,13 +567,18 @@ The bridge should treat this as a no-op, not an error.
 
 Send a photo.
 
-**Request:** `multipart/form-data`
+**Request:** `multipart/form-data; boundary=...`
+
+The metadata fields are ordinary text parts; integer values use their decimal
+string representation. The required file part is named `photo` and its
+multipart filename is forwarded to Telegram. The proxy does not inspect the
+file MIME type; Telegram performs media validation.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `chat_id` | integer | yes | Target chat |
 | `thread_id` | integer | no | Target forum topic |
-| `photo` | file | yes | Image file (JPEG/PNG, max 10MB) |
+| `photo` | file | yes | Image file, max 10 MiB |
 | `caption` | string | no | Caption (0–1024 chars) |
 | `parse_mode` | string | no | Parse mode for caption |
 | `reply_to_message_id` | integer | no | Message to reply to |
@@ -534,19 +591,27 @@ Send a photo.
 }
 ```
 
+The response is `application/json` and uses the common `SendResponse` schema.
+Validation failures are JSON `400`/`413` responses; Telegram failures use the
+error mapping in [Error behavior](#error-behavior).
+
 ---
 
 ### POST /send_document
 
 Send a file/document.
 
-**Request:** `multipart/form-data`
+**Request:** `multipart/form-data; boundary=...`
+
+The required file part is named `document`. Its multipart filename is used by
+default; the optional `file_name` text field overrides that filename before
+the proxy calls Telegram.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `chat_id` | integer | yes | Target chat |
 | `thread_id` | integer | no | Target forum topic |
-| `document` | file | yes | File to send (max 50MB) |
+| `document` | file | yes | File to send, max 50 MiB |
 | `caption` | string | no | Caption (0–1024 chars) |
 | `parse_mode` | string | no | Parse mode for caption |
 | `reply_to_message_id` | integer | no | Message to reply to |
@@ -560,19 +625,24 @@ Send a file/document.
 }
 ```
 
+The response is `application/json` and uses the common `SendResponse` schema.
+
 ---
 
 ### POST /send_audio
 
 Send an audio file.
 
-**Request:** `multipart/form-data`
+**Request:** `multipart/form-data; boundary=...`
+
+The required file part is named `audio`; its multipart filename is forwarded
+to Telegram.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `chat_id` | integer | yes | Target chat |
 | `thread_id` | integer | no | Target forum topic |
-| `audio` | file | yes | Audio file (max 50MB) |
+| `audio` | file | yes | Audio file, max 50 MiB |
 | `caption` | string | no | Caption |
 | `parse_mode` | string | no | Parse mode for caption |
 | `duration` | integer | no | Duration in seconds |
@@ -587,19 +657,24 @@ Send an audio file.
 }
 ```
 
+The response is `application/json` and uses the common `SendResponse` schema.
+
 ---
 
 ### POST /send_video
 
 Send a video file.
 
-**Request:** `multipart/form-data`
+**Request:** `multipart/form-data; boundary=...`
+
+The required file part is named `video`; its multipart filename is forwarded
+to Telegram.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `chat_id` | integer | yes | Target chat |
 | `thread_id` | integer | no | Target forum topic |
-| `video` | file | yes | Video file (max 50MB) |
+| `video` | file | yes | Video file, max 50 MiB |
 | `caption` | string | no | Caption |
 | `parse_mode` | string | no | Parse mode for caption |
 | `duration` | integer | no | Duration in seconds |
@@ -615,6 +690,16 @@ Send a video file.
 }
 ```
 
+The response is `application/json` and uses the common `SendResponse` schema.
+
+For all four media endpoints, the proxy limits the entire multipart request
+to the file limit plus a small 4096-byte allowance for form fields. Multipart
+parsing keeps up to 32 MiB in memory and may spool the remainder to temporary
+storage. A missing file, malformed form, or invalid/missing `chat_id` returns
+HTTP 400; an oversized request returns HTTP 413. Malformed optional integer
+fields are treated as absent by the current handler, so clients should send
+valid decimal values rather than rely on that behavior.
+
 ---
 
 ### POST /send_chat_action
@@ -629,6 +714,9 @@ Send a typing indicator. Telegram shows it for 5 seconds. The bridge should re-s
   "action": "typing"
 }
 ```
+
+Send the request with `Content-Type: application/json`. The action is routed
+to `thread_id` when present; omit it for General.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -657,6 +745,10 @@ Create a new forum topic in a supergroup.
   "icon_color": 7322096
 }
 ```
+
+Send the request with `Content-Type: application/json`. The proxy forwards
+`chat_id`, `name`, and the optional `icon_color` to Telegram's
+`createForumTopic` method.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -708,7 +800,8 @@ Edit a forum topic's name or icon.
 | `name` | string | no | New name (1–128 chars) |
 | `icon_color` | integer | no | New icon color |
 
-At least one of `name` or `icon_color` must be provided.
+Telegram requires at least one of `name` or `icon_color`; the proxy forwards
+the request and lets Telegram return the validation error if both are absent.
 
 **Response 200:**
 ```json
@@ -731,6 +824,9 @@ Close a forum topic (makes it read-only).
 }
 ```
 
+Send the request with `Content-Type: application/json`. `thread_id` is the
+topic to close in `chat_id`.
+
 **Response 200:**
 ```json
 {
@@ -747,11 +843,15 @@ Reopen a previously closed forum topic.
 **Request body:**
 ```json
 {
-  "ok": true
+  "chat_id": -1001234567890,
+  "thread_id": 43
 }
 ```
 
 Same request/response schema as `/close_topic`.
+
+The response is `application/json`; `thread_id` is the topic to reopen in
+`chat_id`.
 
 ---
 
@@ -835,9 +935,32 @@ Used in `reply_markup` field of `/send` and `/edit`.
 
 ---
 
-## Rate Limiting
+## Retries and rate limits
 
-The proxy enforces Telegram's rate limits and returns 429 with retry information:
+The proxy makes one Telegram request per API call. It does not perform a
+retry or deduplicate an outbound request. A successful Telegram side effect
+followed by a lost response can therefore be repeated by a caller; clients
+should account for possible duplicate sends when retrying `/send`, media, or
+topic creation.
+
+The bridge's JSON sender applies the following retry policy to `/send`,
+`/edit`, `/create_topic`, `/edit_topic`, `/close_topic`, `/reopen_topic`, and
+`/pin_message`:
+
+- transport failures and proxy HTTP 502/503/504 responses are retried up to
+  five times after the initial attempt;
+- exponential delays are 1, 2, 4, 8, and 16 seconds (capped at 30 seconds);
+- HTTP 429 waits for `retry_after` seconds when present, or one second when it
+  is absent, and that wait does not consume one of the five retry attempts;
+- other JSON API errors are returned immediately.
+
+`/send_chat_action`, all four media upload endpoints, and `GET /file/{file_id}`
+are single-attempt operations in the current bridge client. A caller that
+chooses to retry a media upload or topic creation should expect duplicates if
+the first request reached Telegram before the failure was observed. File IDs
+can also expire while a retry is pending.
+
+Telegram supplies the authoritative rate-limit response:
 
 ```json
 {
@@ -848,14 +971,34 @@ The proxy enforces Telegram's rate limits and returns 429 with retry information
 }
 ```
 
-The bridge must respect `retry_after` and not retry before that interval.
+The bridge must respect `retry_after` and not retry before that interval. The
+proxy has no local message/request throttle, so callers should debounce
+progressive `/edit` calls and queue sends where needed rather than relying on
+the proxy to enforce a fixed Telegram quota.
 
-Telegram rate limits:
-- 1 message/second per chat (private)
-- 20 messages/minute per group
-- ~30 requests/second global across all chats
+## Limits
 
-The bridge is responsible for debouncing edit calls (max 1/second) and queuing sends per chat.
+The proxy forwards JSON values to Telegram and does not locally validate most
+Telegram field limits; the following limits are the values callers should
+observe, and violations normally come back as a Telegram error mapped to HTTP
+502:
+
+| Value | Limit |
+|---|---|
+| `/send` and `/edit` `text` | 1–4096 characters |
+| Media `caption` | 0–1024 characters |
+| Forum topic `name` | 1–128 characters |
+| Inline-button `callback_data` | 1–64 bytes |
+| `/answer_callback` `text` | 0–200 characters |
+| `/send_photo` file | 10 MiB; the proxy rejects an oversized multipart request with 413 |
+| `/send_document`, `/send_audio`, `/send_video` file | 50 MiB; the proxy rejects an oversized multipart request with 413 |
+| `GET /file/{file_id}` | 20 MiB according to Telegram's reported `file_size`; the proxy rejects it with 413 |
+| Retained unacknowledged updates | 10,000 by default; oldest entries are dropped on overflow |
+
+The multipart request limit is the media limit plus a 4096-byte allowance for
+form fields. Up to 32 MiB is used for multipart parsing in memory; larger
+requests may use temporary storage. The bridge chunks longer Claude output
+before `/send` and uploads an oversized code block as a document.
 
 ---
 
