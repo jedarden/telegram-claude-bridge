@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,6 +82,7 @@ type CommandHandler struct {
 	bridgeSHA           string
 	buildDate           string
 	authorizer          *Authorizer
+	workingDirPolicy    *WorkingDirectoryPolicy
 
 	// closeWG tracks in-flight asynchronous close/summary goroutines
 	// started by cmdClose.
@@ -123,6 +124,10 @@ func NewCommandHandler(db *DB, sender *Sender, proxyURL string, updater UpdaterI
 		buildDate:      buildDate,
 		authorizer:     NewAuthorizer(db, 0, 0),
 	}
+	// The main bridge replaces this validation-only policy with the explicit
+	// configured workspace allowlist before it accepts updates.
+	workingDirPolicy, _ := NewWorkingDirectoryPolicy()
+	h.workingDirPolicy = workingDirPolicy
 	h.summarizeSession = h.generateSessionSummary
 	return h
 }
@@ -163,6 +168,16 @@ func (h *CommandHandler) SetAdminUserID(userID int64) {
 func (h *CommandHandler) SetAuthorizer(authorizer *Authorizer) {
 	if authorizer != nil {
 		h.authorizer = authorizer
+	}
+}
+
+// SetWorkingDirectoryPolicy installs the policy used when /cwd changes a
+// group's project. The same policy is injected into all process launchers by
+// main, so a path cannot be admitted by the command handler and bypassed by a
+// later spawn path.
+func (h *CommandHandler) SetWorkingDirectoryPolicy(policy *WorkingDirectoryPolicy) {
+	if policy != nil {
+		h.workingDirPolicy = policy
 	}
 }
 
@@ -289,12 +304,15 @@ func (h *CommandHandler) cmdCWD(ctx context.Context, update contract.Update, gro
 		return "Permission denied. Only admins can set the working directory.", nil
 	}
 
-	// Validate that the path exists on the local filesystem.
-	if _, err := os.Stat(args); err != nil {
-		if os.IsNotExist(err) {
+	// Validate and canonicalize the path before it is persisted. This rejects
+	// traversal and sensitive paths and ensures later spawns do not follow a
+	// symlink that points outside the configured workspace roots.
+	resolvedCWD, err := h.workingDirPolicy.Resolve(args)
+	if err != nil {
+		if errors.Is(err, ErrWorkingDirectoryDoesNotExist) {
 			return fmt.Sprintf("Path does not exist: %s", args), nil
 		}
-		return "", fmt.Errorf("stat %q: %w", args, err)
+		return "", fmt.Errorf("working directory policy: %w", err)
 	}
 
 	var saveGroup *Group
@@ -303,12 +321,12 @@ func (h *CommandHandler) cmdCWD(ctx context.Context, update contract.Update, gro
 		// setting survives. A hand-copied field list here previously reset
 		// progress_interval_sec, max_subtasks, max_workers, dispatcher_mode,
 		// and the tool restrictions to zero values on every /cwd call.
-		group.CWD = args
+		group.CWD = resolvedCWD
 		saveGroup = group
 	} else {
 		saveGroup = &Group{
 			ChatID:         update.ChatID,
-			CWD:            args,
+			CWD:            resolvedCWD,
 			DefaultModel:   "claude-sonnet-4-6",
 			MaxBudget:      5.0,
 			TimeoutSec:     300,
@@ -328,7 +346,7 @@ func (h *CommandHandler) cmdCWD(ctx context.Context, update contract.Update, gro
 	if err := h.db.UpsertGroup(ctx, saveGroup); err != nil {
 		return "", fmt.Errorf("save group: %w", err)
 	}
-	return fmt.Sprintf("Working directory set to: %s", args), nil
+	return fmt.Sprintf("Working directory set to: %s", resolvedCWD), nil
 }
 
 // cmdPermission handles /permission [mode].

@@ -91,6 +91,14 @@ func (wp *WorkerPool) SpawnWorker(
 	if input.Prompt == "" {
 		return "", 0, fmt.Errorf("spawn_worker requires a non-empty prompt")
 	}
+	if group == nil {
+		return "", 0, fmt.Errorf("spawn_worker requires a group")
+	}
+	if wp.sessionMgr != nil {
+		if _, err := wp.sessionMgr.ResolveWorkingDirectory(group.CWD); err != nil {
+			return "", 0, fmt.Errorf("working directory policy: %w", err)
+		}
+	}
 
 	// Check concurrency limit
 	running, err := wp.db.CountRunningWorkers(ctx, chatID, threadID)

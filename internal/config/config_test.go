@@ -52,8 +52,19 @@ func TestLoadProxyConfig(t *testing.T) {
 	}
 
 	restoreEnv := func(saved map[string]string) {
-		for k, v := range saved {
-			os.Setenv(k, v)
+		for _, key := range []string{
+			"PROXY_URL", "BRIDGE_DB_PATH", "ALLOWED_CHAT_ID", "POLL_TIMEOUT",
+			"UPDATE_INTERVAL_MINUTES", "REPO_PATH", "BINARY_PATH", "WORKSPACE_ROOTS",
+			"ALLOWED_WORKSPACE_ROOTS", "SESSION_CLEANUP_INTERVAL_MINUTES", "SESSION_TTL_HOURS",
+			"CLOSE_INACTIVE_TOPICS", "ADMIN_USER_ID", "EVENT_PUBLISHING_ENABLED",
+			"EVENT_SOCKET_PATH", "MAX_GLOBAL_WORKERS", "GLOBAL_MAX_WORKERS", "ADMIN_CHAT_ID",
+			"CANARY_ENABLED", "CANARY_INTERVAL_MINUTES",
+		} {
+			if value, ok := saved[key]; ok {
+				os.Setenv(key, value)
+			} else {
+				os.Unsetenv(key)
+			}
 		}
 	}
 
@@ -381,7 +392,8 @@ func TestLoadBridgeConfig(t *testing.T) {
 		envs := []string{
 			"PROXY_URL", "BRIDGE_DB_PATH", "ALLOWED_CHAT_ID",
 			"POLL_TIMEOUT", "UPDATE_INTERVAL_MINUTES", "REPO_PATH",
-			"BINARY_PATH", "SESSION_CLEANUP_INTERVAL_MINUTES",
+			"BINARY_PATH", "WORKSPACE_ROOTS", "ALLOWED_WORKSPACE_ROOTS",
+			"SESSION_CLEANUP_INTERVAL_MINUTES",
 			"SESSION_TTL_HOURS", "CLOSE_INACTIVE_TOPICS",
 			"ADMIN_USER_ID", "EVENT_PUBLISHING_ENABLED",
 			"EVENT_SOCKET_PATH", "MAX_GLOBAL_WORKERS", "GLOBAL_MAX_WORKERS",
@@ -492,6 +504,24 @@ func TestLoadBridgeConfig(t *testing.T) {
 		}
 		if cfg.EventSocketPath != "/custom/events.sock" {
 			t.Errorf("EventSocketPath = %v, want %v", cfg.EventSocketPath, "/custom/events.sock")
+		}
+	})
+
+	t.Run("explicit workspace roots", func(t *testing.T) {
+		saved := saveEnv()
+		defer restoreEnv(saved)
+
+		os.Setenv("PROXY_URL", "http://proxy:9090")
+		os.Setenv("REPO_PATH", "/srv/bridge-deploy")
+		os.Setenv("WORKSPACE_ROOTS", "/srv/project-a"+string(os.PathListSeparator)+"/srv/project-b")
+		os.Unsetenv("ALLOWED_WORKSPACE_ROOTS")
+
+		cfg, err := LoadBridgeConfig()
+		if err != nil {
+			t.Fatalf("LoadBridgeConfig() error = %v", err)
+		}
+		if len(cfg.WorkspaceRoots) != 2 || cfg.WorkspaceRoots[0] != "/srv/project-a" || cfg.WorkspaceRoots[1] != "/srv/project-b" {
+			t.Errorf("WorkspaceRoots = %#v, want explicit two-root allowlist", cfg.WorkspaceRoots)
 		}
 	})
 

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -73,6 +74,12 @@ type BridgeConfig struct {
 	// BinaryPath is the path to the bridge binary (relative to RepoPath).
 	// If empty, defaults to "bridge".
 	BinaryPath string
+
+	// WorkspaceRoots is the explicit allowlist of directories that may be
+	// selected by /cwd and passed to Claude or worker processes. When the
+	// WORKSPACE_ROOTS environment variable is unset, the deployment repository
+	// (RepoPath) is the safe default.
+	WorkspaceRoots []string
 
 	// SessionCleanupInterval is how often to run session cleanup (default: 1 hour).
 	// Set to 0 to disable session cleanup.
@@ -278,6 +285,25 @@ func LoadBridgeConfig() (*BridgeConfig, error) {
 		if exe, err := os.Executable(); err == nil {
 			cfg.RepoPath = filepath.Dir(exe)
 		}
+	}
+
+	// WORKSPACE_ROOTS is an OS path-list separated explicit allowlist. Keep an
+	// alias for operators that prefer the security-oriented name, but always
+	// default to the deployment repository rather than a broad home directory.
+	workspaceRoots := os.Getenv("WORKSPACE_ROOTS")
+	if workspaceRoots == "" {
+		workspaceRoots = os.Getenv("ALLOWED_WORKSPACE_ROOTS")
+	}
+	if workspaceRoots != "" {
+		for _, rawRoot := range strings.Split(workspaceRoots, string(os.PathListSeparator)) {
+			root := strings.TrimSpace(rawRoot)
+			if root == "" {
+				return nil, fmt.Errorf("WORKSPACE_ROOTS contains an empty root")
+			}
+			cfg.WorkspaceRoots = append(cfg.WorkspaceRoots, root)
+		}
+	} else if cfg.RepoPath != "" {
+		cfg.WorkspaceRoots = []string{cfg.RepoPath}
 	}
 
 	cfg.BinaryPath = envOrDefault("BINARY_PATH", "bridge")

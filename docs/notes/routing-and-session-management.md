@@ -16,7 +16,7 @@ The bridge maintains a mapping from Telegram's hierarchy to Claude Code sessions
 
 | Telegram concept | Maps to | Managed by |
 |---|---|---|
-| `group_id` | `--cwd` (project directory) | Bridge routing table |
+| `group_id` | `--cwd` (project directory) | Bridge routing table, constrained by the `WORKSPACE_ROOTS` allowlist |
 | `topic_id` / `message_thread_id` | `--resume` session ID | Bridge routing table |
 | General topic (id=1) | Control plane (bot commands) | Bridge command handler |
 | Non-General topics | Individual Claude Code conversations | Bridge session manager |
@@ -93,7 +93,7 @@ Commands sent in the General topic of any group:
 | Command | Effect |
 |---|---|
 | `/status` | List active sessions in this group |
-| `/cwd [path]` | View or change the default working directory for this group |
+| `/cwd [path]` | View or change the default working directory for this group. Setting it requires an existing directory below `WORKSPACE_ROOTS`; traversal, symlink escapes, and sensitive credential/configuration paths are rejected. |
 | `/sessions` | List all sessions across all groups |
 | `/close` | Close the Claude session for a specific topic |
 

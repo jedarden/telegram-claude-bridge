@@ -14,7 +14,10 @@ bridge logs a warning when `ALLOWED_CHAT_ID=0`, and `ADMIN_USER_ID=0` disables
 the environment bootstrap administrator. With no bootstrap ID, only users
 already recorded with `role=admin` can perform administrator actions; an
 operator must seed that row out of band before `/cwd <path>` can register the
-first group. The `bypassPermissions` default remains in effect until an
+first group. `/cwd` is limited to the configured `WORKSPACE_ROOTS` allowlist;
+paths are canonicalized before storage, and traversal, symlink escapes, and
+credential/configuration directories are rejected. The `bypassPermissions`
+default remains in effect until an
 administrator changes it, so a non-admin cannot weaken or replace the default
 through a command.
 
@@ -152,6 +155,7 @@ The proxy runs as a Docker container and has no host-level dependencies beyond a
 | `PROXY_URL` | — | **Required.** Base URL of the proxy (e.g. `http://localhost:8080`) |
 | `BRIDGE_DB_PATH` | `bridge.db` | SQLite DB path |
 | `ALLOWED_CHAT_ID` | `0` (all) | Restrict to a single Telegram chat ID |
+| `WORKSPACE_ROOTS` | `REPO_PATH` | OS path-list of canonical workspace roots allowed by `/cwd`; unset defaults to the deployment repository |
 | `POLL_TIMEOUT` | `30` | Long-poll timeout (seconds) |
 | `SESSION_CLEANUP_INTERVAL_MINUTES` | `60` | Stale session cleanup interval (`0` = disabled) |
 | `SESSION_TTL_HOURS` | `168` (7 days) | Age at which a session is considered stale |
@@ -226,7 +230,7 @@ Verified self-updates are persisted in the `update_history` table (migration v27
 
 | Command | Description |
 |---------|-------------|
-| `/cwd <path>` | Set group working directory (also registers the group); `/cwd` is readable by all allowed users |
+| `/cwd <path>` | Set group working directory (also registers the group); the path must be an existing directory below `WORKSPACE_ROOTS` |
 | `/permission [mode]` | Read the permission mode; changing it requires admin access |
 | `/config [setting] [value]` | Read configuration; changing `permission_mode`, tool restrictions, or limits requires admin access |
 | `/model [name]`, `/haiku`, `/sonnet`, `/opus` | Read the current model; changing the topic model requires admin access |

@@ -42,6 +42,9 @@ func NewSubtaskOrchestrator(db *DB, sender *Sender, sessionMgr *SessionManager) 
 // Run executes N parallel subtasks and posts results as they complete.
 // Returns an error if setup fails, otherwise runs asynchronously.
 func (o *SubtaskOrchestrator) Run(ctx context.Context, req SubtaskRequest) error {
+	if req.Group == nil {
+		return fmt.Errorf("group is required")
+	}
 	if len(req.Prompts) == 0 {
 		return fmt.Errorf("no prompts provided")
 	}
@@ -56,6 +59,11 @@ func (o *SubtaskOrchestrator) Run(ctx context.Context, req SubtaskRequest) error
 	}
 	if len(req.Prompts) > maxConcurrent {
 		return fmt.Errorf("too many prompts: group max_subtasks is %d", maxConcurrent)
+	}
+	if o.sessionMgr != nil {
+		if _, err := o.sessionMgr.ResolveWorkingDirectory(req.Group.CWD); err != nil {
+			return fmt.Errorf("working directory policy: %w", err)
+		}
 	}
 
 	// Generate subtask IDs and insert into database

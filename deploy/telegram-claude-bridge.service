@@ -18,6 +18,7 @@ Environment=PATH=/home/coding/.local/bin:/home/coding/local/go/bin:/usr/bin:/bin
 Environment=HOME=/home/coding
 Environment=REPO_PATH=/home/coding/.telegram-claude-bridge-deploy
 Environment=BINARY_PATH=bin/bridge
+Environment=WORKSPACE_ROOTS=/home/coding/.telegram-claude-bridge-deploy
 Environment=PROXY_URL=http://telegram-proxy:8080
 Environment=UPDATE_INTERVAL_MINUTES=5
 Environment=ADMIN_CHAT_ID=0

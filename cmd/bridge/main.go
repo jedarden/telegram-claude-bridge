@@ -33,6 +33,11 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
+	workingDirPolicy, err := bridge.NewWorkingDirectoryPolicy(cfg.WorkspaceRoots...)
+	if err != nil {
+		log.Fatalf("working-directory policy: %v", err)
+	}
+
 	db, err := bridge.OpenDB(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("open db: %v", err)
@@ -105,7 +110,8 @@ func main() {
 
 	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL, upd, eventPublisher, Version, CommitSHA, BuildDate)
 	cmdHandler.SetAuthorizer(authorizer)
-	sessionMgr := bridge.NewSessionManager(db, sender, cfg.ProxyURL, eventPublisher, cfg.GlobalMaxWorkers)
+	cmdHandler.SetWorkingDirectoryPolicy(workingDirPolicy)
+	sessionMgr := bridge.NewSessionManager(db, sender, cfg.ProxyURL, eventPublisher, cfg.GlobalMaxWorkers, workingDirPolicy)
 	defer sessionMgr.Shutdown()
 	sessionMgr.SetAuthorizer(authorizer)
 	cmdHandler.SetSessionManager(sessionMgr)
@@ -117,7 +123,7 @@ func main() {
 	cmdHandler.SetSubtaskOrchestrator(subtaskOrchestrator)
 
 	// Create background job manager and wire it to command handler
-	bgJobMgr := bridge.NewBackgroundJobManager(db, sender)
+	bgJobMgr := bridge.NewBackgroundJobManager(db, sender, workingDirPolicy)
 	cmdHandler.SetBackgroundJobManager(bgJobMgr)
 
 	// Create session cleanup (disabled if interval is 0)

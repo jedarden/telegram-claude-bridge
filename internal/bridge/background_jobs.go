@@ -21,8 +21,9 @@ const (
 
 // BackgroundJobManager manages background shell jobs.
 type BackgroundJobManager struct {
-	db     *DB
-	sender *Sender
+	db               *DB
+	sender           *Sender
+	workingDirPolicy *WorkingDirectoryPolicy
 
 	mu     sync.Mutex
 	jobs   map[string]*BackgroundJob // ID -> Job
@@ -31,13 +32,18 @@ type BackgroundJobManager struct {
 }
 
 // NewBackgroundJobManager creates a new BackgroundJobManager.
-func NewBackgroundJobManager(db *DB, sender *Sender) *BackgroundJobManager {
+func NewBackgroundJobManager(db *DB, sender *Sender, policy ...*WorkingDirectoryPolicy) *BackgroundJobManager {
+	var workingDirPolicy *WorkingDirectoryPolicy
+	if len(policy) > 0 {
+		workingDirPolicy = policy[0]
+	}
 	mgr := &BackgroundJobManager{
-		db:     db,
-		sender: sender,
-		jobs:   make(map[string]*BackgroundJob),
-		cmds:   make(map[string]*exec.Cmd),
-		killed: make(map[string]bool),
+		db:               db,
+		sender:           sender,
+		workingDirPolicy: workingDirPolicy,
+		jobs:             make(map[string]*BackgroundJob),
+		cmds:             make(map[string]*exec.Cmd),
+		killed:           make(map[string]bool),
 	}
 	// Load running jobs from DB and mark them as interrupted
 	mgr.recoverRunningJobs()
@@ -66,6 +72,14 @@ func (m *BackgroundJobManager) recoverRunningJobs() {
 // Start launches a background job and streams output to the topic.
 // Returns the job ID and error.
 func (m *BackgroundJobManager) Start(ctx context.Context, chatID, threadID int64, command string, cwd string) (string, error) {
+	if m.workingDirPolicy != nil {
+		resolvedCWD, err := m.workingDirPolicy.Resolve(cwd)
+		if err != nil {
+			return "", fmt.Errorf("working directory policy: %w", err)
+		}
+		cwd = resolvedCWD
+	}
+
 	// Generate a unique job ID (8-character hex)
 	jobID := generateJobID()
 

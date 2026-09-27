@@ -619,13 +619,19 @@ type toolResultDelta struct {
 // proxyURL is the base URL of the proxy, used to download photo attachments.
 // eventPublisher may be nil if event publishing is disabled.
 // globalMaxWorkers is the maximum concurrent workers across all topics (0 = no limit).
-func NewSessionManager(db *DB, sender *Sender, proxyURL string, eventPublisher events.Publishable, globalMaxWorkers int) *SessionManager {
+// The optional working-directory policy is shared by every Claude and worker
+// spawn reached through this manager.
+func NewSessionManager(db *DB, sender *Sender, proxyURL string, eventPublisher events.Publishable, globalMaxWorkers int, policy ...*WorkingDirectoryPolicy) *SessionManager {
+	var workingDirPolicy *WorkingDirectoryPolicy
+	if len(policy) > 0 {
+		workingDirPolicy = policy[0]
+	}
 	m := &SessionManager{
 		db:                   db,
 		sender:               sender,
 		proxyURL:             proxyURL,
 		eventPublisher:       eventPublisher,
-		ptyMgr:               NewPTYManager(),
+		ptyMgr:               NewPTYManager(workingDirPolicy),
 		commandExec:          realCommandExec{},
 		topics:               make(map[topicKey]*topicWorker),
 		pinnedUpdateLastSeen: make(map[topicKey]time.Time),
@@ -659,6 +665,13 @@ func (m *SessionManager) isAdmin(ctx context.Context, userID int64) (bool, error
 // PTYManager returns the shared PTYManager for use by other bridge components.
 func (m *SessionManager) PTYManager() *PTYManager {
 	return m.ptyMgr
+}
+
+// ResolveWorkingDirectory validates a directory using the policy attached to
+// the shared PTY manager. Worker pools use this before recording a worker so a
+// rejected directory fails synchronously rather than in a background goroutine.
+func (m *SessionManager) ResolveWorkingDirectory(cwd string) (string, error) {
+	return m.ptyMgr.ResolveWorkingDirectory(cwd)
 }
 
 // Handle implements SessionHandlerFunc and is registered as router.OnSession.
@@ -1657,6 +1670,14 @@ func (m *SessionManager) invokeClaudeAPI(
 	placeholderID int64,
 	notificationMode string,
 ) (*claudeOutput, error) {
+	validatedCWD, err := m.ResolveWorkingDirectory(group.CWD)
+	if err != nil {
+		return nil, fmt.Errorf("working directory policy: %w", err)
+	}
+	validatedGroup := *group
+	validatedGroup.CWD = validatedCWD
+	group = &validatedGroup
+
 	// Pane name: "t<absChatID>-<threadID>" (short, tmux-safe).
 	absChatID := chatID
 	if absChatID < 0 {
@@ -3331,6 +3352,14 @@ func (m *SessionManager) createNewSession(ctx context.Context, chatID int64, gro
 // createClaudeSession starts a fresh interactive claude session with a seed prompt
 // and returns the captured session_id by scanning ~/.claude/projects/.
 func (m *SessionManager) createClaudeSession(ctx context.Context, group *Group, prompt string) (string, error) {
+	validatedCWD, err := m.ResolveWorkingDirectory(group.CWD)
+	if err != nil {
+		return "", fmt.Errorf("working directory policy: %w", err)
+	}
+	validatedGroup := *group
+	validatedGroup.CWD = validatedCWD
+	group = &validatedGroup
+
 	paneName := fmt.Sprintf("init-%d", time.Now().UnixNano())
 	permArgs := resolvePermissionArgs(group)
 	args := append(permArgs,

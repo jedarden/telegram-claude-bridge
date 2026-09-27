@@ -60,9 +60,10 @@ const (
 // One pane per active topic; panes are culled after idleTTL of inactivity
 // and relaunched with --resume on the next message.
 type PTYManager struct {
-	mu           sync.Mutex
-	idleTimers   map[string]*time.Timer // paneTarget → idle kill timer
-	managedPanes map[string]struct{}    // panes intentionally owned by this bridge process
+	mu               sync.Mutex
+	idleTimers       map[string]*time.Timer // paneTarget → idle kill timer
+	managedPanes     map[string]struct{}    // panes intentionally owned by this bridge process
+	workingDirPolicy *WorkingDirectoryPolicy
 }
 
 // ResponseSource identifies which extraction path supplied a completed
@@ -77,11 +78,27 @@ const (
 )
 
 // NewPTYManager creates a new PTYManager.
-func NewPTYManager() *PTYManager {
-	return &PTYManager{
-		idleTimers:   make(map[string]*time.Timer),
-		managedPanes: make(map[string]struct{}),
+func NewPTYManager(policy ...*WorkingDirectoryPolicy) *PTYManager {
+	var workingDirPolicy *WorkingDirectoryPolicy
+	if len(policy) > 0 {
+		workingDirPolicy = policy[0]
 	}
+	return &PTYManager{
+		idleTimers:       make(map[string]*time.Timer),
+		managedPanes:     make(map[string]struct{}),
+		workingDirPolicy: workingDirPolicy,
+	}
+}
+
+// ResolveWorkingDirectory validates and canonicalizes a working directory when
+// this manager was configured with a policy. Managers created without a policy
+// retain the legacy test-only behavior of passing the caller's path through;
+// the production bridge always injects an explicit policy from configuration.
+func (p *PTYManager) ResolveWorkingDirectory(cwd string) (string, error) {
+	if p.workingDirPolicy == nil {
+		return cwd, nil
+	}
+	return p.workingDirPolicy.Resolve(cwd)
 }
 
 // EnsureSession creates the telegram-bridge tmux session if absent.
@@ -100,6 +117,12 @@ func (p *PTYManager) EnsureSession() error {
 // paneName is the window name (e.g., "t1001234-42").
 // Returns the full pane target "telegram-bridge:<paneName>".
 func (p *PTYManager) SpawnPane(paneName, cwd string, claudeArgs []string) (string, error) {
+	resolvedCWD, err := p.ResolveWorkingDirectory(cwd)
+	if err != nil {
+		return "", fmt.Errorf("working directory policy: %w", err)
+	}
+	cwd = resolvedCWD
+
 	if err := p.EnsureSession(); err != nil {
 		return "", err
 	}
