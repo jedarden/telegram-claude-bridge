@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -87,12 +88,14 @@ func TestProxyBridgeV1_HealthContract(t *testing.T) {
 func TestProxyBridgeV1_UpdatesNormalizeGeneralAndOmitOptionals(t *testing.T) {
 	generalText := "General 🌍 — no optional fields"
 	general := tgTextUpdate(7_100, 101)
+	general.Message.Date = 1_700_000_001
 	general.Message.MessageThreadID = int64PointerV1(1)
 	general.Message.Text = &generalText
 
 	namedText := "topic message"
 	namedUsername := "topic-user"
 	named := tgTextUpdate(7_101, 102)
+	named.Message.Date = 1_700_000_042
 	named.Message.MessageThreadID = int64PointerV1(42)
 	named.Message.From.Username = &namedUsername
 	named.Message.Text = &namedText
@@ -140,6 +143,9 @@ func TestProxyBridgeV1_UpdatesNormalizeGeneralAndOmitOptionals(t *testing.T) {
 	if generalEnvelope.ChatID != -100123456789 || generalEnvelope.ThreadID != nil || !generalEnvelope.IsGeneralTopic() {
 		t.Errorf("General envelope = %+v, want signed chat ID and omitted thread_id", generalEnvelope)
 	}
+	if generalEnvelope.Timestamp != 1_700_000_001 {
+		t.Errorf("General timestamp = %d, want 1700000001", generalEnvelope.Timestamp)
+	}
 	if generalEnvelope.Content == nil || generalEnvelope.Content.Text == nil || *generalEnvelope.Content.Text != generalText {
 		t.Errorf("General content = %+v, want UTF-8 text", generalEnvelope.Content)
 	}
@@ -165,12 +171,97 @@ func TestProxyBridgeV1_UpdatesNormalizeGeneralAndOmitOptionals(t *testing.T) {
 	if namedEnvelope.ChatID != -100123456789 || namedEnvelope.ThreadID == nil || *namedEnvelope.ThreadID != 42 {
 		t.Errorf("named-topic envelope = %+v, want signed chat ID and thread_id=42", namedEnvelope)
 	}
+	if namedEnvelope.Timestamp != 1_700_000_042 {
+		t.Errorf("named-topic timestamp = %d, want 1700000042", namedEnvelope.Timestamp)
+	}
 	if namedEnvelope.ReplyToMessageID == nil || *namedEnvelope.ReplyToMessageID != 99 {
 		t.Errorf("named-topic reply_to_message_id = %v, want 99", namedEnvelope.ReplyToMessageID)
 	}
 	if namedEnvelope.FromUser.Username == nil || *namedEnvelope.FromUser.Username != namedUsername {
 		t.Errorf("named-topic username = %v, want %q", namedEnvelope.FromUser.Username, namedUsername)
 	}
+}
+
+func TestProxyBridgeV1_UpdatesNormalizeCallbackAndServiceEnvelopes(t *testing.T) {
+	callbackData := "approve 🌍"
+	callbackThreadID := int64(42)
+	callbackMessage := tgTextUpdate(7_200, 201).Message
+	callbackMessage.Date = 1_700_001_201
+	callbackMessage.MessageThreadID = &callbackThreadID
+	callback := telegram.Update{
+		UpdateID: 7_200,
+		CallbackQuery: &telegram.CallbackQuery{
+			ID:      "callback-🌍",
+			From:    telegram.User{ID: 9, FirstName: "Callback user"},
+			Message: callbackMessage,
+			Data:    &callbackData,
+		},
+	}
+
+	service := tgTextUpdate(7_201, 202)
+	service.Message.Date = 1_700_001_202
+	service.Message.MessageThreadID = &callbackThreadID
+	service.Message.Text = nil
+	service.Message.ForumTopicClosed = &telegram.ForumTopicClosed{}
+
+	telegramAPI := mockTelegram(t, [][]telegram.Update{{callback, service}})
+	defer telegramAPI.Close()
+	poller := telegram.NewPoller("test-token", telegramAPI.URL, "v1-test", "abc123", "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go poller.Start(ctx)
+
+	deadline := time.Now().Add(time.Second)
+	for !poller.Health().Polling && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !poller.Health().Polling {
+		t.Fatal("proxy poller did not start")
+	}
+
+	rec := httptest.NewRecorder()
+	proxyContractMux(poller, telegram.NewSender("test-token", telegramAPI.URL)).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/updates?timeout=1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /updates status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	assertJSONContentType(t, rec)
+	assertV1JSONHasNoNull(t, rec.Body.Bytes())
+
+	var response struct {
+		OK      bool              `json:"ok"`
+		Updates []json.RawMessage `json:"updates"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode updates response: %v", err)
+	}
+	if !response.OK || len(response.Updates) != 2 {
+		t.Fatalf("updates response = %+v, want callback and service updates", response)
+	}
+
+	var callbackEnvelope contract.Update
+	if err := json.Unmarshal(response.Updates[0], &callbackEnvelope); err != nil {
+		t.Fatalf("decode callback envelope: %v", err)
+	}
+	if callbackEnvelope.Type != "callback_query" || callbackEnvelope.ChatID != -100123456789 || callbackEnvelope.ThreadID == nil || *callbackEnvelope.ThreadID != callbackThreadID {
+		t.Errorf("callback envelope = %+v, want named-topic callback", callbackEnvelope)
+	}
+	if callbackEnvelope.Timestamp != 1_700_001_201 || callbackEnvelope.Content == nil || callbackEnvelope.Content.CallbackQueryID == nil || *callbackEnvelope.Content.CallbackQueryID != "callback-🌍" || callbackEnvelope.Content.Data == nil || *callbackEnvelope.Content.Data != callbackData {
+		t.Errorf("callback envelope content = %+v, want UTF-8 callback and timestamp", callbackEnvelope)
+	}
+	assertV1JSONKeyAbsent(t, response.Updates[0], "service")
+	assertV1JSONKeyAbsent(t, response.Updates[0], "message_thread_id")
+
+	var serviceEnvelope contract.Update
+	if err := json.Unmarshal(response.Updates[1], &serviceEnvelope); err != nil {
+		t.Fatalf("decode service envelope: %v", err)
+	}
+	if serviceEnvelope.Type != "service" || serviceEnvelope.ChatID != -100123456789 || serviceEnvelope.ThreadID == nil || *serviceEnvelope.ThreadID != callbackThreadID || serviceEnvelope.Timestamp != 1_700_001_202 {
+		t.Errorf("service envelope = %+v, want signed named-topic service with timestamp", serviceEnvelope)
+	}
+	if serviceEnvelope.Content != nil || serviceEnvelope.Service == nil || serviceEnvelope.Service.Type != contract.ServiceTypeForumTopicClosed {
+		t.Errorf("service envelope payload = %+v, want forum_topic_closed without content", serviceEnvelope)
+	}
+	assertV1JSONKeyAbsent(t, response.Updates[1], "content")
 }
 
 func TestProxyBridgeV1_MinimalJSONRequestsOmitOptionalFields(t *testing.T) {
@@ -343,6 +434,60 @@ func TestProxyBridgeV1_MinimalMediaRequestsOmitOptionalFields(t *testing.T) {
 	}
 }
 
+func TestProxyBridgeV1_FileDownloadContract(t *testing.T) {
+	const fileBody = "downloaded-🌍"
+	var cdnCalls int
+
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/bottest-token/getFile":
+			if r.Method != http.MethodPost {
+				t.Errorf("getFile method = %s, want POST", r.Method)
+			}
+			writeTelegramJSON(w, map[string]any{
+				"file_id":   "file-🌍",
+				"file_size": len([]byte(fileBody)),
+				"file_path": "documents/report-🌍.txt",
+			})
+		case "/file/bottest-token/documents/report-🌍.txt":
+			cdnCalls++
+			if r.Method != http.MethodGet {
+				t.Errorf("CDN method = %s, want GET", r.Method)
+			}
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Header().Set("Content-Length", "15")
+			_, _ = io.WriteString(w, fileBody)
+		default:
+			t.Errorf("unexpected Telegram path %q", r.URL.Path)
+			writeTelegramFailure(w, http.StatusNotFound, "unexpected path", nil)
+		}
+	}))
+	defer api.Close()
+
+	poller := telegram.NewPoller("test-token", api.URL, "v1-test", "abc123", "")
+	rec := httptest.NewRecorder()
+	proxyContractMux(poller, telegram.NewSender("test-token", api.URL)).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/file/file-🌍", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /file status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if !bytes.Equal(rec.Body.Bytes(), []byte(fileBody)) {
+		t.Errorf("download body = %q, want %q", rec.Body.Bytes(), fileBody)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Errorf("download Content-Type = %q, want UTF-8 text type", got)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "15" {
+		t.Errorf("download Content-Length = %q, want 15", got)
+	}
+	if got := rec.Header().Get("Content-Disposition"); got != `attachment; filename="report-🌍.txt"` {
+		t.Errorf("download Content-Disposition = %q, want UTF-8 filename", got)
+	}
+	if cdnCalls != 1 {
+		t.Errorf("CDN calls = %d, want 1", cdnCalls)
+	}
+}
+
 func TestProxyBridgeV1_ErrorEnvelopesAndFailureCodes(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -373,6 +518,63 @@ func TestProxyBridgeV1_ErrorEnvelopesAndFailureCodes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProxyBridgeV1_InternalAndTelegramErrorMapping(t *testing.T) {
+	t.Run("Telegram errors preserve contract code and retry metadata", func(t *testing.T) {
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeTelegramFailure(w, contract.ErrCodeRateLimit, "Too Many Requests", intPointer(3))
+		}))
+		defer api.Close()
+
+		poller := telegram.NewPoller("test-token", api.URL, "v1-test", "abc123", "")
+		sender := telegram.NewSender("test-token", api.URL)
+		rec := proxyJSONRequest(t, proxyContractMux(poller, sender), http.MethodPost, "/send", `{"chat_id":-1001234567890,"text":"hello"}`)
+		if rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("Telegram rate-limit status = %d, want 429; body=%q", rec.Code, rec.Body.String())
+		}
+		assertJSONContentType(t, rec)
+		got := decodeProxyError(t, rec)
+		if got.ErrorCode != contract.ErrCodeRateLimit || got.Description != "Too Many Requests" || got.RetryAfter == nil || *got.RetryAfter != 3 {
+			t.Errorf("Telegram error = %+v, want 429 with retry_after=3", got)
+		}
+	})
+
+	t.Run("Telegram unreachable maps to 502", func(t *testing.T) {
+		api := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		apiURL := api.URL
+		api.Close()
+
+		poller := telegram.NewPoller("test-token", apiURL, "v1-test", "abc123", "")
+		rec := proxyJSONRequest(t, proxyContractMux(poller, telegram.NewSender("test-token", apiURL)), http.MethodPost, "/send", `{"chat_id":-1001234567890,"text":"hello"}`)
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("unreachable status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+		}
+		got := decodeProxyError(t, rec)
+		if got.ErrorCode != contract.ErrCodeTelegramUnreachable {
+			t.Errorf("unreachable error_code = %d, want %d", got.ErrorCode, contract.ErrCodeTelegramUnreachable)
+		}
+	})
+
+	t.Run("Telegram deadline maps to 504", func(t *testing.T) {
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(100 * time.Millisecond)
+		}))
+		defer api.Close()
+
+		poller := telegram.NewPoller("test-token", api.URL, "v1-test", "abc123", "")
+		sender := telegram.NewSender("test-token", api.URL)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		rec := proxyJSONRequestWithContext(t, proxyContractMux(poller, sender), ctx, http.MethodPost, "/send", `{"chat_id":-1001234567890,"text":"hello"}`)
+		if rec.Code != http.StatusGatewayTimeout {
+			t.Fatalf("deadline status = %d, want 504; body=%q", rec.Code, rec.Body.String())
+		}
+		got := decodeProxyError(t, rec)
+		if got.ErrorCode != contract.ErrCodeTelegramTimeout {
+			t.Errorf("deadline error_code = %d, want %d", got.ErrorCode, contract.ErrCodeTelegramTimeout)
+		}
+	})
 }
 
 func TestProxyBridgeV1_BridgeSenderRequestShapes(t *testing.T) {
