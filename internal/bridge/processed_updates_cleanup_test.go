@@ -2,10 +2,46 @@ package bridge
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func createDatabaseAtSchemaVersion(t *testing.T, path string, version int) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+
+	if _, err := raw.Exec(`CREATE TABLE schema_version (
+		version INTEGER NOT NULL,
+		applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+	)`); err != nil {
+		t.Fatalf("create schema_version: %v", err)
+	}
+
+	for i := 0; i < version; i++ {
+		tx, err := raw.Begin()
+		if err != nil {
+			t.Fatalf("begin migration %d: %v", i+1, err)
+		}
+		if _, err := tx.Exec(migrations[i]); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("apply migration %d: %v", i+1, err)
+		}
+		if _, err := tx.Exec(`INSERT INTO schema_version (version) VALUES (?)`, i+1); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("record migration %d: %v", i+1, err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit migration %d: %v", i+1, err)
+		}
+	}
+}
 
 func setProcessedAtRelative(t *testing.T, db *DB, updateID int64, modifier string) {
 	t.Helper()
@@ -43,6 +79,85 @@ func waitForUpdateProcessed(t *testing.T, db *DB, updateID int64, want bool, tim
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("IsUpdateProcessed(%d) did not become %v within %s", updateID, want, timeout)
+}
+
+func TestOpenDB_Migration24CreatesProcessedUpdatesTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bridge.db")
+	createDatabaseAtSchemaVersion(t, path, 23)
+
+	db, err := OpenDB(path)
+	if err != nil {
+		t.Fatalf("OpenDB from schema version 23: %v", err)
+	}
+	defer db.Close()
+
+	var gotVersion int
+	if err := db.SqlDB().QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&gotVersion); err != nil {
+		t.Fatalf("read schema version: %v", err)
+	}
+	if gotVersion != schemaVersion {
+		t.Fatalf("schema version = %d, want %d after migration 24", gotVersion, schemaVersion)
+	}
+
+	var tableCount int
+	if err := db.SqlDB().QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name = 'processed_updates'`).Scan(&tableCount); err != nil {
+		t.Fatalf("check processed_updates table: %v", err)
+	}
+	if tableCount != 1 {
+		t.Fatalf("processed_updates table count = %d, want 1", tableCount)
+	}
+
+	if err := db.MarkUpdateProcessed(context.Background(), 1000); err != nil {
+		t.Fatalf("MarkUpdateProcessed after migration 24: %v", err)
+	}
+}
+
+func TestProcessedUpdates_PersistAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bridge.db")
+	db, err := OpenDB(path)
+	if err != nil {
+		t.Fatalf("open initial database: %v", err)
+	}
+	const updateID int64 = 1007
+	if err := db.MarkUpdateProcessed(context.Background(), updateID); err != nil {
+		db.Close()
+		t.Fatalf("MarkUpdateProcessed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close initial database: %v", err)
+	}
+
+	restarted, err := OpenDB(path)
+	if err != nil {
+		t.Fatalf("open database after restart: %v", err)
+	}
+	defer restarted.Close()
+	assertUpdateProcessed(t, restarted, updateID, true)
+}
+
+func TestMarkUpdateProcessed_DuplicateIsIdempotent(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	const updateID int64 = 1008
+
+	if err := db.MarkUpdateProcessed(ctx, updateID); err != nil {
+		t.Fatalf("first MarkUpdateProcessed: %v", err)
+	}
+	if err := db.MarkUpdateProcessed(ctx, updateID); err != nil {
+		t.Fatalf("duplicate MarkUpdateProcessed: %v", err)
+	}
+
+	var count int
+	if err := db.SqlDB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM processed_updates WHERE update_id = ?`, updateID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count duplicate rows: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("processed_updates rows for duplicate ID = %d, want 1", count)
+	}
 }
 
 func TestPruneProcessedUpdates_ExactBoundaryRetainsID(t *testing.T) {
@@ -103,6 +218,53 @@ func TestPruneProcessedUpdates_PreservesUnexpiredReplayProtection(t *testing.T) 
 		t.Fatalf("PruneProcessedUpdates deleted %d unexpired rows, want 0", deleted)
 	}
 	assertUpdateProcessed(t, db, updateID, true)
+}
+
+func TestPruneProcessedUpdates_SevenDayTTLBoundaries(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	const ttl = 7 * 24 * time.Hour
+
+	// SQLite evaluates datetime('now') at second precision. Retry the exact
+	// boundary fixture if the setup and DELETE statements cross a second.
+	for attempt := 0; attempt < 20; attempt++ {
+		baseID := int64(1100 + attempt*3)
+		staleID, exactID, freshID := baseID, baseID+1, baseID+2
+		for _, updateID := range []int64{staleID, exactID, freshID} {
+			if err := db.MarkUpdateProcessed(ctx, updateID); err != nil {
+				t.Fatalf("MarkUpdateProcessed(%d): %v", updateID, err)
+			}
+		}
+
+		_, err := db.SqlDB().ExecContext(ctx, `
+			UPDATE processed_updates
+			SET processed_at = CASE update_id
+				WHEN ? THEN datetime('now', '-7 days', '-1 second')
+				WHEN ? THEN datetime('now', '-7 days')
+				WHEN ? THEN datetime('now', '-7 days', '+1 second')
+			END
+			WHERE update_id IN (?, ?, ?)`,
+			staleID, exactID, freshID, staleID, exactID, freshID)
+		if err != nil {
+			t.Fatalf("set seven-day TTL fixtures: %v", err)
+		}
+
+		deleted, err := db.PruneProcessedUpdates(ctx, ttl)
+		if err != nil {
+			t.Fatalf("PruneProcessedUpdates: %v", err)
+		}
+		if deleted != 1 {
+			// If the exact row was evaluated in the preceding SQLite second,
+			// it is correctly treated as older than the cutoff. Retry with new IDs.
+			continue
+		}
+		assertUpdateProcessed(t, db, staleID, false)
+		assertUpdateProcessed(t, db, exactID, true)
+		assertUpdateProcessed(t, db, freshID, true)
+		return
+	}
+
+	t.Fatal("could not exercise the exact seven-day processed_at TTL boundary")
 }
 
 func TestPruneProcessedUpdates_RejectsInvalidTTLs(t *testing.T) {
@@ -187,4 +349,30 @@ func TestProcessedUpdatesCleanup_RunsOnConfiguredInterval(t *testing.T) {
 	}
 	setProcessedAtRelative(t, db, secondUpdateID, "-2 hours")
 	waitForUpdateProcessed(t, db, secondUpdateID, false, time.Second)
+}
+
+func TestProcessedUpdatesCleanup_ContinuesAfterDatabaseError(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	if _, err := db.PruneProcessedUpdates(context.Background(), time.Hour); err == nil {
+		t.Fatal("PruneProcessedUpdates on a closed database returned nil error")
+	}
+
+	cleanup := NewProcessedUpdatesCleanup(db, time.Hour, time.Hour)
+	// run intentionally absorbs the database error after logging it. The test
+	// fails on a panic or a blocked call, which would prevent the service from
+	// surviving a transient cleanup failure.
+	done := make(chan struct{})
+	go func() {
+		cleanup.run(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup.run did not return after a database error")
+	}
 }
