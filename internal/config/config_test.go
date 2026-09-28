@@ -742,15 +742,16 @@ func TestLoadBridgeConfig(t *testing.T) {
 	})
 
 	t.Run("invalid PROCESSED_UPDATES_TTL_HOURS", func(t *testing.T) {
-		saved := saveEnv()
-		defer restoreEnv(saved)
+		for _, value := range []string{"0", "-1", "not-a-number"} {
+			t.Run(value, func(t *testing.T) {
+				t.Setenv("PROXY_URL", "http://localhost:8080")
+				t.Setenv("PROCESSED_UPDATES_TTL_HOURS", value)
 
-		os.Setenv("PROXY_URL", "http://localhost:8080")
-		os.Setenv("PROCESSED_UPDATES_TTL_HOURS", "0")
-
-		_, err := LoadBridgeConfig()
-		if err == nil {
-			t.Error("LoadBridgeConfig() expected error for zero PROCESSED_UPDATES_TTL_HOURS")
+				_, err := LoadBridgeConfig()
+				if err == nil {
+					t.Errorf("LoadBridgeConfig() expected error for PROCESSED_UPDATES_TTL_HOURS=%q", value)
+				}
+			})
 		}
 	})
 
