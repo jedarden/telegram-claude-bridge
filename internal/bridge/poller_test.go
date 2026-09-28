@@ -426,6 +426,92 @@ func TestPoller_SendsAckAfterProcessing(t *testing.T) {
 	}
 }
 
+// TestPoller_AdvancesCumulativeAckAfterOutOfOrderBatch verifies that the
+// bridge does not publish a high-water mark while an out-of-order response is
+// still being consumed. Once every update in the response is handled, the ack
+// advances to the highest update ID in that batch.
+func TestPoller_AdvancesCumulativeAckAfterOutOfOrderBatch(t *testing.T) {
+	const (
+		firstUpdateID  int64 = 1_000
+		secondUpdateID       = firstUpdateID + 2
+		thirdUpdateID        = firstUpdateID + 1
+	)
+
+	batch := []contract.Update{
+		makePollerUpdate(firstUpdateID),
+		makePollerUpdate(secondUpdateID),
+		makePollerUpdate(thirdUpdateID),
+	}
+	var mu sync.Mutex
+	var acks []string
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		acks = append(acks, r.URL.Query().Get("ack"))
+		calls++
+		call := calls
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			_ = json.NewEncoder(w).Encode(contract.UpdatesResponse{OK: true, Updates: batch})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(contract.UpdatesResponse{OK: true, Updates: []contract.Update{}})
+	}))
+	defer srv.Close()
+
+	updates := make(chan contract.Update)
+	ctx, cancel := context.WithCancel(context.Background())
+	p := NewPoller(srv.URL, 1, updates, nil)
+	p.Start(ctx)
+	defer func() {
+		cancel()
+		select {
+		case <-p.Done():
+		case <-time.After(time.Second):
+			t.Fatal("poller did not stop after cancellation")
+		}
+	}()
+
+	for _, wantID := range []int64{firstUpdateID, secondUpdateID, thirdUpdateID} {
+		select {
+		case got := <-updates:
+			if got.UpdateID != wantID {
+				t.Fatalf("forwarded update = %d, want %d", got.UpdateID, wantID)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("poller did not forward update %d", wantID)
+		}
+
+		if wantID != thirdUpdateID {
+			mu.Lock()
+			seen := append([]string(nil), acks...)
+			mu.Unlock()
+			if len(seen) != 1 || seen[0] != "" {
+				t.Fatalf("ack queries before batch completion = %v, want only an empty initial ack", seen)
+			}
+		}
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		seen := append([]string(nil), acks...)
+		mu.Unlock()
+		for _, ack := range seen {
+			if ack == "1002" {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	t.Fatalf("ack queries = %v, want cumulative ack=1002 after the complete out-of-order batch", acks)
+}
+
 // TestPoller_DoesNotAckPastInterruptedBatch verifies that an interruption in
 // the middle of one response leaves the acknowledgement at the previous
 // contiguous high-water mark. A later restart may replay the already-forwarded
