@@ -113,6 +113,29 @@ func TestProxyHTTP_GeneralTopicOmitsThreadID(t *testing.T) {
 	}
 }
 
+func TestProxyHTTP_MissingRouteUsesStandardNotFoundResponse(t *testing.T) {
+	poller := telegram.NewPoller("test-token", "http://127.0.0.1:1", "test-version", "test-sha", "")
+	sender := telegram.NewSender("test-token", "http://127.0.0.1:1")
+	mux := proxyContractMux(poller, sender)
+
+	for _, path := range []string{"/missing-route", "/file"} {
+		t.Run(path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("GET %s status = %d, want %d; body=%q", path, rec.Code, http.StatusNotFound, rec.Body.String())
+			}
+			if got := rec.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+				t.Errorf("GET %s Content-Type = %q, want plain text", path, got)
+			}
+			if got := strings.TrimSpace(rec.Body.String()); !strings.EqualFold(got, "404 page not found") {
+				t.Errorf("GET %s body = %q, want standard not-found response", path, got)
+			}
+		})
+	}
+}
+
 func proxyJSONRequestForConformance(t *testing.T, method, path, body string) *http.Request {
 	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
