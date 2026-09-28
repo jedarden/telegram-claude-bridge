@@ -27,11 +27,12 @@ test: test-admin-allowlist
 test-admin-allowlist:
 	bash scripts/test-manage-admins.sh
 
-# Run the bridge-facing v1 proxy contract suite explicitly. The normal test
+# Run the complete proxy/bridge v1 contract suite explicitly. The normal test
 # target already includes it; this target gives CI and focused local checks a
-# stable command that names the conformance boundary.
+# stable command that also includes the HTTP-level exception and edge-case
+# tests alongside the bridge-facing envelope tests.
 test-v1-conformance:
-	go test -buildvcs=false ./cmd/proxy -run '^TestProxyBridgeV1_' -count=1
+	go test -buildvcs=false ./cmd/proxy -run '^(TestProxyBridgeV1_|TestProxyHTTP_)' -count=1
 
 vet:
 	go vet ./...
