@@ -84,6 +84,10 @@ func NewPoller(token, apiBase, version, commitSHA, offsetPath string) *Poller {
 		if len(unacked) > 0 {
 			var dropped int
 			p.updates, dropped = trimToCap(unacked, p.bufferCap)
+			if len(p.updates) > 0 {
+				lastID := p.updates[len(p.updates)-1].UpdateID
+				p.lastID = &lastID
+			}
 			if dropped > 0 {
 				log.Printf("poller: persisted unacked buffer exceeded cap (%d) — dropped %d oldest updates; they cannot be re-delivered", p.bufferCap, dropped)
 				if err := p.saveState(); err != nil {
@@ -172,6 +176,14 @@ func (p *Poller) Start(ctx context.Context) {
 		}
 
 		p.mu.Lock()
+		// Health reports the most recent Telegram update received, including
+		// updates that do not normalize into a bridge-facing envelope. The
+		// upstream offset advances for those updates too, so reporting only
+		// normalized updates would make the health value misleading.
+		if len(updates) > 0 {
+			lastID := updates[len(updates)-1].UpdateID
+			p.lastID = &lastID
+		}
 		// Commit the upstream offset and bridge-facing buffer in memory as one
 		// state transition. saveState below writes this pair with one atomic
 		// rename, so a restart observes either the old pair or the new pair,
@@ -184,9 +196,6 @@ func (p *Poller) Start(ctx context.Context) {
 			if dropped := p.trimBufferLocked(); dropped > 0 {
 				log.Printf("poller: unacked update buffer cap (%d) exceeded — dropped %d oldest updates; they cannot be re-delivered", p.bufferCap, dropped)
 			}
-			id := normalized[len(normalized)-1].UpdateID
-			p.lastID = &id
-
 			// Cache message content for /get_message endpoint
 			for _, upd := range normalized {
 				if upd.Content != nil {

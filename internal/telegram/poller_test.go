@@ -664,6 +664,12 @@ func TestPoller_PersistsOffsetWhenBatchHasNoBridgeEnvelope(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go p.Start(ctx)
 	waitForStateFile(t, offsetPath, `"offset":701`)
+	if got := p.Health().LastUpdateID; got == nil || *got != 700 {
+		if got == nil {
+			t.Fatal("LastUpdateID is nil after receiving an unrecognized update")
+		}
+		t.Fatalf("LastUpdateID = %d, want 700 for the received update", *got)
+	}
 	cancel()
 	deadline := time.Now().Add(2 * time.Second)
 	for p.Health().Polling && time.Now().Before(deadline) {

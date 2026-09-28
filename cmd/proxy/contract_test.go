@@ -1021,6 +1021,9 @@ func TestProxyHTTP_HealthReadiness(t *testing.T) {
 	if beforeResponse.OK || beforeResponse.Polling || beforeResponse.LastUpdateID != nil {
 		t.Errorf("health before Start = %+v, want not ready and no last update", beforeResponse)
 	}
+	if beforeResponse.UptimeSeconds < 0 {
+		t.Errorf("health before Start uptime = %d, want non-negative", beforeResponse.UptimeSeconds)
+	}
 	if beforeResponse.ContractVersion != contract.ContractVersion || beforeResponse.Version != "test-version" || beforeResponse.CommitSHA != "test-sha" {
 		t.Errorf("health metadata = %+v, want contract/version/commit metadata", beforeResponse)
 	}
@@ -1062,5 +1065,52 @@ func TestProxyHTTP_HealthReadiness(t *testing.T) {
 	}
 	if poller.Health().Polling {
 		t.Fatal("poller did not become not-ready after cancellation")
+	}
+}
+
+func TestProxyHTTP_HealthReportsLatestUpdateAndUptime(t *testing.T) {
+	telegramAPI := mockTelegram(t, [][]telegram.Update{{tgTextUpdate(7_321, 1)}})
+	defer telegramAPI.Close()
+
+	poller := telegram.NewPoller("test-token", telegramAPI.URL, "test-version", "test-sha", "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go poller.Start(ctx)
+
+	deadline := time.Now().Add(time.Second)
+	for poller.Health().LastUpdateID == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := poller.Health().LastUpdateID; got == nil || *got != 7_321 {
+		if got == nil {
+			t.Fatal("poller did not record the received update ID")
+		}
+		t.Fatalf("poller last update ID = %d, want 7321", *got)
+	}
+
+	rec := httptest.NewRecorder()
+	handleHealth(poller).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("health status = %d, want 200", rec.Code)
+	}
+	assertJSONContentType(t, rec)
+
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode health JSON: %v; body=%q", err, rec.Body.String())
+	}
+	var lastID int64
+	if err := json.Unmarshal(body["last_update_id"], &lastID); err != nil {
+		t.Fatalf("decode last_update_id: %v; body=%q", err, rec.Body.String())
+	}
+	if lastID != 7_321 {
+		t.Errorf("last_update_id = %d, want 7321", lastID)
+	}
+	var uptime int64
+	if err := json.Unmarshal(body["uptime_seconds"], &uptime); err != nil {
+		t.Fatalf("decode uptime_seconds: %v; body=%q", err, rec.Body.String())
+	}
+	if uptime < 0 {
+		t.Errorf("uptime_seconds = %d, want non-negative", uptime)
 	}
 }
