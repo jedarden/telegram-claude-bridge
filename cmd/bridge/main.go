@@ -27,6 +27,15 @@ var (
 	BuildDate = "unknown"
 )
 
+func logAuthorizationWarnings(allowedChatID, adminUserID int64) {
+	if allowedChatID == 0 {
+		log.Printf("[bridge] WARNING: ALLOWED_CHAT_ID=0 accepts updates from every chat")
+	}
+	if adminUserID == 0 {
+		log.Printf("[bridge] WARNING: ADMIN_USER_ID=0 disables bootstrap administrator access; only database admins can use privileged controls")
+	}
+}
+
 func main() {
 	cfg, err := config.LoadBridgeConfig()
 	if err != nil {
@@ -107,12 +116,7 @@ func main() {
 	defer events.StopPublisher(eventPublisher)
 
 	authorizer := bridge.NewAuthorizer(db, cfg.AllowedChatID, cfg.AdminUserID)
-	if cfg.AllowedChatID == 0 {
-		log.Printf("[bridge] WARNING: ALLOWED_CHAT_ID=0 accepts updates from every chat")
-	}
-	if cfg.AdminUserID == 0 {
-		log.Printf("[bridge] WARNING: ADMIN_USER_ID=0 disables bootstrap administrator access; only database admins can use privileged controls")
-	}
+	logAuthorizationWarnings(cfg.AllowedChatID, cfg.AdminUserID)
 
 	cmdHandler := bridge.NewCommandHandler(db, sender, cfg.ProxyURL, upd, eventPublisher, Version, CommitSHA, BuildDate)
 	cmdHandler.SetAuthorizer(authorizer)
