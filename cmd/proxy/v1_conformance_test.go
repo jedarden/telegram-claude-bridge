@@ -57,6 +57,8 @@ func assertV1JSONKeyAbsent(t *testing.T, body []byte, key string) {
 
 func int64PointerV1(value int64) *int64 { return &value }
 
+func intPointerV1(value int) *int { return &value }
+
 func stringPointerV1(value string) *string { return &value }
 
 func TestProxyBridgeV1_HealthContract(t *testing.T) {
@@ -389,6 +391,174 @@ func TestProxyBridgeV1_UpdatesNormalizeForumTopicServices(t *testing.T) {
 				t.Fatalf("encode %s service envelope: %v", tc.name, err)
 			}
 			assertV1JSONKeyAbsent(t, body, "content")
+		})
+	}
+}
+
+func TestProxyBridgeV1_UpdatesNormalizeAllContentTypes(t *testing.T) {
+	caption := "media caption 🌍"
+	captionEntity := telegram.MessageEntity{Type: "bold", Offset: 0, Length: len(caption)}
+	photoSize := int64(4_096)
+	voiceSize := int64(8_192)
+	audioSize := int64(16_384)
+	videoSize := int64(32_768)
+	videoNoteSize := int64(65_536)
+	documentSize := int64(131_072)
+	voiceMime := "audio/ogg"
+	audioMime := "audio/mpeg"
+	videoMime := "video/mp4"
+	documentMime := "text/plain"
+	title := "meeting-notes.mp3"
+	performer := "The Testers"
+	fileName := "notes.txt"
+
+	base := func(updateID, messageID int64) telegram.Update {
+		update := tgTextUpdate(updateID, messageID)
+		update.Message.Date = 1_700_010_000 + updateID
+		update.Message.Text = nil
+		return update
+	}
+
+	photo := base(8_001, 401)
+	photo.Message.Photo = []telegram.PhotoSize{
+		{FileID: "photo-small", Width: 320, Height: 240},
+		{FileID: "photo-selected", Width: 800, Height: 600, FileSize: &photoSize},
+		{FileID: "photo-too-large", Width: 2_560, Height: 1_920},
+	}
+	photo.Message.Caption = &caption
+	photo.Message.CaptionEntities = []telegram.MessageEntity{captionEntity}
+
+	voice := base(8_002, 402)
+	voice.Message.Voice = &telegram.Voice{FileID: "voice-file", Duration: 12, MimeType: &voiceMime, FileSize: &voiceSize}
+
+	audio := base(8_003, 403)
+	audio.Message.Audio = &telegram.Audio{FileID: "audio-file", Duration: 240, MimeType: &audioMime, Title: &title, Performer: &performer, FileSize: &audioSize}
+
+	video := base(8_004, 404)
+	video.Message.Video = &telegram.Video{FileID: "video-file", Width: 1_920, Height: 1_080, Duration: 30, MimeType: &videoMime, FileSize: &videoSize}
+
+	videoNote := base(8_005, 405)
+	videoNote.Message.VideoNote = &telegram.VideoNote{FileID: "video-note-file", Length: 240, Duration: 15, FileSize: &videoNoteSize}
+
+	document := base(8_006, 406)
+	document.Message.Document = &telegram.Document{FileID: "document-file", FileName: &fileName, MimeType: &documentMime, FileSize: &documentSize}
+	document.Message.Caption = &caption
+	document.Message.CaptionEntities = []telegram.MessageEntity{captionEntity}
+
+	telegramAPI := mockTelegram(t, [][]telegram.Update{{photo, voice, audio, video, videoNote, document}})
+	defer telegramAPI.Close()
+	poller := telegram.NewPoller("test-token", telegramAPI.URL, "v1-test", "abc123", "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go poller.Start(ctx)
+
+	deadline := time.Now().Add(time.Second)
+	for !poller.Health().Polling && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !poller.Health().Polling {
+		t.Fatal("proxy poller did not start")
+	}
+
+	rec := httptest.NewRecorder()
+	proxyContractMux(poller, telegram.NewSender("test-token", telegramAPI.URL)).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/updates?timeout=1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /updates status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	assertJSONContentType(t, rec)
+	assertV1JSONHasNoNull(t, rec.Body.Bytes())
+
+	var response struct {
+		OK      bool              `json:"ok"`
+		Updates []json.RawMessage `json:"updates"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode updates response: %v", err)
+	}
+	if !response.OK || len(response.Updates) != 6 {
+		t.Fatalf("updates response = %+v, want six media updates", response)
+	}
+
+	wantTypes := []string{
+		contract.ContentTypePhoto,
+		contract.ContentTypeVoice,
+		contract.ContentTypeAudio,
+		contract.ContentTypeVideo,
+		contract.ContentTypeVideoNote,
+		contract.ContentTypeDocument,
+	}
+	wantFileIDs := []string{"photo-selected", "voice-file", "audio-file", "video-file", "video-note-file", "document-file"}
+	for index, raw := range response.Updates {
+		t.Run(wantTypes[index], func(t *testing.T) {
+			var envelope contract.Update
+			if err := json.Unmarshal(raw, &envelope); err != nil {
+				t.Fatalf("decode %s envelope: %v", wantTypes[index], err)
+			}
+			if envelope.UpdateID != int64(8_001+index) || envelope.Type != "message" || envelope.ChatID != -100123456789 || envelope.MessageID != int64(401+index) {
+				t.Errorf("envelope = %+v, want canonical message metadata", envelope)
+			}
+			if envelope.Content == nil || envelope.Content.Type != wantTypes[index] {
+				t.Fatalf("content = %+v, want type %q", envelope.Content, wantTypes[index])
+			}
+			if envelope.Content.FileID == nil || *envelope.Content.FileID != wantFileIDs[index] {
+				t.Errorf("file_id = %v, want %q", envelope.Content.FileID, wantFileIDs[index])
+			}
+			if envelope.Service != nil {
+				t.Errorf("service = %+v, want omitted for media update", envelope.Service)
+			}
+
+			var object map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &object); err != nil {
+				t.Fatalf("decode %s object: %v", wantTypes[index], err)
+			}
+			var contentObject map[string]json.RawMessage
+			if err := json.Unmarshal(object["content"], &contentObject); err != nil {
+				t.Fatalf("decode %s content object: %v", wantTypes[index], err)
+			}
+			if _, ok := contentObject["type"]; !ok {
+				t.Errorf("content object omitted required type: %s", raw)
+			}
+			if _, ok := contentObject["file_id"]; !ok {
+				t.Errorf("content object omitted required file_id: %s", raw)
+			}
+
+			switch wantTypes[index] {
+			case contract.ContentTypePhoto:
+				if envelope.Content.Width == nil || *envelope.Content.Width != 800 || envelope.Content.Height == nil || *envelope.Content.Height != 600 || envelope.Content.Caption == nil || *envelope.Content.Caption != caption {
+					t.Errorf("photo content = %+v, want selected dimensions and caption", envelope.Content)
+				}
+				if _, ok := contentObject["caption_entities"]; !ok {
+					t.Errorf("photo content omitted caption_entities: %s", raw)
+				}
+			case contract.ContentTypeVoice:
+				if envelope.Content.Duration == nil || *envelope.Content.Duration != 12 || envelope.Content.MimeType == nil || *envelope.Content.MimeType != voiceMime || envelope.Content.FileSize == nil || *envelope.Content.FileSize != voiceSize {
+					t.Errorf("voice content = %+v, want duration/mime/file_size", envelope.Content)
+				}
+			case contract.ContentTypeAudio:
+				if envelope.Content.Duration == nil || *envelope.Content.Duration != 240 || envelope.Content.MimeType == nil || *envelope.Content.MimeType != audioMime || envelope.Content.Title == nil || *envelope.Content.Title != title || envelope.Content.Performer == nil || *envelope.Content.Performer != performer || envelope.Content.FileSize == nil || *envelope.Content.FileSize != audioSize {
+					t.Errorf("audio content = %+v, want metadata fields", envelope.Content)
+				}
+			case contract.ContentTypeVideo:
+				if envelope.Content.Duration == nil || *envelope.Content.Duration != 30 || envelope.Content.Width == nil || *envelope.Content.Width != 1_920 || envelope.Content.Height == nil || *envelope.Content.Height != 1_080 || envelope.Content.MimeType == nil || *envelope.Content.MimeType != videoMime || envelope.Content.FileSize == nil || *envelope.Content.FileSize != videoSize {
+					t.Errorf("video content = %+v, want dimensions/duration/mime/file_size", envelope.Content)
+				}
+				for _, key := range []string{"caption", "caption_entities"} {
+					if _, ok := contentObject[key]; ok {
+						t.Errorf("video content included absent optional field %q: %s", key, raw)
+					}
+				}
+			case contract.ContentTypeVideoNote:
+				if envelope.Content.Duration == nil || *envelope.Content.Duration != 15 || envelope.Content.Length == nil || *envelope.Content.Length != 240 || envelope.Content.FileSize == nil || *envelope.Content.FileSize != videoNoteSize {
+					t.Errorf("video note content = %+v, want length/duration/file_size", envelope.Content)
+				}
+			case contract.ContentTypeDocument:
+				if envelope.Content.FileName == nil || *envelope.Content.FileName != fileName || envelope.Content.MimeType == nil || *envelope.Content.MimeType != documentMime || envelope.Content.FileSize == nil || *envelope.Content.FileSize != documentSize || envelope.Content.Caption == nil || *envelope.Content.Caption != caption {
+					t.Errorf("document content = %+v, want filename/mime/file_size/caption", envelope.Content)
+				}
+				if _, ok := contentObject["caption_entities"]; !ok {
+					t.Errorf("document content omitted caption_entities: %s", raw)
+				}
+			}
 		})
 	}
 }
