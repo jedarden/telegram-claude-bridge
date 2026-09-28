@@ -28,7 +28,7 @@ test:
 # target already includes it; this target gives CI and focused local checks a
 # stable command that names the conformance boundary.
 test-v1-conformance:
-	go test ./cmd/proxy -run '^TestProxyBridgeV1_' -count=1
+	go test -buildvcs=false ./cmd/proxy -run '^TestProxyBridgeV1_' -count=1
 
 vet:
 	go vet ./...
