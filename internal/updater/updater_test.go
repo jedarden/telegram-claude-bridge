@@ -1582,6 +1582,76 @@ func TestCheckStartupHealth(t *testing.T) {
 	})
 }
 
+func TestCheckStartupHealthPersistsVerifiedHistoryAcrossDBReopen(t *testing.T) {
+	tempDir := t.TempDir()
+	initTestRepo(t, tempDir)
+	os.Unsetenv(envUpdatedFromCommit)
+
+	dbPath := filepath.Join(t.TempDir(), "bridge.db")
+	db, err := bridge.OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+
+	binaryPath := filepath.Join(tempDir, "bridge")
+	if err := os.WriteFile(binaryPath, []byte("new binary"), 0755); err != nil {
+		db.Close()
+		t.Fatalf("write new binary: %v", err)
+	}
+	if err := os.WriteFile(binaryPath+backupBinarySuffix, []byte("old binary"), 0755); err != nil {
+		db.Close()
+		t.Fatalf("write backup binary: %v", err)
+	}
+	if err := writePendingUpdateMarker(binaryPath, &pendingUpdate{
+		FromCommit: "oldsha",
+		ToCommit:   "newsha",
+		AppliedAt:  time.Now().UTC().Add(-time.Minute),
+	}); err != nil {
+		db.Close()
+		t.Fatalf("write pending marker: %v", err)
+	}
+
+	liveness := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/livez" {
+			t.Errorf("liveness request path = %q, want /livez", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer liveness.Close()
+
+	originalInterval, originalTimeout := healthCheckInterval, healthCheckTimeout
+	healthCheckInterval, healthCheckTimeout = 5*time.Millisecond, time.Second
+	t.Cleanup(func() {
+		healthCheckInterval, healthCheckTimeout = originalInterval, originalTimeout
+	})
+
+	if err := CheckStartupHealth(tempDir, "bridge", db, liveness.URL+"/livez"); err != nil {
+		db.Close()
+		t.Fatalf("CheckStartupHealth: %v", err)
+	}
+	db.Close()
+
+	reopened, err := bridge.OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer reopened.Close()
+
+	success, err := reopened.GetLastUpdateSuccess(context.Background())
+	if err != nil {
+		t.Fatalf("GetLastUpdateSuccess after reopen: %v", err)
+	}
+	if success == nil {
+		t.Fatal("verified startup update was not persisted in update_history")
+	}
+	if success.FromCommit != "oldsha" || success.ToCommit != "newsha" {
+		t.Errorf("persisted update = %s -> %s, want oldsha -> newsha", success.FromCommit, success.ToCommit)
+	}
+	if success.VerifiedAt.IsZero() {
+		t.Fatal("persisted verification timestamp is zero")
+	}
+}
+
 // execCall records one invocation of the execBinary stub.
 type execCall struct {
 	Path string
