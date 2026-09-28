@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestWorkingDirectoryPolicyEnforcesMultipleWorkspaceRoots(t *testing.T) {
@@ -146,5 +148,103 @@ func TestRouterCWDRegistrationRequiresAdminAndStoresCanonicalPath(t *testing.T) 
 	}
 	if group.CWD != project {
 		t.Fatalf("registered CWD = %q, want canonical %q", group.CWD, project)
+	}
+}
+
+func TestExistingWorkspaceAndPermissionChangesRequireAdmin(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "workspace")
+	original := filepath.Join(root, "original")
+	replacement := filepath.Join(root, "replacement")
+	alias := filepath.Join(root, "replacement-alias")
+	if err := os.MkdirAll(original, 0o755); err != nil {
+		t.Fatalf("mkdir original project: %v", err)
+	}
+	if err := os.Mkdir(replacement, 0o755); err != nil {
+		t.Fatalf("mkdir replacement project: %v", err)
+	}
+	if err := os.Symlink(replacement, alias); err != nil {
+		t.Fatalf("symlink replacement project: %v", err)
+	}
+
+	ctx := context.Background()
+	db := openTestDB(t)
+	const (
+		adminID    = int64(9001)
+		nonAdminID = int64(200)
+		chatID     = int64(100)
+	)
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: adminID, Role: "admin"}); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: nonAdminID, Role: "user"}); err != nil {
+		t.Fatalf("seed non-admin: %v", err)
+	}
+	group := &Group{
+		ChatID:         chatID,
+		CWD:            original,
+		PermissionMode: "plan",
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("seed group: %v", err)
+	}
+	policy, err := NewWorkingDirectoryPolicy(root)
+	if err != nil {
+		t.Fatalf("NewWorkingDirectoryPolicy: %v", err)
+	}
+	h := newTestCommandHandler(t, db)
+	h.SetWorkingDirectoryPolicy(policy)
+
+	nonAdminUpdate := makeUpdate(chatID, nil, 1, "/cwd "+alias, nonAdminID)
+	reply, err := h.cmdCWD(ctx, nonAdminUpdate, group, alias)
+	if err != nil {
+		t.Fatalf("non-admin cmdCWD: %v", err)
+	}
+	if !strings.Contains(reply, "Permission denied") {
+		t.Fatalf("non-admin workspace change reply = %q, want denial", reply)
+	}
+	if group.CWD != original {
+		t.Fatalf("non-admin changed in-memory CWD to %q, want %q", group.CWD, original)
+	}
+
+	for _, command := range []struct {
+		name string
+		call func() (string, error)
+	}{
+		{name: "permission command", call: func() (string, error) {
+			return h.cmdPermission(ctx, makeUpdate(chatID, nil, 2, "/permission bypassPermissions", nonAdminID), group, "bypassPermissions")
+		}},
+		{name: "config command", call: func() (string, error) {
+			return h.cmdConfig(ctx, makeUpdate(chatID, nil, 3, "/config permission_mode bypassPermissions", nonAdminID), group, "permission_mode bypassPermissions")
+		}},
+	} {
+		t.Run(command.name, func(t *testing.T) {
+			reply, err := command.call()
+			if err != nil {
+				t.Fatalf("non-admin permission change: %v", err)
+			}
+			if !strings.Contains(reply, "Permission denied") {
+				t.Fatalf("non-admin permission change reply = %q, want denial", reply)
+			}
+			if group.PermissionMode != "plan" {
+				t.Fatalf("non-admin changed in-memory permission mode to %q, want plan", group.PermissionMode)
+			}
+			stored, err := db.GetGroup(ctx, chatID)
+			if err != nil {
+				t.Fatalf("get group after rejected permission change: %v", err)
+			}
+			if stored.PermissionMode != "plan" || stored.CWD != original {
+				t.Fatalf("rejected non-admin mutation persisted group = %+v, want CWD %q and permission mode plan", stored, original)
+			}
+		})
+	}
+
+	adminUpdate := makeUpdate(chatID, nil, 4, "/cwd "+alias, adminID)
+	if _, err := h.cmdCWD(ctx, adminUpdate, group, alias); err != nil {
+		t.Fatalf("admin cmdCWD: %v", err)
+	}
+	if group.CWD != replacement {
+		t.Fatalf("admin CWD = %q, want canonical %q", group.CWD, replacement)
 	}
 }
