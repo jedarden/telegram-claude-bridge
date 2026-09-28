@@ -318,6 +318,16 @@ topic:
 /users
 ```
 
+Granting `admin` gives the target all administrator capabilities. To revoke
+only administrator privileges while keeping the account allow-listed, change
+the role back to `user`; use `/removeuser` to revoke all access:
+
+```text
+/adduser <telegram-user-id> admin
+/adduser <telegram-user-id> user
+/removeuser <telegram-user-id>
+```
+
 `/users` is the in-band audit of every allowlisted user, role, and added time.
 For an offline audit, or to verify the bootstrap state during maintenance,
 run `./scripts/manage-admins.sh --db "$DB_PATH" audit`. The bridge refuses to
@@ -326,7 +336,9 @@ add and verify a replacement administrator before changing an existing admin
 role. An environment bootstrap administrator remains authorized even if its
 database row is accidentally removed, but keeping a database admin row makes
 the allowlist auditable and provides a recovery path if the environment is
-later changed to `ADMIN_USER_ID=0`.
+later changed to `ADMIN_USER_ID=0`. If its row is changed or removed while the
+bridge is running, the configured identity is still authorized; the next
+startup also re-creates or restores that row as `role=admin`.
 
 ---
 

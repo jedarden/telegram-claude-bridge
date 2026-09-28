@@ -1,4 +1,4 @@
-.PHONY: all build proxy bridge dashboard clean test test-v1-conformance vet docker validate-deployment-security test-deployment-security
+.PHONY: all build proxy bridge dashboard clean test test-admin-allowlist test-v1-conformance vet docker validate-deployment-security test-deployment-security
 
 VERSION := $(shell git describe --tags --always 2>/dev/null || echo "dev")
 COMMITSHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -21,8 +21,11 @@ bridge:
 clean:
 	rm -f bin/proxy bin/bridge bin/dashboard
 
-test:
+test: test-admin-allowlist
 	go test ./...
+
+test-admin-allowlist:
+	bash scripts/test-manage-admins.sh
 
 # Run the bridge-facing v1 proxy contract suite explicitly. The normal test
 # target already includes it; this target gives CI and focused local checks a

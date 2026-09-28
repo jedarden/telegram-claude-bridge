@@ -268,6 +268,140 @@ func TestSeededAdministratorCanRegisterGroupWhenBootstrapDisabled(t *testing.T) 
 	}
 }
 
+func TestAdministratorGrantAndRevokeLifecycle(t *testing.T) {
+	const (
+		adminUser  = int64(9001)
+		targetUser = int64(200)
+		chatID     = int64(100)
+	)
+
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: adminUser, Role: "admin"}); err != nil {
+		t.Fatalf("seed administrator: %v", err)
+	}
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: targetUser, Role: "user"}); err != nil {
+		t.Fatalf("seed target user: %v", err)
+	}
+
+	h := newTestCommandHandler(t, db)
+	adminUpdate := func(text string) contract.Update {
+		return makeUpdate(chatID, nil, 1, text, adminUser)
+	}
+
+	grantReply, err := h.cmdAddUser(ctx, adminUpdate("/adduser 200 admin"), "200 admin")
+	if err != nil {
+		t.Fatalf("grant administrator: %v", err)
+	}
+	if !strings.Contains(grantReply, "Added user 200 with role: admin") {
+		t.Fatalf("grant reply = %q", grantReply)
+	}
+	role, err := db.GetUserRole(ctx, targetUser)
+	if err != nil {
+		t.Fatalf("get granted role: %v", err)
+	}
+	if role != "admin" {
+		t.Fatalf("granted role = %q, want admin", role)
+	}
+
+	authorizer := NewAuthorizer(db, chatID, 0)
+	isAdmin, err := authorizer.IsAdmin(ctx, targetUser)
+	if err != nil {
+		t.Fatalf("check granted administrator: %v", err)
+	}
+	if !isAdmin {
+		t.Fatal("granted administrator was not authorized")
+	}
+
+	revokeReply, err := h.cmdAddUser(ctx, adminUpdate("/adduser 200 user"), "200 user")
+	if err != nil {
+		t.Fatalf("revoke administrator role: %v", err)
+	}
+	if !strings.Contains(revokeReply, "Added user 200 with role: user") {
+		t.Fatalf("revoke reply = %q", revokeReply)
+	}
+	role, err = db.GetUserRole(ctx, targetUser)
+	if err != nil {
+		t.Fatalf("get revoked role: %v", err)
+	}
+	if role != "user" {
+		t.Fatalf("revoked role = %q, want user", role)
+	}
+	isAdmin, err = authorizer.IsAdmin(ctx, targetUser)
+	if err != nil {
+		t.Fatalf("check revoked administrator: %v", err)
+	}
+	if isAdmin {
+		t.Fatal("demoted user retained administrator access")
+	}
+
+	removeReply, err := h.cmdRemoveUser(ctx, adminUpdate("/removeuser 200"), "200")
+	if err != nil {
+		t.Fatalf("revoke allowlist access: %v", err)
+	}
+	if !strings.Contains(removeReply, "Removed user 200") {
+		t.Fatalf("remove reply = %q", removeReply)
+	}
+	allowed, err := authorizer.CanReceiveUpdate(ctx, commandTextUpdate(targetUser, chatID, 2, "/help"))
+	if err != nil {
+		t.Fatalf("check removed user: %v", err)
+	}
+	if allowed {
+		t.Fatal("removed user retained update access")
+	}
+}
+
+func TestConfiguredBootstrapAdministratorSurvivesAllowlistChanges(t *testing.T) {
+	const (
+		bootstrapUser = int64(9001)
+		otherAdmin    = int64(9002)
+		chatID        = int64(100)
+	)
+
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.EnsureAdminUser(ctx, bootstrapUser); err != nil {
+		t.Fatalf("ensure bootstrap administrator: %v", err)
+	}
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: otherAdmin, Role: "admin"}); err != nil {
+		t.Fatalf("seed second administrator: %v", err)
+	}
+
+	authorizer := NewAuthorizer(db, chatID, bootstrapUser)
+	assertBootstrapAuthorized := func(label string) {
+		t.Helper()
+		allowed, err := authorizer.CanReceiveUpdate(ctx, commandTextUpdate(bootstrapUser, chatID, 1, "/help"))
+		if err != nil {
+			t.Fatalf("%s authorization: %v", label, err)
+		}
+		if !allowed {
+			t.Fatalf("configured bootstrap administrator was denied after %s", label)
+		}
+	}
+
+	assertBootstrapAuthorized("startup bootstrap")
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: bootstrapUser, Role: "user"}); err != nil {
+		t.Fatalf("demote bootstrap row: %v", err)
+	}
+	assertBootstrapAuthorized("database demotion")
+
+	if err := db.DeleteAllowedUser(ctx, bootstrapUser); err != nil {
+		t.Fatalf("remove bootstrap row: %v", err)
+	}
+	assertBootstrapAuthorized("database removal")
+
+	if err := db.EnsureAdminUser(ctx, bootstrapUser); err != nil {
+		t.Fatalf("re-establish bootstrap row: %v", err)
+	}
+	user, err := db.GetAllowedUser(ctx, bootstrapUser)
+	if err != nil {
+		t.Fatalf("get re-established bootstrap row: %v", err)
+	}
+	if user == nil || user.Role != "admin" {
+		t.Fatalf("re-established bootstrap row = %+v, want role=admin", user)
+	}
+}
+
 func TestCommandHandler_NoBootstrapRejectsUnauthorizedAdminMutation(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
