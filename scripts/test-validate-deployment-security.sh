@@ -5,6 +5,10 @@ readonly validator="$(dirname "$0")/validate-deployment-security.sh"
 readonly fixture="$(mktemp -d)"
 readonly runtime_token="synthetic-runtime-token-for-tests-only"
 readonly literal_token="123456:$(printf '%020d' 0)"
+readonly system_mktemp="$(command -v mktemp)"
+readonly system_chmod="$(command -v chmod)"
+readonly system_stat="$(command -v stat)"
+readonly system_grep="$(command -v grep)"
 runtime_pid=""
 
 stop_runtime() {
@@ -152,6 +156,17 @@ case "$mode" in
   descendant-arguments-worker)
     IFS= read -r token
     exec bash -c 'while :; do sleep 30; done' bridge-process "$token"
+    ;;
+  disappearing-descendant)
+    IFS= read -r token
+    (exec sleep 30) &
+    child=$!
+    while [[ ! -e "${BRIDGE_RELEASE_FILE:?}" ]]; do
+      sleep 0.01
+    done
+    kill "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+    exec sleep 30
     ;;
   *)
     exit 2
@@ -355,6 +370,20 @@ run_acl_without_test() {
 }'
 }
 
+run_acl_without_rule() {
+  run_acl_file '{
+  "acls": [],
+  "tests": [
+    {
+      "src": "tag:bridge",
+      "proto": "tcp",
+      "accept": ["tag:telegram-proxy:8080"],
+      "deny": ["tag:telegram-proxy:22"]
+    }
+  ]
+}'
+}
+
 run_missing_deployment() {
   "$validator" \
     --proxy-service "$fixture/manifests/service.yaml" \
@@ -427,8 +456,9 @@ run_empty_token() {
 }
 
 run_broad_root() {
+  local root=$1
   printf '%s\n' "$runtime_token" |
-    run_full --token-stdin --bridge-pid "$$" --bridge-root /tmp
+    run_full --token-stdin --bridge-pid "$$" --bridge-root "$root"
 }
 
 start_runtime() {
@@ -456,6 +486,102 @@ run_runtime_file() {
   mkdir -p "$bad_root"
   printf '%s\n' "$runtime_token" > "$bad_root/leaked-state"
   run_full --token-stdin --bridge-pid "$$" --bridge-root "$bad_root"
+}
+
+run_runtime_disappearing_descendant() {
+  local tool_dir="$fixture/disappearing-descendant-bin"
+  local release_file="$fixture/disappearing-descendant.release"
+  mkdir -p "$tool_dir"
+  rm -f "$release_file"
+  cat > "$tool_dir/grep" <<'GREP'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+for argument in "$@"; do
+  case "$argument" in
+    /proc/*/environ|/proc/*/cmdline)
+      if [[ -n "${BRIDGE_RELEASE_FILE:-}" && ! -e "$BRIDGE_RELEASE_FILE" ]]; then
+        : > "$BRIDGE_RELEASE_FILE"
+      fi
+      ;;
+  esac
+done
+
+exec "${SECURITY_TEST_REAL_GREP:?}" "$@"
+GREP
+  chmod +x "$tool_dir/grep"
+
+  printf '%s\n' "$runtime_token" |
+    BRIDGE_RELEASE_FILE="$release_file" "$fixture/runtime-process.sh" disappearing-descendant &
+  runtime_pid=$!
+  sleep 0.1
+  local status=0
+  if printf '%s\n' "$runtime_token" |
+    BRIDGE_RELEASE_FILE="$release_file" PATH="$tool_dir:$PATH" \
+      SECURITY_TEST_REAL_GREP="$system_grep" \
+      "$validator" "${full_args[@]}" --token-stdin --bridge-pid "$runtime_pid" \
+      --bridge-root "$fixture/bridge-root"; then
+    status=0
+  else
+    status=$?
+  fi
+  stop_runtime
+  return "$status"
+}
+
+run_token_temp_file() {
+  local tool_dir="$fixture/token-tools"
+  local mktemp_record="$fixture/token-mktemp.path"
+  local chmod_record="$fixture/token-chmod.mode"
+  local output="$fixture/token-temp-file.output"
+  mkdir -p "$tool_dir"
+  cat > "$tool_dir/mktemp" <<'MKTEMP'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+path=$("${SECURITY_TEST_REAL_MKTEMP:?}" "$@")
+printf '%s\n' "$path" > "${SECURITY_TEST_MKTEMP_RECORD:?}"
+printf '%s\n' "$path"
+MKTEMP
+  cat > "$tool_dir/chmod" <<'CHMOD'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+"${SECURITY_TEST_REAL_CHMOD:?}" "$@"
+if [[ "$#" -eq 2 && "$1" == 600 ]]; then
+  "${SECURITY_TEST_REAL_STAT:?}" -c '%a' "$2" > "${SECURITY_TEST_CHMOD_RECORD:?}"
+fi
+CHMOD
+  chmod +x "$tool_dir/mktemp" "$tool_dir/chmod"
+
+  if ! printf '%s\n' "$runtime_token" |
+    SECURITY_TEST_MKTEMP_RECORD="$mktemp_record" \
+    SECURITY_TEST_CHMOD_RECORD="$chmod_record" \
+    SECURITY_TEST_REAL_MKTEMP="$system_mktemp" \
+    SECURITY_TEST_REAL_CHMOD="$system_chmod" \
+    SECURITY_TEST_REAL_STAT="$system_stat" \
+    PATH="$tool_dir:$PATH" "$validator" "${full_args[@]}" \
+      --token-stdin --bridge-pid "$$" --bridge-root "$fixture/bridge-root" \
+      >"$output" 2>&1; then
+    cat "$output" >&2
+    return 1
+  fi
+  [[ -s "$mktemp_record" ]] || { echo "mktemp wrapper was not called" >&2; return 1; }
+  [[ -s "$chmod_record" ]] || { echo "chmod wrapper did not observe mode 600" >&2; return 1; }
+  [[ "$(<"$chmod_record")" == 600 ]] || {
+    echo "token tempfile was not mode 600" >&2
+    return 1
+  }
+  local token_path
+  token_path=$(<"$mktemp_record")
+  [[ ! -e "$token_path" ]] || {
+    echo "token tempfile was not removed on exit" >&2
+    return 1
+  }
+  if grep -Fq -- "$runtime_token" "$output"; then
+    echo "validator printed the piped runtime token" >&2
+    return 1
+  fi
 }
 
 expect_success static-default "$validator" --static-only
@@ -507,6 +633,7 @@ expect_failure acl-all-hosts-wildcard run_acl_all_hosts_wildcard
 expect_failure acl-wrong-protocol run_acl_wrong_proto
 expect_failure acl-wrong-source run_acl_wrong_source
 expect_failure acl-wrong-destination run_acl_wrong_destination
+expect_failure acl-missing-rule run_acl_without_rule
 expect_failure acl-missing-test run_acl_without_test
 
 expect_failure missing-deployment run_missing_deployment
@@ -519,13 +646,20 @@ expect_failure token-without-pid run_token_without_pid
 expect_failure token-without-root run_token_without_root
 expect_failure pid-without-token run_pid_without_token
 expect_failure empty-token run_empty_token
-expect_failure broad-runtime-root run_broad_root
+expect_failure broad-runtime-root-slash run_broad_root /
+expect_failure broad-runtime-root-home run_broad_root /home
+expect_failure broad-runtime-root-root run_broad_root /root
+expect_failure broad-runtime-root-etc run_broad_root /etc
+expect_failure broad-runtime-root-var run_broad_root /var
+expect_failure broad-runtime-root-tmp run_broad_root /tmp
 
 expect_success runtime-process-clean run_runtime_process clean
+expect_success runtime-token-stdin-never-printed run_token_temp_file
 expect_failure runtime-environment-leak run_runtime_process environment
 expect_failure runtime-arguments-leak run_runtime_process arguments
 expect_failure runtime-descendant-environment-leak run_runtime_process descendant-environment
 expect_failure runtime-descendant-arguments-leak run_runtime_process descendant-arguments
+expect_success runtime-disappearing-descendant run_runtime_disappearing_descendant
 expect_failure runtime-file-leak run_runtime_file
 
 echo "PASS deployment security validator fixture matrix"

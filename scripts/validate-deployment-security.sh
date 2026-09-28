@@ -249,7 +249,12 @@ check_secret_in_proc_file() {
   case "$status" in
     0) die "Telegram token found in bridge $label (pid $pid)" ;;
     1) : ;;
-    *) die "could not inspect bridge $label (pid $pid)" ;;
+    *)
+      if [[ "$pid" != "$bridge_pid" && ! -d "/proc/$pid" ]]; then
+        return 0
+      fi
+      die "could not inspect bridge $label (pid $pid)"
+      ;;
   esac
 }
 
