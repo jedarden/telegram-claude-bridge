@@ -144,7 +144,7 @@ func validateWorkingDirectoryShape(path string) error {
 	for _, component := range pathComponents(clean) {
 		lower := strings.ToLower(component)
 		switch lower {
-		case ".ssh", ".gnupg", ".gpg", ".aws", ".azure", ".config", ".kube", ".docker", ".claude", ".git", ".git-credentials", "credentials", "secrets", "secret", "tokens", "token", "vault", "id_rsa", "id_ed25519":
+		case ".ssh", ".gnupg", ".gpg", ".aws", ".azure", ".config", ".kube", ".docker", ".claude", ".git", ".git-credentials", ".vault-token", ".vault-token-openbao-v2", "credentials", "secrets", "secret", "tokens", "token", "vault", "id_rsa", "id_ed25519":
 			return ErrWorkingDirectorySensitive
 		}
 		if lower == ".env" || strings.HasPrefix(lower, ".env.") {

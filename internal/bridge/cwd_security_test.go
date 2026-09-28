@@ -43,6 +43,67 @@ func TestWorkingDirectoryPolicyEnforcesMultipleWorkspaceRoots(t *testing.T) {
 	}
 }
 
+func TestCmdCWDStoresCanonicalPathFromEachConfiguredRoot(t *testing.T) {
+	parent := t.TempDir()
+	rootA := filepath.Join(parent, "workspace-a")
+	rootB := filepath.Join(parent, "workspace-b")
+	projectA := filepath.Join(rootA, "project")
+	projectB := filepath.Join(rootB, "project")
+	aliasA := filepath.Join(rootA, "project-alias")
+	aliasB := filepath.Join(rootB, "project-alias")
+	for _, directory := range []string{projectA, projectB} {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatalf("mkdir %q: %v", directory, err)
+		}
+	}
+	for alias, target := range map[string]string{aliasA: projectA, aliasB: projectB} {
+		if err := os.Symlink(target, alias); err != nil {
+			t.Fatalf("symlink %q -> %q: %v", alias, target, err)
+		}
+	}
+
+	policy, err := NewWorkingDirectoryPolicy(rootA, rootB)
+	if err != nil {
+		t.Fatalf("NewWorkingDirectoryPolicy: %v", err)
+	}
+	db := openTestDB(t)
+	ctx := context.Background()
+	const adminID = int64(9001)
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: adminID, Role: "admin"}); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
+	h := newTestCommandHandler(t, db)
+	h.SetWorkingDirectoryPolicy(policy)
+
+	tests := []struct {
+		name   string
+		chatID int64
+		path   string
+		want   string
+	}{
+		{name: "exact first root", chatID: 100, path: rootA, want: rootA},
+		{name: "symlinked project in second root", chatID: 200, path: aliasB, want: projectB},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			update := makeUpdate(test.chatID, nil, 1, "/cwd "+test.path, adminID)
+			if _, err := h.cmdCWD(ctx, update, nil, test.path); err != nil {
+				t.Fatalf("cmdCWD(%q): %v", test.path, err)
+			}
+			group, err := db.GetGroup(ctx, test.chatID)
+			if err != nil {
+				t.Fatalf("get stored group: %v", err)
+			}
+			if group == nil {
+				t.Fatal("cmdCWD did not register group")
+			}
+			if group.CWD != test.want {
+				t.Fatalf("stored CWD = %q, want canonical %q", group.CWD, test.want)
+			}
+		})
+	}
+}
+
 func TestCmdCWDRejectsUnsafePathsWithoutRegisteringGroup(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "workspace")

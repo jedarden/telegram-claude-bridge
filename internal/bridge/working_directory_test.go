@@ -52,6 +52,53 @@ func TestWorkingDirectoryPolicyEnforcesAllowedRoots(t *testing.T) {
 	}
 }
 
+func TestWorkingDirectoryPolicyAcceptsExactAndNestedPathsInEveryConfiguredRoot(t *testing.T) {
+	parent := t.TempDir()
+	rootA := filepath.Join(parent, "workspace-a")
+	rootB := filepath.Join(parent, "workspace-b")
+	projectA := filepath.Join(rootA, "project")
+	projectB := filepath.Join(rootB, "project")
+	aliasA := filepath.Join(rootA, "project-alias")
+	aliasB := filepath.Join(rootB, "project-alias")
+	for _, directory := range []string{projectA, projectB} {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatalf("mkdir %q: %v", directory, err)
+		}
+	}
+	for alias, target := range map[string]string{aliasA: projectA, aliasB: projectB} {
+		if err := os.Symlink(target, alias); err != nil {
+			t.Fatalf("symlink %q -> %q: %v", alias, target, err)
+		}
+	}
+
+	policy, err := NewWorkingDirectoryPolicy(rootA, rootB)
+	if err != nil {
+		t.Fatalf("NewWorkingDirectoryPolicy: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "exact first root", path: rootA, want: rootA},
+		{name: "nested first root", path: aliasA, want: projectA},
+		{name: "exact second root", path: rootB, want: rootB},
+		{name: "nested second root", path: aliasB, want: projectB},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := policy.Resolve(test.path)
+			if err != nil {
+				t.Fatalf("Resolve(%q): %v", test.path, err)
+			}
+			if got != test.want {
+				t.Fatalf("Resolve(%q) = %q, want canonical %q", test.path, got, test.want)
+			}
+		})
+	}
+}
+
 func TestWorkingDirectoryPolicyCanonicalizesConfiguredRoot(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "workspace")
@@ -122,6 +169,38 @@ func TestWorkingDirectoryPolicyRejectsSymlinkEscape(t *testing.T) {
 	}
 }
 
+func TestWorkingDirectoryPolicyRejectsSymlinkedParentEscapeAndPrefixSibling(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "workspace")
+	outside := filepath.Join(parent, "outside")
+	sibling := filepath.Join(parent, "workspace-sibling")
+	outsideChild := filepath.Join(outside, "project")
+	linkedParent := filepath.Join(root, "linked-parent")
+	if err := os.MkdirAll(outsideChild, 0o755); err != nil {
+		t.Fatalf("mkdir outside child: %v", err)
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	if err := os.Mkdir(sibling, 0o755); err != nil {
+		t.Fatalf("mkdir prefix sibling: %v", err)
+	}
+	if err := os.Symlink(outside, linkedParent); err != nil {
+		t.Fatalf("symlink parent: %v", err)
+	}
+
+	policy, err := NewWorkingDirectoryPolicy(root)
+	if err != nil {
+		t.Fatalf("NewWorkingDirectoryPolicy: %v", err)
+	}
+	if _, err := policy.Resolve(filepath.Join(linkedParent, "project")); !errors.Is(err, ErrWorkingDirectoryNotAllowed) {
+		t.Fatalf("Resolve symlinked parent escape error = %v, want %v", err, ErrWorkingDirectoryNotAllowed)
+	}
+	if _, err := policy.Resolve(sibling); !errors.Is(err, ErrWorkingDirectoryNotAllowed) {
+		t.Fatalf("Resolve prefix sibling error = %v, want %v", err, ErrWorkingDirectoryNotAllowed)
+	}
+}
+
 func TestWorkingDirectoryPolicyRejectsSensitiveDirectory(t *testing.T) {
 	root := t.TempDir()
 	policy, err := NewWorkingDirectoryPolicy(root)
@@ -131,7 +210,7 @@ func TestWorkingDirectoryPolicyRejectsSensitiveDirectory(t *testing.T) {
 
 	sensitiveNames := []string{
 		".ssh", ".gnupg", ".gpg", ".aws", ".azure", ".config", ".kube", ".docker", ".claude", ".git",
-		".git-credentials", "credentials", "secrets", "secret", "tokens", "token", "vault",
+		".git-credentials", ".vault-token", ".vault-token-openbao-v2", "credentials", "secrets", "secret", "tokens", "token", "vault",
 		"id_rsa", "id_ed25519", ".env", ".env.local",
 	}
 	for _, name := range sensitiveNames {
@@ -145,6 +224,22 @@ func TestWorkingDirectoryPolicyRejectsSensitiveDirectory(t *testing.T) {
 				t.Fatalf("Resolve sensitive directory error = %v, want %v", err, ErrWorkingDirectorySensitive)
 			}
 		})
+	}
+}
+
+func TestWorkingDirectoryPolicyRejectsNestedOpenBaoCredentialDirectory(t *testing.T) {
+	root := t.TempDir()
+	credentialDir := filepath.Join(root, "project", ".config", "openbao", "openbao-v2")
+	if err := os.MkdirAll(credentialDir, 0o700); err != nil {
+		t.Fatalf("mkdir OpenBao credential directory: %v", err)
+	}
+
+	policy, err := NewWorkingDirectoryPolicy(root)
+	if err != nil {
+		t.Fatalf("NewWorkingDirectoryPolicy: %v", err)
+	}
+	if _, err := policy.Resolve(credentialDir); !errors.Is(err, ErrWorkingDirectorySensitive) {
+		t.Fatalf("Resolve OpenBao credential directory error = %v, want %v", err, ErrWorkingDirectorySensitive)
 	}
 }
 
