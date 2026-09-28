@@ -1,8 +1,10 @@
 package bridge
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ── modelTier ─────────────────────────────────────────────────────────────────
@@ -209,6 +211,48 @@ func TestPrependConversationHistory(t *testing.T) {
 	}
 }
 
+func TestSessionManager_PersistSessionRefreshesLastActive(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	group := &Group{ChatID: 1, CWD: "/tmp", DefaultModel: "claude-sonnet-4-6"}
+	if err := db.UpsertGroup(ctx, group); err != nil {
+		t.Fatalf("UpsertGroup: %v", err)
+	}
+
+	oldLastActive := time.Date(2020, time.January, 2, 3, 4, 5, 0, time.UTC)
+	session := &Session{
+		ChatID:       1,
+		ThreadID:     2,
+		SessionID:    "old-session",
+		CWD:          "/tmp",
+		Model:        group.DefaultModel,
+		Status:       "active",
+		LastActive:   oldLastActive,
+		MessageCount: 1,
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	sm := NewSessionManager(db, &Sender{}, "", nil, 0)
+	err := sm.persistSession(ctx, topicKey{chatID: 1, threadID: 2}, session, group,
+		&claudeOutput{SessionID: "new-session"}, 99)
+	if err != nil {
+		t.Fatalf("persistSession: %v", err)
+	}
+
+	got, err := db.GetSession(ctx, 1, 2)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if !got.LastActive.After(oldLastActive) {
+		t.Errorf("LastActive = %s, want timestamp after %s", got.LastActive, oldLastActive)
+	}
+	if got.MessageCount != 2 {
+		t.Errorf("MessageCount = %d, want 2", got.MessageCount)
+	}
+}
+
 // ── tierModel (helper for tier changes) ─────────────────────────────────────────
 
 func TestTierModel(t *testing.T) {
@@ -258,4 +302,3 @@ func TestTierModel(t *testing.T) {
 		})
 	}
 }
-
