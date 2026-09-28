@@ -143,6 +143,12 @@ func TestProxyHTTP_MethodValidation(t *testing.T) {
 			if rec.Code != http.StatusMethodNotAllowed {
 				t.Fatalf("%s %s status = %d, want %d; body=%q", tc.want, tc.path, rec.Code, http.StatusMethodNotAllowed, rec.Body.String())
 			}
+			if got := rec.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+				t.Errorf("%s %s Content-Type = %q, want plain text", tc.want, tc.path, got)
+			}
+			if got := strings.TrimSpace(rec.Body.String()); !strings.EqualFold(got, "method not allowed") {
+				t.Errorf("%s %s body = %q, want plain-text 405 response", tc.want, tc.path, got)
+			}
 		})
 	}
 }
@@ -497,6 +503,45 @@ func TestProxyHTTP_UpdatesTimeoutAndCancellation(t *testing.T) {
 				t.Errorf("response = %+v, want ok=true and empty non-nil updates", got)
 			}
 		})
+	}
+}
+
+func TestProxyHTTP_UpdatesActiveLongPollCancellation(t *testing.T) {
+	poller := telegram.NewPoller("test-token", "http://127.0.0.1:1", "test-version", "test-sha", "")
+	handler := handleUpdates(poller)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/updates?timeout=30", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+
+	go func() {
+		handler.ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	// Give PeekUpdates time to enter its wait before canceling the request.
+	time.Sleep(20 * time.Millisecond)
+	started := time.Now()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("active long poll did not stop after cancellation")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("canceled long poll took %s", elapsed)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	assertJSONContentType(t, rec)
+	var got contract.UpdatesResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !got.OK || got.Updates == nil || len(got.Updates) != 0 {
+		t.Errorf("response = %+v, want ok=true and empty non-nil updates", got)
 	}
 }
 
