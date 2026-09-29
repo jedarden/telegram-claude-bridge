@@ -121,6 +121,7 @@ func (p *Poller) pollLoop(ctx context.Context) {
 		baseAck := p.currentAck()
 		maxCompleted := baseAck
 		var firstIncomplete int64
+		var completedIDs []int64
 		for _, u := range updates {
 			if u.UpdateID <= baseAck {
 				// The proxy may replay an update already covered by the previous
@@ -164,6 +165,7 @@ func (p *Poller) pollLoop(ctx context.Context) {
 
 			if completed {
 				maxCompleted = max(maxCompleted, u.UpdateID)
+				completedIDs = append(completedIDs, u.UpdateID)
 			} else if firstIncomplete == 0 || u.UpdateID < firstIncomplete {
 				firstIncomplete = u.UpdateID
 			}
@@ -171,11 +173,20 @@ func (p *Poller) pollLoop(ctx context.Context) {
 
 		if firstIncomplete == 0 {
 			p.setAck(maxCompleted)
-		} else if firstIncomplete > baseAck+1 {
-			// Updates can legitimately have gaps in Telegram's numeric IDs.
-			// Advance only through the largest safe contiguous high-water mark;
-			// never leap over the first update that was not durably recorded.
-			p.setAck(firstIncomplete - 1)
+		} else {
+			// Updates can legitimately have gaps in Telegram's numeric IDs, but
+			// an incomplete update is still a hard boundary. Advance only through
+			// the largest completed update below that boundary; never synthesize
+			// an acknowledgement for an ID that was not durably handled.
+			safeAck := baseAck
+			for _, completedID := range completedIDs {
+				if completedID < firstIncomplete && completedID > safeAck {
+					safeAck = completedID
+				}
+			}
+			if safeAck > baseAck {
+				p.setAck(safeAck)
+			}
 		}
 	}
 }

@@ -426,6 +426,82 @@ func TestPoller_SendsAckAfterProcessing(t *testing.T) {
 	}
 }
 
+// TestPoller_DoesNotAckBeforeDurableProcessedMark verifies that forwarding an
+// update to the next bridge stage is not enough to acknowledge it. If the
+// processed-update write fails, the proxy must see no high-water mark and must
+// return the update again on the next poll.
+func TestPoller_DoesNotAckBeforeDurableProcessedMark(t *testing.T) {
+	const updateID int64 = 725
+
+	var mu sync.Mutex
+	var acks []string
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		acks = append(acks, r.URL.Query().Get("ack"))
+		call := calls
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		updates := []contract.Update(nil)
+		if call <= 2 {
+			updates = []contract.Update{makePollerUpdate(updateID)}
+		}
+		_ = json.NewEncoder(w).Encode(contract.UpdatesResponse{OK: true, Updates: updates})
+	}))
+	defer srv.Close()
+
+	db, err := OpenDB(t.TempDir() + "/bridge.db")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	// A closed database makes both the dedup lookup and the processed marker
+	// fail. The poller must still expose the update, but cannot acknowledge it.
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database to simulate durability failure: %v", err)
+	}
+
+	updates := make(chan contract.Update, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	p := NewPoller(srv.URL, 1, updates, db)
+	p.Start(ctx)
+
+	var forwarded [2]contract.Update
+	for i := range forwarded {
+		select {
+		case forwarded[i] = <-updates:
+		case <-time.After(2 * time.Second):
+			t.Fatal("poller did not re-deliver the update after durability failure")
+		}
+	}
+	cancel()
+	select {
+	case <-p.Done():
+	case <-time.After(time.Second):
+		t.Fatal("poller did not stop after durability failure")
+	}
+
+	mu.Lock()
+	seenCalls := calls
+	seenAcks := append([]string(nil), acks...)
+	mu.Unlock()
+	if seenCalls < 2 || len(seenAcks) < 2 {
+		t.Fatalf("proxy calls after durability failure = %d with acknowledgements %v, want at least two polls", seenCalls, seenAcks)
+	}
+	for _, ack := range seenAcks {
+		if ack != "" {
+			t.Fatalf("ack queries before durable processed mark = %v, want all empty", seenAcks)
+		}
+	}
+	if got := p.currentAck(); got != 0 {
+		t.Fatalf("bridge ack after failed processed mark = %d, want 0", got)
+	}
+	if forwarded[0].UpdateID != updateID || forwarded[1].UpdateID != updateID {
+		t.Fatalf("forwarded updates after failed processed mark = [%d %d], want [%d %d]", forwarded[0].UpdateID, forwarded[1].UpdateID, updateID, updateID)
+	}
+}
+
 // TestPoller_AdvancesCumulativeAckAfterOutOfOrderBatch verifies that the
 // bridge does not publish a high-water mark while an out-of-order response is
 // still being consumed. Once every update in the response is handled, the ack
