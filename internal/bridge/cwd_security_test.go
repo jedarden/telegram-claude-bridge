@@ -409,19 +409,39 @@ func TestCmdCWDBoundaryMatrixStoresOnlyCanonicalSafePaths(t *testing.T) {
 	}
 
 	// A rejected update to an existing group must not replace its previously
-	// stored canonical path with an unsafe or non-canonical value.
+	// stored canonical path with an unsafe or non-canonical value. Exercise
+	// every rejected shape here, since a validation error must be non-mutating
+	// even when the group already exists.
 	group, err := db.GetGroup(ctx, 101)
 	if err != nil {
 		t.Fatalf("get canonical group before rejected update: %v", err)
 	}
-	if _, err := h.cmdCWD(ctx, makeUpdate(101, nil, 2, "/cwd "+escape, adminID), group, escape); !errors.Is(err, ErrWorkingDirectoryNotAllowed) {
-		t.Fatalf("rejected update error = %v, want %v", err, ErrWorkingDirectoryNotAllowed)
-	}
-	stored, err := db.GetGroup(ctx, 101)
-	if err != nil {
-		t.Fatalf("get group after rejected update: %v", err)
-	}
-	if stored == nil || stored.CWD != safeB {
-		t.Fatalf("rejected update stored group = %+v, want canonical CWD %q", stored, safeB)
+	for index, test := range tests {
+		if test.want != "" {
+			continue
+		}
+		t.Run("existing group/"+test.name, func(t *testing.T) {
+			reply, err := h.cmdCWD(ctx, makeUpdate(101, nil, int64(index+2), "/cwd "+test.path, adminID), group, test.path)
+			if test.wantErr != nil {
+				if !errors.Is(err, test.wantErr) {
+					t.Fatalf("cmdCWD(%q) error = %v, want %v", test.path, err, test.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("cmdCWD(%q): %v", test.path, err)
+			}
+			if test.wantReply != "" && !strings.Contains(reply, test.wantReply) {
+				t.Fatalf("cmdCWD(%q) reply = %q, want substring %q", test.path, reply, test.wantReply)
+			}
+			if group.CWD != safeB {
+				t.Fatalf("rejected update changed in-memory CWD to %q, want %q", group.CWD, safeB)
+			}
+			stored, err := db.GetGroup(ctx, 101)
+			if err != nil {
+				t.Fatalf("get group after rejected update: %v", err)
+			}
+			if stored == nil || stored.CWD != safeB {
+				t.Fatalf("rejected update stored group = %+v, want canonical CWD %q", stored, safeB)
+			}
+		})
 	}
 }
