@@ -309,3 +309,119 @@ func TestExistingWorkspaceAndPermissionChangesRequireAdmin(t *testing.T) {
 		t.Fatalf("admin CWD = %q, want canonical %q", group.CWD, replacement)
 	}
 }
+
+func TestCmdCWDBoundaryMatrixStoresOnlyCanonicalSafePaths(t *testing.T) {
+	parent := t.TempDir()
+	rootA := filepath.Join(parent, "workspace-a")
+	rootB := filepath.Join(parent, "workspace-b")
+	safeA := filepath.Join(rootA, "project-a")
+	safeB := filepath.Join(rootB, "project-b")
+	aliasB := filepath.Join(rootB, "project-alias")
+	outsideA := t.TempDir()
+	outsideB := t.TempDir()
+	escape := filepath.Join(rootA, "escape")
+	traversal := safeA + string(filepath.Separator) + ".." + string(filepath.Separator) + "project-a"
+	missing := filepath.Join(rootA, "missing")
+	regularFile := filepath.Join(rootA, "not-a-directory")
+	sensitiveConfig := filepath.Join(safeA, ".config")
+	sensitiveCredentials := filepath.Join(safeB, "credentials")
+
+	for _, directory := range []string{safeA, safeB, sensitiveConfig, sensitiveCredentials} {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatalf("mkdir %q: %v", directory, err)
+		}
+	}
+	if err := os.Symlink(safeB, aliasB); err != nil {
+		t.Fatalf("safe symlink: %v", err)
+	}
+	if err := os.Symlink(outsideA, escape); err != nil {
+		t.Fatalf("escape symlink: %v", err)
+	}
+	if err := os.WriteFile(regularFile, []byte("fixture"), 0o600); err != nil {
+		t.Fatalf("write regular file: %v", err)
+	}
+
+	policy, err := NewWorkingDirectoryPolicy(rootA, rootB)
+	if err != nil {
+		t.Fatalf("NewWorkingDirectoryPolicy: %v", err)
+	}
+	db := openTestDB(t)
+	ctx := context.Background()
+	const adminID = int64(9001)
+	if err := db.UpsertAllowedUser(ctx, &AllowedUser{UserID: adminID, Role: "admin"}); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
+	h := newTestCommandHandler(t, db)
+	h.SetWorkingDirectoryPolicy(policy)
+
+	tests := []struct {
+		name      string
+		chatID    int64
+		path      string
+		want      string
+		wantErr   error
+		wantReply string
+	}{
+		{name: "normalizes safe path", chatID: 100, path: filepath.Join(safeA, "."), want: safeA},
+		{name: "canonicalizes safe symlink in second root", chatID: 101, path: aliasB, want: safeB},
+		{name: "rejects relative path", chatID: 102, path: "relative/project", wantErr: ErrWorkingDirectoryNotAbsolute},
+		{name: "rejects traversal", chatID: 103, path: traversal, wantErr: ErrWorkingDirectoryTraversal},
+		{name: "rejects path outside first root", chatID: 104, path: outsideA, wantErr: ErrWorkingDirectoryNotAllowed},
+		{name: "rejects path outside second root", chatID: 105, path: outsideB, wantErr: ErrWorkingDirectoryNotAllowed},
+		{name: "rejects symlink escape", chatID: 106, path: escape, wantErr: ErrWorkingDirectoryNotAllowed},
+		{name: "rejects missing path", chatID: 107, path: missing, wantReply: "Path does not exist"},
+		{name: "rejects regular file", chatID: 108, path: regularFile, wantErr: ErrWorkingDirectoryNotDirectory},
+		{name: "rejects configuration directory", chatID: 109, path: sensitiveConfig, wantErr: ErrWorkingDirectorySensitive},
+		{name: "rejects credentials directory", chatID: 110, path: sensitiveCredentials, wantErr: ErrWorkingDirectorySensitive},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reply, err := h.cmdCWD(ctx, makeUpdate(test.chatID, nil, 1, "/cwd "+test.path, adminID), nil, test.path)
+			if test.wantErr != nil {
+				if !errors.Is(err, test.wantErr) {
+					t.Fatalf("cmdCWD(%q) error = %v, want %v", test.path, err, test.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("cmdCWD(%q): %v", test.path, err)
+			}
+			if test.wantReply != "" && !strings.Contains(reply, test.wantReply) {
+				t.Fatalf("cmdCWD(%q) reply = %q, want substring %q", test.path, reply, test.wantReply)
+			}
+
+			group, err := db.GetGroup(ctx, test.chatID)
+			if err != nil {
+				t.Fatalf("get group: %v", err)
+			}
+			if test.want != "" {
+				if group == nil {
+					t.Fatal("accepted /cwd did not register group")
+				}
+				if group.CWD != test.want {
+					t.Fatalf("stored CWD = %q, want canonical %q", group.CWD, test.want)
+				}
+				return
+			}
+			if group != nil {
+				t.Fatalf("rejected /cwd stored group with CWD %q", group.CWD)
+			}
+		})
+	}
+
+	// A rejected update to an existing group must not replace its previously
+	// stored canonical path with an unsafe or non-canonical value.
+	group, err := db.GetGroup(ctx, 101)
+	if err != nil {
+		t.Fatalf("get canonical group before rejected update: %v", err)
+	}
+	if _, err := h.cmdCWD(ctx, makeUpdate(101, nil, 2, "/cwd "+escape, adminID), group, escape); !errors.Is(err, ErrWorkingDirectoryNotAllowed) {
+		t.Fatalf("rejected update error = %v, want %v", err, ErrWorkingDirectoryNotAllowed)
+	}
+	stored, err := db.GetGroup(ctx, 101)
+	if err != nil {
+		t.Fatalf("get group after rejected update: %v", err)
+	}
+	if stored == nil || stored.CWD != safeB {
+		t.Fatalf("rejected update stored group = %+v, want canonical CWD %q", stored, safeB)
+	}
+}
