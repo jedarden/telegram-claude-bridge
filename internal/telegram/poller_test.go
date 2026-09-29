@@ -184,6 +184,37 @@ func TestPoller_PeekUpdates_Timeout(t *testing.T) {
 	}
 }
 
+func TestPoller_PeekUpdates_WakesAllWaiters(t *testing.T) {
+	p := NewPoller("test-token", "", "test-version", "test-sha", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	results := make(chan []contract.Update, 2)
+	for range 2 {
+		go func() {
+			results <- p.PeekUpdates(ctx, time.Second)
+		}()
+	}
+
+	// Let both callers observe an empty buffer before publishing the batch.
+	time.Sleep(20 * time.Millisecond)
+	p.mu.Lock()
+	p.updates = []contract.Update{{UpdateID: 42}}
+	p.signalNewDataLocked()
+	p.mu.Unlock()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-results:
+			if gotIDs := updateIDs(got); len(gotIDs) != 1 || gotIDs[0] != 42 {
+				t.Fatalf("waiter %d received ids %v, want [42]", i, gotIDs)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("a concurrent PeekUpdates waiter was not woken")
+		}
+	}
+}
+
 // TestPoller_Health verifies the health response reflects polling state.
 func TestPoller_Health(t *testing.T) {
 	srv, _ := mockTelegramServer(t, nil)

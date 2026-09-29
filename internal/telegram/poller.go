@@ -43,7 +43,7 @@ type Poller struct {
 	bufferCap int
 	polling   bool
 	started   time.Time
-	newData   chan struct{} // cap-1 signal: new updates are available
+	newData   chan struct{} // closed-and-replaced broadcast when updates arrive
 
 	// saveMu serializes state-file writes so that a snapshot taken by one
 	// writer cannot be overwritten by a stale snapshot from another.
@@ -69,7 +69,7 @@ func NewPoller(token, apiBase, version, commitSHA, offsetPath string) *Poller {
 		commitSHA:    commitSHA,
 		client:       &http.Client{Timeout: 40 * time.Second},
 		started:      time.Now(),
-		newData:      make(chan struct{}, 1),
+		newData:      make(chan struct{}),
 		offsetPath:   offsetPath,
 		bufferCap:    DefaultUpdateBufferCap,
 		messageCache: make(map[string]*contract.MessageContent),
@@ -228,6 +228,7 @@ func (p *Poller) Start(ctx context.Context) {
 					}
 				}
 			}
+			p.signalNewDataLocked()
 		}
 		p.mu.Unlock()
 
@@ -240,12 +241,6 @@ func (p *Poller) Start(ctx context.Context) {
 			return
 		}
 
-		if len(normalized) > 0 {
-			select {
-			case p.newData <- struct{}{}:
-			default:
-			}
-		}
 	}
 }
 
@@ -256,28 +251,39 @@ func (p *Poller) Start(ctx context.Context) {
 // to timeout for new updates to arrive (or until ctx is cancelled), mirroring
 // Telegram's own getUpdates long-poll.
 func (p *Poller) PeekUpdates(ctx context.Context, timeout time.Duration) []contract.Update {
-	p.mu.Lock()
-	if len(p.updates) > 0 {
-		out := append([]contract.Update(nil), p.updates...)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		p.mu.Lock()
+		if len(p.updates) > 0 {
+			out := append([]contract.Update(nil), p.updates...)
+			p.mu.Unlock()
+			return out
+		}
+		newData := p.newData
 		p.mu.Unlock()
-		return out
-	}
-	p.mu.Unlock()
 
-	select {
-	case <-p.newData:
-	case <-ctx.Done():
-		return nil
-	case <-time.After(timeout):
-		return nil
+		select {
+		case <-newData:
+			// The notification is a broadcast. Re-check the condition because a
+			// concurrent acknowledgement may have drained the buffer before this
+			// waiter reacquired the mutex.
+		case <-ctx.Done():
+			return nil
+		case <-timer.C:
+			return nil
+		}
 	}
+}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.updates) == 0 {
-		return nil
-	}
-	return append([]contract.Update(nil), p.updates...)
+// signalNewDataLocked wakes every PeekUpdates caller currently waiting for a
+// batch. Replacing the channel gives future callers a fresh notification
+// generation instead of leaving a stale token that only one waiter can consume.
+// The caller must hold p.mu.
+func (p *Poller) signalNewDataLocked() {
+	close(p.newData)
+	p.newData = make(chan struct{})
 }
 
 // Ack discards retained updates with update_id <= through. The caller asserts
