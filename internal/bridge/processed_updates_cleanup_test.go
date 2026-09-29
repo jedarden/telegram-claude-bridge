@@ -137,6 +137,46 @@ func TestProcessedUpdates_PersistAcrossRestart(t *testing.T) {
 	assertUpdateProcessed(t, restarted, updateID, true)
 }
 
+func TestProcessedUpdatesCleanup_RestartPrunesExpiredPreservesRecent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bridge.db")
+	const (
+		expiredID = int64(1009)
+		recentID  = int64(1010)
+		ttl       = 2 * time.Hour
+	)
+
+	initial, err := OpenDB(path)
+	if err != nil {
+		t.Fatalf("open initial database: %v", err)
+	}
+	ctx := context.Background()
+	for _, updateID := range []int64{expiredID, recentID} {
+		if err := initial.MarkUpdateProcessed(ctx, updateID); err != nil {
+			initial.Close()
+			t.Fatalf("MarkUpdateProcessed(%d): %v", updateID, err)
+		}
+	}
+	setProcessedAtRelative(t, initial, expiredID, "-3 hours")
+	if err := initial.Close(); err != nil {
+		t.Fatalf("close initial database: %v", err)
+	}
+
+	restarted, err := OpenDB(path)
+	if err != nil {
+		t.Fatalf("open database after restart: %v", err)
+	}
+	defer restarted.Close()
+
+	cleanup := NewProcessedUpdatesCleanup(restarted, ttl, time.Hour)
+	cleanup.Start(ctx)
+	defer cleanup.Stop()
+
+	// The expired row proves the startup pass ran. The recent row must remain
+	// available for replay protection under the same configured TTL.
+	waitForUpdateProcessed(t, restarted, expiredID, false, time.Second)
+	assertUpdateProcessed(t, restarted, recentID, true)
+}
+
 func TestMarkUpdateProcessed_DuplicateIsIdempotent(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

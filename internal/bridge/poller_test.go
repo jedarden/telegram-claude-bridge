@@ -651,3 +651,77 @@ func TestPoller_RestartReplaysUnacknowledgedSuffixSafely(t *testing.T) {
 	}
 	t.Fatal("restarted poller never acknowledged the replayed suffix")
 }
+
+func TestPoller_RestartFiltersRecentUpdateAfterConfiguredPrune(t *testing.T) {
+	path := t.TempDir() + "/bridge.db"
+	db, err := OpenDB(path)
+	if err != nil {
+		t.Fatalf("open initial database: %v", err)
+	}
+	const (
+		recentID  = int64(950)
+		expiredID = int64(951)
+		ttl       = 2 * time.Hour
+	)
+	ctx := context.Background()
+	for _, updateID := range []int64{recentID, expiredID} {
+		if err := db.MarkUpdateProcessed(ctx, updateID); err != nil {
+			db.Close()
+			t.Fatalf("MarkUpdateProcessed(%d): %v", updateID, err)
+		}
+	}
+	setProcessedAtRelative(t, db, expiredID, "-3 hours")
+	if err := db.Close(); err != nil {
+		t.Fatalf("close initial database: %v", err)
+	}
+
+	restartedDB, err := OpenDB(path)
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer restartedDB.Close()
+
+	cleanup := NewProcessedUpdatesCleanup(restartedDB, ttl, time.Hour)
+	cleanup.Start(ctx)
+	defer cleanup.Stop()
+	waitForUpdateProcessed(t, restartedDB, expiredID, false, time.Second)
+	assertUpdateProcessed(t, restartedDB, recentID, true)
+
+	requestSeen := make(chan struct{})
+	var requestOnce sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestOnce.Do(func() { close(requestSeen) })
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(contract.UpdatesResponse{
+			OK:      true,
+			Updates: []contract.Update{makePollerUpdate(recentID)},
+		})
+	}))
+	defer srv.Close()
+
+	updates := make(chan contract.Update, 1)
+	poller := NewPoller(srv.URL, 1, updates, restartedDB)
+	pollCtx, cancel := context.WithCancel(ctx)
+	poller.Start(pollCtx)
+
+	select {
+	case <-requestSeen:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("restarted poller did not request the replayed update")
+	}
+
+	select {
+	case update := <-updates:
+		cancel()
+		t.Fatalf("recent update was reprocessed after cleanup: got %d", update.UpdateID)
+	case <-time.After(200 * time.Millisecond):
+		// The recent processed ID remained inside the configured retention window.
+	}
+	cancel()
+	select {
+	case <-poller.Done():
+	case <-time.After(time.Second):
+		t.Fatal("restarted poller did not stop after cancellation")
+	}
+}
