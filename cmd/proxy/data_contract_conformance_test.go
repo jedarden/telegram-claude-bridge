@@ -132,6 +132,9 @@ func TestProxyHTTP_DocumentedErrorStatusMappings(t *testing.T) {
 		retryAfter *int
 	}{
 		{name: "rate limit", errorCode: contract.ErrCodeRateLimit, wantStatus: http.StatusTooManyRequests, retryAfter: intPointer(11)},
+		// The bridge's retry policy falls back to a one-second wait when a 429
+		// carries no retry_after, so the field must be omitted, not null.
+		{name: "rate limit without retry_after", errorCode: contract.ErrCodeRateLimit, wantStatus: http.StatusTooManyRequests},
 		{name: "unreachable", errorCode: contract.ErrCodeTelegramUnreachable, wantStatus: http.StatusBadGateway},
 		{name: "not polling", errorCode: contract.ErrCodeNotPolling, wantStatus: http.StatusServiceUnavailable},
 		{name: "timeout", errorCode: contract.ErrCodeTelegramTimeout, wantStatus: http.StatusGatewayTimeout},
